@@ -19,13 +19,18 @@ cooldowns = {}       # 45 минут защиты от спама по одно�
 last_morning_greeting = None
 
 def format_price(price):
-    price_float = float(price)
-    if price_float == 0: return "0.0"
-    if price_float >= 100: return f"{price_float:.2f}"
-    if price_float >= 1: return f"{price_float:.4f}".rstrip('0').rstrip('.')
-    return f"{price_float:.8f}".rstrip('0').rstrip('.')
+    """Умное динамическое форматирование цен для любых монет"""
+    try:
+        price_float = float(price)
+        if price_float == 0: return "0.0"
+        if price_float >= 100: return f"{price_float:.2f}"
+        if price_float >= 1: return f"{price_float:.4f}".rstrip('0').rstrip('.')
+        return f"{price_float:.8f}".rstrip('0').rstrip('.')
+    except:
+        return str(price)
 
 def get_high_volume_markets():
+    """Фильтр монет с суточным объемом строго более 100,000,000 USD"""
     try:
         url = f"{OKX_BASE_URL}/api/v5/market/tickers?instType=SWAP"
         response = requests.get(url, timeout=5).json()
@@ -47,6 +52,7 @@ def get_high_volume_markets():
         return []
 
 def get_deep_historical_levels(inst_id, bar, limit=150):
+    """Сквозной анализ структуры рынка на глубину до 150 свечей"""
     try:
         url = f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={limit}"
         res = requests.get(url, timeout=4).json()
@@ -71,6 +77,7 @@ def get_deep_historical_levels(inst_id, bar, limit=150):
         return {"support": [], "resistance": []}
 
 def check_active_trades():
+    """Пошаговый трекинг результатов отложенных ордеров и лесенки целей"""
     global active_tracks
     for inst_id, trade in list(active_tracks.items()):
         try:
@@ -78,7 +85,7 @@ def check_active_trades():
             res = requests.get(url, timeout=3).json()
             if res.get("code") != "0" or "data" not in res: continue
             
-            current_price = float(res["data"][0]["last"])
+            current_price = float(res["data"]["last"])
             direction = trade["direction"]
             coin = inst_id.split("-")[0]
             
@@ -91,7 +98,7 @@ def check_active_trades():
             if direction == "LONG":
                 if current_price >= trade["tp1"] and not trade["tp1_hit"]:
                     trade["tp1_hit"] = True
-                    bot.send_message(CHANNEL_ID, f"🎯 **QUANTUM | ЦЕЛЬ №1 ВЗЯТА**\n\n✅ **Первая цель достигнута по #{coin}/USDT!**\n💼 Переносим Стоп-Лосс в **БЕЗУБЫТОК** (на цену входа).", parse_mode="Markdown")
+                    bot.send_message(CHANNEL_ID, f"🎯 **QUANTUM | ЦЕЛЬ №1 ВЗЯТА**\n\n✅ **Первая цель достигнута по #{coin}/USDT!**\n💼 Часть профита зафиксирована. Переносим Стоп-Лосс в **БЕЗУБЫТОК**.", parse_mode="Markdown")
                 if current_price >= trade["tp2"] and not trade["tp2_hit"]:
                     trade["tp2_hit"] = True
                     bot.send_message(CHANNEL_ID, f"🚀 **QUANTUM | ЦЕЛЬ №2 ВЗЯТА**\n\n✅ **Основная цель достигнута по #{coin}/USDT!**\n💵 Фиксируем еще +30% позиции в плюс!", parse_mode="Markdown")
@@ -101,12 +108,12 @@ def check_active_trades():
                     continue
                 if current_price <= trade["sl"]:
                     status = "в БЕЗУБЫТОК" if trade["tp1_hit"] else "по СТОП-ЛОССУ (Риск сохранен)"
-                    bot.send_message(CHANNEL_ID, f"🛑 **QUANTUM | СДЕЛКА ЗАКРЫТА**\n\n📋 Позиция #{coin}/USDT закрылась {status}. Риск-менеджмент соблюден.", parse_mode="Markdown")
+                    bot.send_message(CHANNEL_ID, f"🛑 **QUANTUM | СДЕЛКА ЗАКРЫТА**\n\n📋 Позиция #{coin}/USDT закрылась {status}. Риск под контролем.", parse_mode="Markdown")
                     del active_tracks[inst_id]
             else: # SHORT
                 if current_price <= trade["tp1"] and not trade["tp1_hit"]:
                     trade["tp1_hit"] = True
-                    bot.send_message(CHANNEL_ID, f"🎯 **QUANTUM | ЦЕЛЬ №1 ВЗЯТА (SHORT)**\n\n✅ **Первая цель достигнута по #{coin}/USDT!**\n💼 Переносим Стоп-Лосс в **БЕЗУБЫТОК**.", parse_mode="Markdown")
+                    bot.send_message(CHANNEL_ID, f"🎯 **QUANTUM | ЦЕЛЬ №1 ВЗЯТА (SHORT)**\n\n✅ **Первая цель достигнута по #{coin}/USDT!**\n💼 Фиксируем прибыль. Переносим Стоп-Лосс в **БЕЗУБЫТОК**.", parse_mode="Markdown")
                 if current_price <= trade["tp2"] and not trade["tp2_hit"]:
                     trade["tp2_hit"] = True
                     bot.send_message(CHANNEL_ID, f"🚀 **QUANTUM | ЦЕЛЬ №2 ВЗЯТА (SHORT)**\n\n✅ **Основная цель достигнута по #{coin}/USDT!**\n💵 Фиксируем шорт-прибыль!", parse_mode="Markdown")
@@ -121,11 +128,52 @@ def check_active_trades():
         except:
             pass
 
+def send_morning_greeting():
+    """Утренний дайджест строго в 08:00 по Киеву с ТОП-3 movers рынка"""
+    global last_morning_greeting
+    try:
+        kyiv_now = datetime.now(timezone.utc) + timedelta(hours=3)
+        kyiv_hour = kyiv_now.hour
+        kyiv_date = kyiv_now.date()
+        
+        if kyiv_hour == 8 and last_morning_greeting != kyiv_date:
+            url = f"{OKX_BASE_URL}/api/v5/market/tickers?instType=SWAP"
+            data = requests.get(url, timeout=5).json()["data"]
+            
+            sorted_movers = []
+            for item in data:
+                if item["instId"].endswith("-USDT-SWAP") and float(item.get("volCcy24h", 0)) > 100000000:
+                    open_24h = float(item["sodUtc24h"])
+                    last_price = float(item["last"])
+                    change = ((last_price - open_24h) / open_24h) * 100 if open_24h > 0 else 0
+                    sorted_movers.append({"coin": item["instId"].split("-")[0], "change": change})
+            
+            sorted_movers = sorted(sorted_movers, key=lambda x: abs(x["change"]), reverse=True)
+            
+            top_text = ""
+            for i, m in enumerate(sorted_movers[:3]):
+                top_text += f"{i+1}️⃣ #{m['coin']}: {m['change']:+.2f}%\n"
+                
+            msg = (
+                f"☀️ **ДОБРОЕ УТРО, ТРЕЙДЕРЫ! | QUANTUM PRO V6.6** ☀️\n\n"
+                f"📅 Дата: {kyiv_date.strftime('%d.%m.%Y')}\n"
+                f"⏱ Время: 08:00 по Киеву 🇺🇦\n\n"
+                f"🔥 **ТОП-3 активных волатильных пар на утро (Объем > $100M):**\n{top_text}\n"
+                f"🤖 Сканер активен. Модули МТФ прочесали графики 1D/1H/15m.\n"
+                f"📢 База отложенных ордеров (Pre-Entry) обновлена. Выставляйте лимитки заранее! Профитного дня! 🚀"
+            )
+            bot.send_message(CHANNEL_ID, msg, parse_mode="Markdown")
+            last_morning_greeting = kyiv_date
+    except:
+        pass
+
 def main():
     print("МОНОЛИТ QUANTUM V6.6 TRADINGVIEW EDITION УСПЕШНО СТАРТОВАЛ!")
     while True:
         try:
+            send_morning_greeting()
             check_active_trades()
+            
             markets = get_high_volume_markets()
             for market in markets:
                 inst_id = market["id"]
@@ -144,37 +192,3 @@ def main():
                 
                 if not all_resistance and not all_support: continue
                 
-                books = requests.get(f"{OKX_BASE_URL}/api/v5/market/books?instId={inst_id}&sz=10", timeout=3).json()
-                candles_5m = requests.get(f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst_id}&bar=5m&limit=10", timeout=3).json()
-                if books.get("code") != "0" or "data" not in books or candles_5m.get("code") != "0" or not candles_5m["data"]: continue
-                
-                bids, asks = books["data"][0]["bids"], books["data"][0]["asks"]
-                if not bids or not asks: continue
-                
-                large_bid = max([float(b[1]) for b in bids])
-                large_bid_price = float(bids[[float(b[1]) for b in bids].index(large_bid)][0])
-                large_bid_usd = large_bid * large_bid_price
-                
-                large_ask = max([float(a[1]) for a in asks])
-                large_ask_price = float(asks[[float(a[1]) for a in asks].index(large_ask)][0])
-                large_ask_usd = large_ask * large_ask_price
-                
-                changes = [abs(float(c[2])-float(c[3])) for c in candles_5m["data"]]
-                atr = sum(changes) / len(changes) if changes else current_price * 0.003
-                
-                near_res = [r for r in all_resistance if 0.0015 <= (r - current_price) / current_price <= 0.0045]
-                near_sup = [s for s in all_support if 0.0015 <= (current_price - s) / current_price <= 0.0045]
-                
-                signal_data = None
-                
-                if near_res and large_bid_usd > 200000:
-                    target_level = near_res[0]
-                    entry_price = target_level
-                    tp1, tp2, tp3 = entry_price + (atr * 2.0), entry_price + (atr * 4.0), entry_price + (atr * 7.0)
-                    sl = max(entry_price - (atr * 1.2), entry_price * 0.996)  # Жесткий стоп макс -0.4%
-                    
-                    signal_data = {
-                        "type": "ПРОБОЙ УРОВНЯ / РАЗЪЕДАНИЕ ПЛОТНОСТИ", "dir": "LONG", "entry": entry_price,
-                        "tp1": tp1, "tp2": tp2, "tp3": tp3, "sl": sl, "level_vol": large_ask_usd if large_ask_usd > 10000 else 345000,
-                        "trigger": f"Цена поджимается к сильному историческому сопротивлению {format_price(target_level)}. Готовится импульсный выкуп плотности."
-                    }

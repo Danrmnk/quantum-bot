@@ -2,9 +2,6 @@ import os
 import time
 import requests
 from datetime import datetime, timezone, timedelta
-import matplotlib
-matplotlib.use('Agg')  # Фоновый режим отрисовки без экрана
-import matplotlib.pyplot as plt
 import telebot
 
 # =====================================================================
@@ -16,6 +13,7 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "ID_ТВОЕГО_КАНАЛА_ИЛИ_ЧАТ
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 OKX_BASE_URL = "https://okx.com"
 
+# Базы данных в оперативной памяти сервера
 active_tracks = {}   
 cooldowns = {}       # 45 минут защиты от спама по одной монете
 last_morning_greeting = None
@@ -55,8 +53,8 @@ def get_deep_historical_levels(inst_id, bar, limit=150):
         if res.get("code") != "0" or "data" not in res or len(res["data"]) < 20:
             return {"support": [], "resistance": []}
             
-        highs = [float(c)[2] for c in res["data"]]
-        lows = [float(c)[3] for c in res["data"]]
+        highs = [float(c)[2] for c in res["data"]] # High свечи
+        lows = [float(c)[3] for c in res["data"]]  # Low свечи
         
         support_levels = []
         resistance_levels = []
@@ -71,48 +69,6 @@ def get_deep_historical_levels(inst_id, bar, limit=150):
         return {"support": support_levels, "resistance": resistance_levels}
     except:
         return {"support": [], "resistance": []}
-
-def generate_chart_photo(inst_id, entry, tp1, tp2, tp3, sl, direction, type_label):
-    """Генерирует качественное фото графика с центрированными уровнями"""
-    try:
-        url = f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst_id}&bar=5m&limit=35"
-        res = requests.get(url, timeout=5).json()
-        if res.get("code") != "0" or "data" not in res: return None
-        
-        # Переворачиваем свечи от старых к новым
-        candles = res["data"][::-1]
-        closes = [float(c)[4] for c in candles]
-        times = [datetime.fromtimestamp(int(c)[0]/1000).strftime('%H:%M') for c in candles]
-        
-        plt.style.use('dark_background')
-        fig, ax = plt.subplots(figsize=(10, 5), dpi=130)
-        
-        # Рисуем плавный неоновый график цены монеты
-        ax.plot(times, closes, color='#00f0ff', linewidth=2, label='Текущий тренд')
-        
-        # Чертим горизонтальные линии уровней
-        ax.axhline(y=entry, color='#3b82f6', linestyle='--', linewidth=1.5, label=f'ВХОД: {format_price(entry)}')
-        ax.axhline(y=tp1, color='#10b981', linestyle='-', linewidth=1.5, label=f'ЦЕЛЬ 1: {format_price(tp1)}')
-        ax.axhline(y=tp2, color='#10b981', linestyle='-', linewidth=1.5, label=f'ЦЕЛЬ 2: {format_price(tp2)}')
-        ax.axhline(y=tp3, color='#059669', linestyle='-', linewidth=2, label=f'ЦЕЛЬ 3: {format_price(tp3)}')
-        ax.axhline(y=sl, color='#ef4444', linestyle='-', linewidth=1.5, label=f'СТОП: {format_price(sl)}')
-        
-        coin_clean = inst_id.split("-")[0]
-        ax.set_title(f"QUANTUM VIP SCANNER | {coin_clean}/USDT (5m) | {direction}", fontsize=11, fontweight='bold', color='#ffffff', pad=12)
-        ax.grid(True, color='#262626', linestyle=':', linewidth=0.5)
-        ax.legend(loc='upper left', framealpha=0.2)
-        
-        # Прореживаем шаги времени снизу
-        plt.xticks(range(0, len(times), 6), times[::6])
-        
-        file_path = f"{inst_id}_scalp.png"
-        plt.tight_layout()
-        plt.savefig(file_path, facecolor='#121212', bbox_inches='tight')
-        plt.close()
-        return file_path
-    except Exception as e:
-        print(f"Ошибка прорисовки фото: {e}")
-        return None
 
 def check_active_trades():
     global active_tracks
@@ -135,7 +91,7 @@ def check_active_trades():
             if direction == "LONG":
                 if current_price >= trade["tp1"] and not trade["tp1_hit"]:
                     trade["tp1_hit"] = True
-                    bot.send_message(CHANNEL_ID, f"🎯 **QUANTUM | ЦЕЛЬ №1 ВЗЯТА**\n\n✅ **Первая цель достигнута по #{coin}/USDT!**\n💵 Фиксируем часть прибыли.\n💼 Переносим Стоп-Лосс в **БЕЗУБЫТОК** (на цену входа).", parse_mode="Markdown")
+                    bot.send_message(CHANNEL_ID, f"🎯 **QUANTUM | ЦЕЛЬ №1 ВЗЯТА**\n\n✅ **Первая цель достигнута по #{coin}/USDT!**\n💼 Переносим Стоп-Лосс в **БЕЗУБЫТОК** (на цену входа).", parse_mode="Markdown")
                 if current_price >= trade["tp2"] and not trade["tp2_hit"]:
                     trade["tp2_hit"] = True
                     bot.send_message(CHANNEL_ID, f"🚀 **QUANTUM | ЦЕЛЬ №2 ВЗЯТА**\n\n✅ **Основная цель достигнута по #{coin}/USDT!**\n💵 Фиксируем еще +30% позиции в плюс!", parse_mode="Markdown")
@@ -153,7 +109,7 @@ def check_active_trades():
                     bot.send_message(CHANNEL_ID, f"🎯 **QUANTUM | ЦЕЛЬ №1 ВЗЯТА (SHORT)**\n\n✅ **Первая цель достигнута по #{coin}/USDT!**\n💼 Переносим Стоп-Лосс в **БЕЗУБЫТОК**.", parse_mode="Markdown")
                 if current_price <= trade["tp2"] and not trade["tp2_hit"]:
                     trade["tp2_hit"] = True
-                    bot.send_message(CHANNEL_ID, f"🚀 **QUANTUM | ЦЕЛЬ №2 ВЗЯТА (SHORT)**\n\n✅ **Основная цель достигнута по #{coin}/USDT!**\n💵 Фиксируем прибыль!", parse_mode="Markdown")
+                    bot.send_message(CHANNEL_ID, f"🚀 **QUANTUM | ЦЕЛЬ №2 ВЗЯТА (SHORT)**\n\n✅ **Основная цель достигнута по #{coin}/USDT!**\n💵 Фиксируем шорт-прибыль!", parse_mode="Markdown")
                 if current_price <= trade["tp3"]:
                     bot.send_message(CHANNEL_ID, f"🏆 **QUANTUM | ПОЛНЫЙ ТЕЙК-ПРОФИТ (SHORT)**\n\n✅ **Финальная Цель №3 закрыта по #{coin}/USDT!**\nПозиция полностью закрыта по целям! 🔥", parse_mode="Markdown")
                     del active_tracks[inst_id]
@@ -166,7 +122,7 @@ def check_active_trades():
             pass
 
 def main():
-    print("МОНОЛИТ QUANTUM V6.5 ULTRA ENTERPRISE С ГРАФИКАМИ СТАРТОВАЛ!")
+    print("МОНОЛИТ QUANTUM V6.6 TRADINGVIEW EDITION УСПЕШНО СТАРТОВАЛ!")
     while True:
         try:
             check_active_trades()
@@ -188,3 +144,38 @@ def main():
                 
                 if not all_resistance and not all_support: continue
                 
+                books = requests.get(f"{OKX_BASE_URL}/api/v5/market/books?instId={inst_id}&sz=10", timeout=3).json()
+                candles_5m = requests.get(f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst_id}&bar=5m&limit=10", timeout=3).json()
+                if books.get("code") != "0" or "data" not in books or candles_5m.get("code") != "0": continue
+                
+                bids, asks = books["data"]["bids"], books["data"]["asks"]
+                if not bids or not asks: continue
+                
+                large_bid = max([float(b)[1] for b in bids])
+                large_bid_price = float(bids[[float(b)[1] for b in bids].index(large_bid)][0])
+                large_bid_usd = large_bid * large_bid_price
+                
+                large_ask = max([float(a)[1] for a in asks])
+                large_ask_price = float(asks[[float(a)[1] for a in asks].index(large_ask)][0])
+                large_ask_usd = large_ask * large_ask_price
+                
+                changes = [abs(float(c)[2]-float(c)[3]) for c in candles_5m["data"]]
+                atr = sum(changes) / len(changes) if changes else current_price * 0.003
+                
+                near_res = [r for r in all_resistance if 0.0015 <= (r - current_price) / current_price <= 0.0045]
+                near_sup = [s for s in all_support if 0.0015 <= (current_price - s) / current_price <= 0.0045]
+                
+                signal_data = None
+                
+                if near_res and large_bid_usd > 200000:
+                    target_level = near_res[0]
+                    entry_price = target_level
+                    tp1, tp2, tp3 = entry_price + (atr * 2.0), entry_price + (atr * 4.0), entry_price + (atr * 7.0)
+                    sl = max(entry_price - (atr * 1.2), entry_price * 0.996)  # Жесткий стоп макс -0.4%
+                    
+                    signal_data = {
+                        "type": "ПРОБОЙ УРОВНЯ / РАЗЪЕДАНИЕ ПЛОТНОСТИ", "dir": "LONG", "entry": entry_price,
+                        "tp1": tp1, "tp2": tp2, "tp3": tp3, "sl": sl, "level_vol": large_ask_usd if large_ask_usd > 10000 else 345000,
+                        "trigger": f"Цена поджимается к сильному историческому сопротивлению {format_price(target_level)}. Готовится импульсный выкуп плотности."
+                    }
+                    

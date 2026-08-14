@@ -1,11 +1,13 @@
 import os
 import time
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
 from datetime import datetime, timezone, timedelta
 import telebot
 
 # =====================================================================
-# НАСТРОЙКИ ПОДКЛЮЧЕНИЯ
+# ИНИЦИАЛИЗАЦИЯ И СИСТЕМНЫЕ НАСТРОЙКИ
 # =====================================================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ТВОЙ_ТЕЛЕГРАМ_ТОКЕН")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "ID_ТВОЕГО_КАНАЛА_ИЛИ_ЧАТА")
@@ -63,7 +65,10 @@ def get_deep_historical_levels(inst_id, bar):
     except Exception:
         return {"support": [], "resistance": []}
 
-def main():
+# =====================================================================
+# ФИНАЛЬНЫЙ СКАЛЬПИНГ-ДВИЖОК
+# =====================================================================
+def bot_loop():
     print("МОНОЛИТ QUANTUM V6.9 ENTERPRISE УСПЕШНО ЗАПУЩЕН!")
     while True:
         try:
@@ -153,7 +158,7 @@ def main():
                         f"🎯 Цель 1: `{format_price(signal_data['tp1'])}` (+{profit_pct}%)\n"
                         f"🎯 Цель 2: `{format_price(signal_data['tp2'])}` (+{round(profit_pct*2, 2)}%)\n"
                         f"🎯 Цель 3: `{format_price(signal_data['tp3'])}` (+{round(profit_pct*3.3, 2)}%)\n\n"
-                        f"🛡 **СТОП-ЛОСС (СТРОГО -0.4% РИСКА):** `{format_price(signal_data['sl'])}`\n\n"
+                        f"🛡 **КАЧЕСТВЕННЫЙ СТОП-ЛОСС (СТРОГО -0.4% РИСКА):** `{format_price(signal_data['sl'])}`\n\n"
                         f"📈 **ЖИВОЙ ГРАФИК TRADINGVIEW:** [ОТКРЫТЬ В БРАУЗЕРЕ]({tv_chart_url})\n\n"
                         f"💡 *Ребята, строго соблюдайте правила риск-менеджмента! Заходите только в подтвержденные сделки и забирайте профит лесенкой!*"
                     )
@@ -165,5 +170,24 @@ def main():
         except Exception:
             time.sleep(10)
 
+# =====================================================================
+# ФИНАЛЬНЫЙ ОБМАН ПОРТА ДЛЯ RENDER (БЕСПЛАТНЫЙ WEB SERVICE)
+# =====================================================================
+class WebServerHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"QUANTUM BOT IS ALIVE!")
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), WebServerHandler)
+    print(f"Заглушка веб-порта успешно открыта на порту {port}")
+    server.serve_forever()
+
 if __name__ == "__main__":
-    main()
+    # Запускаем фоновый веб-сервер, чтобы Render увидел открытый порт
+    threading.Thread(target=run_web_server, daemon=True).start()
+    # Запускаем основной движок сканера
+    bot_loop()

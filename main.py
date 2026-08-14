@@ -53,8 +53,8 @@ def get_deep_historical_levels(inst_id, bar, limit=150):
         if res.get("code") != "0" or "data" not in res or len(res["data"]) < 20:
             return {"support": [], "resistance": []}
             
-        highs = [float(c)[2] for c in res["data"]] # High свечи
-        lows = [float(c)[3] for c in res["data"]]  # Low свечи
+        highs = [float(c[2]) for c in res["data"]] # High свечи
+        lows = [float(c[3]) for c in res["data"]]  # Low свечи
         
         support_levels = []
         resistance_levels = []
@@ -78,7 +78,7 @@ def check_active_trades():
             res = requests.get(url, timeout=3).json()
             if res.get("code") != "0" or "data" not in res: continue
             
-            current_price = float(res["data"]["last"])
+            current_price = float(res["data"][0]["last"])
             direction = trade["direction"]
             coin = inst_id.split("-")[0]
             
@@ -146,20 +146,20 @@ def main():
                 
                 books = requests.get(f"{OKX_BASE_URL}/api/v5/market/books?instId={inst_id}&sz=10", timeout=3).json()
                 candles_5m = requests.get(f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst_id}&bar=5m&limit=10", timeout=3).json()
-                if books.get("code") != "0" or "data" not in books or candles_5m.get("code") != "0": continue
+                if books.get("code") != "0" or "data" not in books or candles_5m.get("code") != "0" or not candles_5m["data"]: continue
                 
-                bids, asks = books["data"]["bids"], books["data"]["asks"]
+                bids, asks = books["data"][0]["bids"], books["data"][0]["asks"]
                 if not bids or not asks: continue
                 
-                large_bid = max([float(b)[1] for b in bids])
-                large_bid_price = float(bids[[float(b)[1] for b in bids].index(large_bid)][0])
+                large_bid = max([float(b[1]) for b in bids])
+                large_bid_price = float(bids[[float(b[1]) for b in bids].index(large_bid)][0])
                 large_bid_usd = large_bid * large_bid_price
                 
-                large_ask = max([float(a)[1] for a in asks])
-                large_ask_price = float(asks[[float(a)[1] for a in asks].index(large_ask)][0])
+                large_ask = max([float(a[1]) for a in asks])
+                large_ask_price = float(asks[[float(a[1]) for a in asks].index(large_ask)][0])
                 large_ask_usd = large_ask * large_ask_price
                 
-                changes = [abs(float(c)[2]-float(c)[3]) for c in candles_5m["data"]]
+                changes = [abs(float(c[2])-float(c[3])) for c in candles_5m["data"]]
                 atr = sum(changes) / len(changes) if changes else current_price * 0.003
                 
                 near_res = [r for r in all_resistance if 0.0015 <= (r - current_price) / current_price <= 0.0045]
@@ -178,4 +178,3 @@ def main():
                         "tp1": tp1, "tp2": tp2, "tp3": tp3, "sl": sl, "level_vol": large_ask_usd if large_ask_usd > 10000 else 345000,
                         "trigger": f"Цена поджимается к сильному историческому сопротивлению {format_price(target_level)}. Готовится импульсный выкуп плотности."
                     }
-                    

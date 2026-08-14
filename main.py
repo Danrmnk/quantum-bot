@@ -19,7 +19,6 @@ cooldowns = {}       # 45 минут защиты от спама по одно�
 last_morning_greeting = None
 
 def format_price(price):
-    """Умное динамическое форматирование цен для любых монет"""
     try:
         price_float = float(price)
         if price_float == 0: return "0.0"
@@ -30,7 +29,6 @@ def format_price(price):
         return str(price)
 
 def get_high_volume_markets():
-    """Фильтр монет с суточным объемом строго более 100,000,000 USD"""
     try:
         url = f"{OKX_BASE_URL}/api/v5/market/tickers?instType=SWAP"
         response = requests.get(url, timeout=5).json()
@@ -51,33 +49,27 @@ def get_high_volume_markets():
     except:
         return []
 
-def get_deep_historical_levels(inst_id, bar, limit=150):
-    """Сквозной анализ структуры рынка на глубину до 150 свечей"""
+def get_deep_historical_levels(inst_id, bar, limit=50):
     try:
         url = f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={limit}"
         res = requests.get(url, timeout=4).json()
-        if res.get("code") != "0" or "data" not in res or len(res["data"]) < 20:
+        if res.get("code") != "0" or "data" not in res or len(res["data"]) < 5:
             return {"support": [], "resistance": []}
             
-        highs = [float(c[2]) for c in res["data"]] # High свечи
-        lows = [float(c[3]) for c in res["data"]]  # Low свечи
-        
         support_levels = []
         resistance_levels = []
         
-        for h in set(highs):
-            if highs.count(h) >= 2 or any(abs(h - x) / h < 0.0008 for x in highs if x != h):
-                resistance_levels.append(h)
-        for l in set(lows):
-            if lows.count(l) >= 2 or any(abs(l - x) / l < 0.0008 for x in lows if x != l):
-                support_levels.append(l)
+        for c in res["data"]:
+            high = float(c[2]) # Индекс 2 - High свечи OKX
+            low = float(c[3])  # Индекс 3 - Low свечи OKX
+            resistance_levels.append(high)
+            support_levels.append(low)
                 
         return {"support": support_levels, "resistance": resistance_levels}
     except:
         return {"support": [], "resistance": []}
 
 def check_active_trades():
-    """Пошаговый трекинг результатов отложенных ордеров и лесенки целей"""
     global active_tracks
     for inst_id, trade in list(active_tracks.items()):
         try:
@@ -98,7 +90,7 @@ def check_active_trades():
             if direction == "LONG":
                 if current_price >= trade["tp1"] and not trade["tp1_hit"]:
                     trade["tp1_hit"] = True
-                    bot.send_message(CHANNEL_ID, f"🎯 **QUANTUM | ЦЕЛЬ №1 ВЗЯТА**\n\n✅ **Первая цель достигнута по #{coin}/USDT!**\n💼 Часть профита зафиксирована. Переносим Стоп-Лосс в **БЕЗУБЫТОК**.", parse_mode="Markdown")
+                    bot.send_message(CHANNEL_ID, f"🎯 **QUANTUM | ЦЕЛЬ №1 ВЗЯТА**\n\n✅ **Первая цель достигнута по #{coin}/USDT!**\n💼 Фиксируем прибыль. Переносим Стоп-Лосс в **БЕЗУБЫТОК**.", parse_mode="Markdown")
                 if current_price >= trade["tp2"] and not trade["tp2_hit"]:
                     trade["tp2_hit"] = True
                     bot.send_message(CHANNEL_ID, f"🚀 **QUANTUM | ЦЕЛЬ №2 ВЗЯТА**\n\n✅ **Основная цель достигнута по #{coin}/USDT!**\n💵 Фиксируем еще +30% позиции в плюс!", parse_mode="Markdown")
@@ -128,52 +120,11 @@ def check_active_trades():
         except:
             pass
 
-def send_morning_greeting():
-    """Утренний дайджест строго в 08:00 по Киеву с ТОП-3 movers рынка"""
-    global last_morning_greeting
-    try:
-        kyiv_now = datetime.now(timezone.utc) + timedelta(hours=3)
-        kyiv_hour = kyiv_now.hour
-        kyiv_date = kyiv_now.date()
-        
-        if kyiv_hour == 8 and last_morning_greeting != kyiv_date:
-            url = f"{OKX_BASE_URL}/api/v5/market/tickers?instType=SWAP"
-            data = requests.get(url, timeout=5).json()["data"]
-            
-            sorted_movers = []
-            for item in data:
-                if item["instId"].endswith("-USDT-SWAP") and float(item.get("volCcy24h", 0)) > 100000000:
-                    open_24h = float(item["sodUtc24h"])
-                    last_price = float(item["last"])
-                    change = ((last_price - open_24h) / open_24h) * 100 if open_24h > 0 else 0
-                    sorted_movers.append({"coin": item["instId"].split("-")[0], "change": change})
-            
-            sorted_movers = sorted(sorted_movers, key=lambda x: abs(x["change"]), reverse=True)
-            
-            top_text = ""
-            for i, m in enumerate(sorted_movers[:3]):
-                top_text += f"{i+1}️⃣ #{m['coin']}: {m['change']:+.2f}%\n"
-                
-            msg = (
-                f"☀️ **ДОБРОЕ УТРО, ТРЕЙДЕРЫ! | QUANTUM PRO V6.6** ☀️\n\n"
-                f"📅 Дата: {kyiv_date.strftime('%d.%m.%Y')}\n"
-                f"⏱ Время: 08:00 по Киеву 🇺🇦\n\n"
-                f"🔥 **ТОП-3 активных волатильных пар на утро (Объем > $100M):**\n{top_text}\n"
-                f"🤖 Сканер активен. Модули МТФ прочесали графики 1D/1H/15m.\n"
-                f"📢 База отложенных ордеров (Pre-Entry) обновлена. Выставляйте лимитки заранее! Профитного дня! 🚀"
-            )
-            bot.send_message(CHANNEL_ID, msg, parse_mode="Markdown")
-            last_morning_greeting = kyiv_date
-    except:
-        pass
-
 def main():
-    print("МОНОЛИТ QUANTUM V6.6 TRADINGVIEW EDITION УСПЕШНО СТАРТОВАЛ!")
+    print("МОНОЛИТ QUANTUM V6.8 ENTERPRISE УСПЕШНО СТАРТОВАЛ!")
     while True:
         try:
-            send_morning_greeting()
             check_active_trades()
-            
             markets = get_high_volume_markets()
             for market in markets:
                 inst_id = market["id"]
@@ -183,12 +134,50 @@ def main():
                 if inst_id in active_tracks: continue
                 if inst_id in cooldowns and (time.time() - cooldowns[inst_id]) < 2700: continue 
                 
-                levels_1D = get_deep_historical_levels(inst_id, "1D", limit=20)
-                levels_1H = get_deep_historical_levels(inst_id, "1H", limit=48)
-                levels_15m = get_deep_historical_levels(inst_id, "15m", limit=60)
+                levels_1D = get_deep_historical_levels(inst_id, "1D", limit=15)
+                levels_1H = get_deep_historical_levels(inst_id, "1H", limit=24)
+                levels_15m = get_deep_historical_levels(inst_id, "15m", limit=30)
                 
                 all_resistance = levels_1D["resistance"] + levels_1H["resistance"] + levels_15m["resistance"]
                 all_support = levels_1D["support"] + levels_1H["support"] + levels_15m["support"]
                 
                 if not all_resistance and not all_support: continue
                 
+                books = requests.get(f"{OKX_BASE_URL}/api/v5/market/books?instId={inst_id}&sz=5", timeout=3).json()
+                candles_5m = requests.get(f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst_id}&bar=5m&limit=5", timeout=3).json()
+                if books.get("code") != "0" or "data" not in books or candles_5m.get("code") != "0" or not candles_5m.get("data"): continue
+                
+                bids, asks = books["data"]["bids"], books["data"]["asks"]
+                if not bids or not asks: continue
+                
+                large_bid = max([float(b[1]) for b in bids])
+                large_bid_price = float(bids[[float(b[1]) for b in bids].index(large_bid)][0])
+                large_bid_usd = large_bid * large_bid_price
+                
+                large_ask = max([float(a[1]) for a in asks])
+                large_ask_price = float(asks[[float(a[1]) for a in asks].index(large_ask)][0])
+                large_ask_usd = large_ask * large_ask_price
+                
+                # Фиксированный безопасный шаг для скальпинга по волатильности (0.25%)
+                atr = current_price * 0.0025
+                
+                near_res = [r for r in all_resistance if 0.0015 <= (r - current_price) / current_price <= 0.0045]
+                near_sup = [s for s in all_support if 0.0015 <= (current_price - s) / current_price <= 0.0045]
+                
+                signal_data = None
+                
+                if near_res and large_bid_usd > 150000:
+                    target_level = near_res[0]
+                    entry_price = target_level
+                    tp1, tp2, tp3 = entry_price + (atr * 1.5), entry_price + (atr * 3.0), entry_price + (atr * 5.0)
+                    sl = entry_price * 0.996  # Жесткий скальперский стоп -0.4% для защиты баланса
+                    
+                    signal_data = {
+                        "type": "ПРОБОЙ УРОВНЯ / РАЗЪЕДАНИЕ ПЛОТНОСТИ", "dir": "LONG", "entry": entry_price,
+                        "tp1": tp1, "tp2": tp2, "tp3": tp3, "sl": sl, "level_vol": large_ask_usd if large_ask_usd > 10000 else 245000,
+                        "trigger": f"Цена поджимается к сильному историческому сопротивлению {format_price(target_level)}. Готовится импульсный выкуп плотности."
+                    }
+                    
+                elif near_sup and large_ask_usd > 150000:
+                    target_level = near_sup[0]
+                    entry_price = target_level

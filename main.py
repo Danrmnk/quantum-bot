@@ -1,23 +1,26 @@
 import os
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+import matplotlib
+matplotlib.use('Agg')  # Фоновый режим отрисовки без экрана
+import matplotlib.pyplot as plt
 import telebot
 
-# ==========================================
-# КОНФИГУРАЦИЯ
-# ==========================================
+# =====================================================================
+# ИНИЦИАЛИЗАЦИЯ И СИСТЕМНЫЕ НАСТРОЙКИ
+# =====================================================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ТВОЙ_ТЕЛЕГРАМ_ТОКЕН")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "ID_ТВОЕГО_КАНАЛА_ИЛИ_ЧАТА")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 OKX_BASE_URL = "https://okx.com"
 
-active_tracks = {}
-cooldowns = {}  # Хранилище кулдаунов монет, чтобы не спамить
+active_tracks = {}   
+cooldowns = {}       # 45 минут защиты от спама по одной монете
+last_morning_greeting = None
 
 def format_price(price):
-    """Умное форматирование цен для любых монет"""
     price_float = float(price)
     if price_float == 0: return "0.0"
     if price_float >= 100: return f"{price_float:.2f}"
@@ -35,7 +38,7 @@ def get_high_volume_markets():
             inst_id = ticker["instId"]
             if not inst_id.endswith("-USDT-SWAP"): continue
             vol_usd = float(ticker.get("volCcy24h", 0))
-            if vol_usd >= 100000000:  # Фильтр объема от 100 млн $
+            if vol_usd >= 100000000:
                 valid_instruments.append({
                     "id": inst_id,
                     "last_price": float(ticker["last"]),
@@ -45,131 +48,143 @@ def get_high_volume_markets():
     except:
         return []
 
-def analyze_scapling_signals(market):
-    inst_id = market["id"]
-    current_price = market["last_price"]
-    
-    # Проверка кулдауна: если по монете был сигнал меньше 30 минут назад — пропускаем
-    if inst_id in cooldowns and (time.time() - cooldowns[inst_id]) < 1800:
-        return None
-        
+def get_deep_historical_levels(inst_id, bar, limit=150):
     try:
-        books_url = f"{OKX_BASE_URL}/api/v5/market/books?instId={inst_id}&sz=50"
-        books = requests.get(books_url, timeout=3).json()
-        
-        candles_url = f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst_id}&bar=5m&limit=20"
-        candles = requests.get(candles_url, timeout=3).json()
-        
-        if books.get("code") != "0" or "data" not in books or candles.get("code") != "0" or len(candles["data"]) < 10: return None
-
-        bids, asks = books["data"]["bids"], books["data"]["asks"]
-        if not bids or not asks: return None
+        url = f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={limit}"
+        res = requests.get(url, timeout=4).json()
+        if res.get("code") != "0" or "data" not in res or len(res["data"]) < 20:
+            return {"support": [], "resistance": []}
             
-        avg_bid_size = sum([float(b) for b in bids]) / len(bids)
-        avg_ask_size = sum([float(a) for a in asks]) / len(asks)
+        highs = [float(c)[2] for c in res["data"]]
+        lows = [float(c)[3] for c in res["data"]]
         
-        large_bid = max([float(b) for b in bids])
-        large_bid_price = float(bids[[float(b) for b in bids].index(large_bid)])
-        large_ask = max([float(a) for a in asks])
-        large_ask_price = float(asks[[float(a) for a in asks].index(large_ask)])
-
-        highs = [float(c) for c in candles["data"]]
-        lows = [float(c) for c in candles["data"]]
-        volumes = [float(c) for c in candles["data"]]
+        support_levels = []
+        resistance_levels = []
         
-        max_high, min_low = max(highs[1:]), min(lows[1:])
-        avg_volume, current_volume = sum(volumes[1:]) / len(volumes[1:]), volumes
-
-        # Расчет среднего хода цены (ATR) для стопов и лесенки целей
-        changes = [abs(float(c)-float(c)) for c in candles["data"]]
-        atr = sum(changes) / len(changes)
-        if atr == 0: atr = current_price * 0.004
-
-        # 1. СТРАТЕГИЯ: ОТСКОК ОТ ПЛОТНОСТИ
-        if large_bid > avg_bid_size * 5 and abs(current_price - large_bid_price) / current_price < 0.002:
-            return {
-                "type": "ОТСКОК ОТ ПЛОТНОСТИ (LIMIT)", "dir": "LONG", 
-                "trigger": f"Крупный лимитный покупатель ({int(large_bid)} лотов) на уровне {format_price(large_bid_price)}",
-                "sl": large_bid_price - (atr * 0.5), "atr": atr
-            }
-        if large_ask > avg_ask_size * 5 and abs(large_ask_price - current_price) / current_price < 0.002:
-            return {
-                "type": "ОТСКОК ОТ ПЛОТНОСТИ (LIMIT)", "dir": "SHORT", 
-                "trigger": f"Крупный лимитный продавец ({int(large_ask)} лотов) на уровне {format_price(large_ask_price)}",
-                "sl": large_ask_price + (atr * 0.5), "atr": atr
-            }
-
-        # 2. СТРАТЕГИЯ: ПРОБОЙ УРОВНЯ (BREAKOUT)
-        if current_price >= max_high and current_volume > avg_volume * 2.5:
-            return {
-                "type": "ПРОБОЙ ЛОКАЛЬНОГО ХАЯ (BREAKOUT)", "dir": "LONG", 
-                "trigger": f"Импульсный прорыв сопротивления {format_price(max_high)} на объемах",
-                "sl": min_low, "atr": atr
-            }
-        if current_price <= min_low and current_volume > avg_volume * 2.5:
-            return {
-                "type": "ПРОБОЙ ЛОКАЛЬНОГО ЛОЯ (BREAKOUT)", "dir": "SHORT", 
-                "trigger": f"Импульсный прорыв поддержки {format_price(min_low)} на объемах",
-                "sl": max_high, "atr": atr
-            }
-
-        return None
+        for h in set(highs):
+            if highs.count(h) >= 2 or any(abs(h - x) / h < 0.0008 for x in highs if x != h):
+                resistance_levels.append(h)
+        for l in set(lows):
+            if lows.count(l) >= 2 or any(abs(l - x) / l < 0.0008 for x in lows if x != l):
+                support_levels.append(l)
+                
+        return {"support": support_levels, "resistance": resistance_levels}
     except:
+        return {"support": [], "resistance": []}
+
+def generate_chart_photo(inst_id, entry, tp1, tp2, tp3, sl, direction, type_label):
+    """Генерирует качественное фото графика с центрированными уровнями"""
+    try:
+        url = f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst_id}&bar=5m&limit=35"
+        res = requests.get(url, timeout=5).json()
+        if res.get("code") != "0" or "data" not in res: return None
+        
+        # Переворачиваем свечи от старых к новым
+        candles = res["data"][::-1]
+        closes = [float(c)[4] for c in candles]
+        times = [datetime.fromtimestamp(int(c)[0]/1000).strftime('%H:%M') for c in candles]
+        
+        plt.style.use('dark_background')
+        fig, ax = plt.subplots(figsize=(10, 5), dpi=130)
+        
+        # Рисуем плавный неоновый график цены монеты
+        ax.plot(times, closes, color='#00f0ff', linewidth=2, label='Текущий тренд')
+        
+        # Чертим горизонтальные линии уровней
+        ax.axhline(y=entry, color='#3b82f6', linestyle='--', linewidth=1.5, label=f'ВХОД: {format_price(entry)}')
+        ax.axhline(y=tp1, color='#10b981', linestyle='-', linewidth=1.5, label=f'ЦЕЛЬ 1: {format_price(tp1)}')
+        ax.axhline(y=tp2, color='#10b981', linestyle='-', linewidth=1.5, label=f'ЦЕЛЬ 2: {format_price(tp2)}')
+        ax.axhline(y=tp3, color='#059669', linestyle='-', linewidth=2, label=f'ЦЕЛЬ 3: {format_price(tp3)}')
+        ax.axhline(y=sl, color='#ef4444', linestyle='-', linewidth=1.5, label=f'СТОП: {format_price(sl)}')
+        
+        coin_clean = inst_id.split("-")[0]
+        ax.set_title(f"QUANTUM VIP SCANNER | {coin_clean}/USDT (5m) | {direction}", fontsize=11, fontweight='bold', color='#ffffff', pad=12)
+        ax.grid(True, color='#262626', linestyle=':', linewidth=0.5)
+        ax.legend(loc='upper left', framealpha=0.2)
+        
+        # Прореживаем шаги времени снизу
+        plt.xticks(range(0, len(times), 6), times[::6])
+        
+        file_path = f"{inst_id}_scalp.png"
+        plt.tight_layout()
+        plt.savefig(file_path, facecolor='#121212', bbox_inches='tight')
+        plt.close()
+        return file_path
+    except Exception as e:
+        print(f"Ошибка прорисовки фото: {e}")
         return None
+
+def check_active_trades():
+    global active_tracks
+    for inst_id, trade in list(active_tracks.items()):
+        try:
+            url = f"{OKX_BASE_URL}/api/v5/market/ticker?instId={inst_id}"
+            res = requests.get(url, timeout=3).json()
+            if res.get("code") != "0" or "data" not in res: continue
+            
+            current_price = float(res["data"]["last"])
+            direction = trade["direction"]
+            coin = inst_id.split("-")[0]
+            
+            if not trade["activated"]:
+                if (direction == "LONG" and current_price >= trade["entry"]) or (direction == "SHORT" and current_price <= trade["entry"]):
+                    trade["activated"] = True
+                    bot.send_message(CHANNEL_ID, f"🔔 **QUANTUM | ОРДЕР АКТИВИРОВАН**\n\n🟢 Отложенный ордер по #{coin}/USDT набран в позицию по цене `{format_price(trade['entry'])}`!\n🎯 Робот начинает ведение сделки по лесенке целей.", parse_mode="Markdown")
+                continue
+
+            if direction == "LONG":
+                if current_price >= trade["tp1"] and not trade["tp1_hit"]:
+                    trade["tp1_hit"] = True
+                    bot.send_message(CHANNEL_ID, f"🎯 **QUANTUM | ЦЕЛЬ №1 ВЗЯТА**\n\n✅ **Первая цель достигнута по #{coin}/USDT!**\n💵 Фиксируем часть прибыли.\n💼 Переносим Стоп-Лосс в **БЕЗУБЫТОК** (на цену входа).", parse_mode="Markdown")
+                if current_price >= trade["tp2"] and not trade["tp2_hit"]:
+                    trade["tp2_hit"] = True
+                    bot.send_message(CHANNEL_ID, f"🚀 **QUANTUM | ЦЕЛЬ №2 ВЗЯТА**\n\n✅ **Основная цель достигнута по #{coin}/USDT!**\n💵 Фиксируем еще +30% позиции в плюс!", parse_mode="Markdown")
+                if current_price >= trade["tp3"]:
+                    bot.send_message(CHANNEL_ID, f"🏆 **QUANTUM | ПОЛНЫЙ ТЕЙК-ПРОФИТ**\n\n✅ **Финальная Цель №3 закрыта по #{coin}/USDT!**\nСделка отработала идеально на 100%! 🔥", parse_mode="Markdown")
+                    del active_tracks[inst_id]
+                    continue
+                if current_price <= trade["sl"]:
+                    status = "в БЕЗУБЫТОК" if trade["tp1_hit"] else "по СТОП-ЛОССУ (Риск сохранен)"
+                    bot.send_message(CHANNEL_ID, f"🛑 **QUANTUM | СДЕЛКА ЗАКРЫТА**\n\n📋 Позиция #{coin}/USDT закрылась {status}. Риск-менеджмент соблюден.", parse_mode="Markdown")
+                    del active_tracks[inst_id]
+            else: # SHORT
+                if current_price <= trade["tp1"] and not trade["tp1_hit"]:
+                    trade["tp1_hit"] = True
+                    bot.send_message(CHANNEL_ID, f"🎯 **QUANTUM | ЦЕЛЬ №1 ВЗЯТА (SHORT)**\n\n✅ **Первая цель достигнута по #{coin}/USDT!**\n💼 Переносим Стоп-Лосс в **БЕЗУБЫТОК**.", parse_mode="Markdown")
+                if current_price <= trade["tp2"] and not trade["tp2_hit"]:
+                    trade["tp2_hit"] = True
+                    bot.send_message(CHANNEL_ID, f"🚀 **QUANTUM | ЦЕЛЬ №2 ВЗЯТА (SHORT)**\n\n✅ **Основная цель достигнута по #{coin}/USDT!**\n💵 Фиксируем прибыль!", parse_mode="Markdown")
+                if current_price <= trade["tp3"]:
+                    bot.send_message(CHANNEL_ID, f"🏆 **QUANTUM | ПОЛНЫЙ ТЕЙК-ПРОФИТ (SHORT)**\n\n✅ **Финальная Цель №3 закрыта по #{coin}/USDT!**\nПозиция полностью закрыта по целям! 🔥", parse_mode="Markdown")
+                    del active_tracks[inst_id]
+                    continue
+                if current_price >= trade["sl"]:
+                    status = "в БЕЗУБЫТОК" if trade["tp1_hit"] else "по СТОП-ЛОССУ"
+                    bot.send_message(CHANNEL_ID, f"🛑 **QUANTUM | СДЕЛКА ЗАКРЫТА**\n\n📋 Позиция #{coin}/USDT закрылась {status}.", parse_mode="Markdown")
+                    del active_tracks[inst_id]
+        except:
+            pass
 
 def main():
-    print("БРОНЕБОЙНЫЙ VIP СКАНЕР ЗАПУЩЕН!")
+    print("МОНОЛИТ QUANTUM V6.5 ULTRA ENTERPRISE С ГРАФИКАМИ СТАРТОВАЛ!")
     while True:
         try:
+            check_active_trades()
             markets = get_high_volume_markets()
             for market in markets:
                 inst_id = market["id"]
-                if inst_id in active_tracks: continue
+                current_price = market["last_price"]
+                vol_24h_usd = market["vol_24h"]
                 
-                signal = analyze_scapling_signals(market)
-                if signal:
-                    current_price = market["last_price"]
-                    coin_clean = inst_id.split("-")[0]
-                    atr = signal["atr"]
-                    
-                    # Расчет профессиональной ЛЕСЕНКИ ТЕЙКОВ (Цели 1, 2, 3)
-                    if signal["dir"] == "LONG":
-                        tp1 = current_price + (atr * 1.5)
-                        tp2 = current_price + (atr * 3.0)
-                        tp3 = current_price + (atr * 5.0)
-                        sl = min(signal["sl"], current_price * 0.993) # Стоп за уровень, но не более 0.7%
-                    else:
-                        tp1 = current_price - (atr * 1.5)
-                        tp2 = current_price - (atr * 3.0)
-                        tp3 = current_price - (atr * 5.0)
-                        sl = max(signal["sl"], current_price * 1.007)
-
-                    # Формируем КРАСИВЫЙ СИГНАЛ С ЛЕСЕНКОЙ ЦЕЛЕЙ
-                    signal_msg = (
-                        f"📊 **QUANTUM | VIP SCANNER 💎**\n\n"
-                        f"🪙 Пара: #{coin_clean}/USDT\n"
-                        f"Тип: **{signal['type']}**\n"
-                        f"Направление: 🔥 **{signal['dir']}** 🔥\n\n"
-                        f"🚨 **Триггер:** _{signal['trigger']}_\n\n"
-                        f"📥 **ЦЕНА ВХОДА (МАРКЕТ):** `{format_price(current_price)}`\n\n"
-                        f"🎯 **ЛЕСЕНКА ЦЕЛЕЙ (TAKE-POINTS):**\n"
-                        f"🎯 🎯 Цель 1: `{format_price(tp1)}` (Ближняя)\n"
-                        f"🎯 🎯 Цель 2: `{format_price(tp2)}` (Основная)\n"
-                        f"🎯 🎯 Цель 3: `{format_price(tp3)}` (Максимум)\n\n"
-                        f"🛡 **СТОП-ЛОСС (ЗА УРОВЕНЬ):** `{format_price(sl)}`"
-                    )
-                    
-                    bot.send_message(CHANNEL_ID, signal_msg, parse_mode="Markdown")
-                    
-                    # Включаем кулдаун на 30 минут, чтобы бот не спамил этой монетой
-                    cooldowns[inst_id] = time.time()
-                    
-                    # Записываем в трекинг (отслеживаем по первой цели)
-                    active_tracks[inst_id] = {"direction": signal["dir"], "tp": tp1, "sl": sl}
-                    time.sleep(2)
-            time.sleep(10)
-        except Exception as e:
-            time.sleep(10)
-
-if __name__ == "__main__":
-    main()
+                if inst_id in active_tracks: continue
+                if inst_id in cooldowns and (time.time() - cooldowns[inst_id]) < 2700: continue 
+                
+                levels_1D = get_deep_historical_levels(inst_id, "1D", limit=20)
+                levels_1H = get_deep_historical_levels(inst_id, "1H", limit=48)
+                levels_15m = get_deep_historical_levels(inst_id, "15m", limit=60)
+                
+                all_resistance = levels_1D["resistance"] + levels_1H["resistance"] + levels_15m["resistance"]
+                all_support = levels_1D["support"] + levels_1H["support"] + levels_15m["support"]
+                
+                if not all_resistance and not all_support: continue
+                

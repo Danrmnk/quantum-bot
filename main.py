@@ -5,7 +5,7 @@ from datetime import datetime, timezone, timedelta
 import telebot
 
 # =====================================================================
-# ИНИЦИАЛИЗАЦИЯ И СИСТЕМНЫЕ НАСТРОЙКИ
+# НАСТРОЙКИ ПОДКЛЮЧЕНИЯ
 # =====================================================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ТВОЙ_ТЕЛЕГРАМ_ТОКЕН")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "ID_ТВОЕГО_КАНАЛА_ИЛИ_ЧАТА")
@@ -14,7 +14,7 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 OKX_BASE_URL = "https://okx.com"
 
 active_tracks = {}   
-cooldowns = {}       # 45 минут защиты от спама по одной монете
+cooldowns = {}       # 45 минут защиты от повторного спама монеты
 
 def format_price(price):
     try:
@@ -56,73 +56,17 @@ def get_deep_historical_levels(inst_id, bar):
             
         support_levels = []
         resistance_levels = []
-        
         for c in res["data"]:
-            high = float(c[2]) 
-            low = float(c[3])  
-            resistance_levels.append(high)
-            support_levels.append(low)
-                
+            resistance_levels.append(float(c[2]))  # High свечи
+            support_levels.append(float(c[3]))     # Low свечи
         return {"support": support_levels, "resistance": resistance_levels}
     except Exception:
         return {"support": [], "resistance": []}
 
-def check_active_trades():
-    global active_tracks
-    for inst_id, trade in list(active_tracks.items()):
-        try:
-            url = f"{OKX_BASE_URL}/api/v5/market/ticker?instId={inst_id}"
-            res = requests.get(url, timeout=3).json()
-            if res.get("code") != "0" or "data" not in res: continue
-            
-            current_price = float(res["data"]["last"])
-            direction = trade["direction"]
-            coin = inst_id.split("-")[0]
-            
-            if not trade["activated"]:
-                if (direction == "LONG" and current_price >= trade["entry"]) or (direction == "SHORT" and current_price <= trade["entry"]):
-                    trade["activated"] = True
-                    bot.send_message(CHANNEL_ID, f"🔔 **QUANTUM | ОРДЕР АКТИВИРОВАН**\n\n🟢 Отложенный ордер по #{coin}/USDT набран в позицию по цене `{format_price(trade['entry'])}`!\n🎯 Робот начинает ведение сделки по лесенке целей.", parse_mode="Markdown")
-                continue
-
-            if direction == "LONG":
-                if current_price >= trade["tp1"] and not trade["tp1_hit"]:
-                    trade["tp1_hit"] = True
-                    bot.send_message(CHANNEL_ID, f"🎯 **QUANTUM | ЦЕЛЬ №1 ВЗЯТА**\n\n✅ **Первая цель достигнута по #{coin}/USDT!**\n💼 Фиксируем прибыль. Переносим Стоп-Лосс в **БЕЗУБЫТОК**.", parse_mode="Markdown")
-                if current_price >= trade["tp2"] and not trade["tp2_hit"]:
-                    trade["tp2_hit"] = True
-                    bot.send_message(CHANNEL_ID, f"🚀 **QUANTUM | ЦЕЛЬ №2 ВЗЯТА**\n\n✅ **Основная цель достигнута по #{coin}/USDT!**\n💵 Фиксируем еще +30% позиции в плюс!", parse_mode="Markdown")
-                if current_price >= trade["tp3"]:
-                    bot.send_message(CHANNEL_ID, f"🏆 **QUANTUM | ПОЛНЫЙ ТЕЙК-ПРОФИТ**\n\n✅ **Финальная Цезоль №3 закрыта по #{coin}/USDT!**\nСделка отработала идеально на 100%! 🔥", parse_mode="Markdown")
-                    del active_tracks[inst_id]
-                    continue
-                if current_price <= trade["sl"]:
-                    status = "в БЕЗУБЫТОК" if trade["tp1_hit"] else "по СТОП-ЛОССУ (Риск сохранен)"
-                    bot.send_message(CHANNEL_ID, f"🛑 **QUANTUM | СДЕЛКА ЗАКРЫТА**\n\n📋 Позиция #{coin}/USDT закрылась {status}. Риск под контролем.", parse_mode="Markdown")
-                    del active_tracks[inst_id]
-            else: # SHORT
-                if current_price <= trade["tp1"] and not trade["tp1_hit"]:
-                    trade["tp1_hit"] = True
-                    bot.send_message(CHANNEL_ID, f"🎯 **QUANTUM | ЦЕЛЬ №1 ВЗЯТА (SHORT)**\n\n✅ **Первая цель достигнута по #{coin}/USDT!**\n💼 Фиксируем прибыль. Переносим Стоп-Лосс в **БЕЗУБЫТОК**.", parse_mode="Markdown")
-                if current_price <= trade["tp2"] and not trade["tp2_hit"]:
-                    trade["tp2_hit"] = True
-                    bot.send_message(CHANNEL_ID, f"🚀 **QUANTUM | ЦЕЛЬ №2 ВЗЯТА (SHORT)**\n\n✅ **Основная цель достигнута по #{coin}/USDT!**\n💵 Фиксируем шорт-прибыль!", parse_mode="Markdown")
-                if current_price <= trade["tp3"]:
-                    bot.send_message(CHANNEL_ID, f"🏆 **QUANTUM | ПОЛНЫЙ ТЕЙК-ПРОФИТ (SHORT)**\n\n✅ **Финальная Цель №3 закрыта по #{coin}/USDT!**\nПозиция полностью закрыта по целям! 🔥", parse_mode="Markdown")
-                    del active_tracks[inst_id]
-                    continue
-                if current_price >= trade["sl"]:
-                    status = "в БЕЗУБЫТОК" if trade["tp1_hit"] else "по СТОП-ЛОССУ"
-                    bot.send_message(CHANNEL_ID, f"🛑 **QUANTUM | СДЕЛКА ЗАКРЫТА**\n\n📋 Позиция #{coin}/USDT закрылась {status}.", parse_mode="Markdown")
-                    del active_tracks[inst_id]
-        except Exception:
-            pass
-
 def main():
-    print("МОНОЛИТ QUANTUM V6.8 ENTERPRISE УСПЕШНО СТАРТОВАЛ!")
+    print("МОНОЛИТ QUANTUM V6.9 ENTERPRISE УСПЕШНО ЗАПУЩЕН!")
     while True:
         try:
-            check_active_trades()
             markets = get_high_volume_markets()
             for market in markets:
                 inst_id = market["id"]
@@ -134,16 +78,14 @@ def main():
                 
                 levels_1D = get_deep_historical_levels(inst_id, "1D")
                 levels_1H = get_deep_historical_levels(inst_id, "1H")
-                levels_15m = get_deep_historical_levels(inst_id, "15m")
                 
-                all_resistance = levels_1D["resistance"] + levels_1H["resistance"] + levels_15m["resistance"]
-                all_support = levels_1D["support"] + levels_1H["support"] + levels_15m["support"]
+                all_resistance = levels_1D["resistance"] + levels_1H["resistance"]
+                all_support = levels_1D["support"] + levels_1H["support"]
                 
                 if not all_resistance and not all_support: continue
                 
                 books = requests.get(f"{OKX_BASE_URL}/api/v5/market/books?instId={inst_id}&sz=5", timeout=3).json()
-                candles_5m = requests.get(f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst_id}&bar=5m&limit=5", timeout=3).json()
-                if books.get("code") != "0" or "data" not in books or candles_5m.get("code") != "0" or not candles_5m.get("data"): continue
+                if books.get("code") != "0" or "data" not in books: continue
                 
                 bids, asks = books["data"]["bids"], books["data"]["asks"]
                 if not bids or not asks: continue
@@ -157,7 +99,6 @@ def main():
                 large_ask_usd = large_ask * large_ask_price
                 
                 atr = current_price * 0.0025
-                
                 near_res = [r for r in all_resistance if 0.0015 <= (r - current_price) / current_price <= 0.0045]
                 near_sup = [s for s in all_support if 0.0015 <= (current_price - s) / current_price <= 0.0045]
                 
@@ -166,19 +107,63 @@ def main():
                 if near_res and large_bid_usd > 150000:
                     target_level = near_res[0]
                     entry_price = target_level
-                    tp1, tp2, tp3 = entry_price + (atr * 1.5), entry_price + (atr * 3.0), entry_price + (atr * 5.0)
+                    tp1 = entry_price + (atr * 1.5)
+                    tp2 = entry_price + (atr * 3.0)
+                    tp3 = entry_price + (atr * 5.0)
                     sl = entry_price * 0.996  
                     
                     signal_data = {
                         "type": "ПРОБОЙ УРОВНЯ / РАЗЪЕДАНИЕ ПЛОТНОСТИ", "dir": "LONG", "entry": entry_price,
-                        "tp1": tp1, "tp2": tp2, "tp3": tp3, "sl": sl, "level_vol": large_ask_usd if large_ask_usd > 10000 else 245000,
-                        "trigger": f"Цена поджимается к сильному историческому сопротивлению {format_price(target_level)}. Готовится импульсный выкуп плотности."
+                        "tp1": tp1, "tp2": tp2, "tp3": tp3, "sl": sl, "level_vol": large_ask_usd,
+                        "trigger": f"Цена поджимается к сильному сопротивлению {format_price(target_level)}. Ожидается выкуп плотности."
                     }
                     
                 elif near_sup and large_ask_usd > 150000:
                     target_level = near_sup[0]
                     entry_price = target_level
-                    tp1, tp2, tp3 = entry_price - (atr * 1.5), entry_price - (atr * 3.0), entry_price - (atr * 5.0)
+                    tp1 = entry_price - (atr * 1.5)
+                    tp2 = entry_price - (atr * 3.0)
+                    tp3 = entry_price - (atr * 5.0)
                     sl = entry_price * 1.004  
                     
                     signal_data = {
+                        "type": "ПРОБОЙ УРОВНЯ / РАЗЪЕДАНИЕ ПЛОТНОСТИ", "dir": "SHORT", "entry": entry_price,
+                        "tp1": tp1, "tp2": tp2, "tp3": tp3, "sl": sl, "level_vol": large_bid_usd,
+                        "trigger": f"Цена приблизилась к уровню поддержки {format_price(target_level)}. Ожидается пробой вниз."
+                    }
+                    
+                if signal_data:
+                    coin_clean = inst_id.split("-")[0]
+                    profit_pct = round((abs(signal_data["tp1"] - signal_data["entry"]) / signal_data["entry"]) * 100, 2)
+                    tv_chart_url = f"https://tradingview.com{coin_clean.lower()[:2]}/{coin_clean.lower()}usdt.png"
+                    
+                    signal_msg = (
+                        f"📊 **QUANTUM | VIP ENTERPRISE SIGNAL 💎**\n\n"
+                        f"🪙 Пара: #{coin_clean}/USDT\n"
+                        f"Паттерн: **{signal_data['type']}**\n"
+                        f"Направление: 🔥 **{signal_data['dir']}** 🔥\n\n"
+                        f"📊 **ОБЪЕМНЫЙ АНАЛИЗ (SMART MONEY):**\n"
+                        f"• Суточный объём монеты: `${round(vol_24h_usd / 1000000, 1)} Млн $`\n"
+                        f"• Плотность капитала на уровне: `${signal_data['level_vol']:,.0f} USD` 💵\n\n"
+                        f"⚠️ **ИНСТРУКЦИЯ ДЛЯ ВХОДА:**\n"
+                        f"_{signal_data['trigger']}_\n"
+                        f"👉 *Выставляйте ОТЛОЖЕННЫЙ ОРДЕР заранее по указанной цене!*\n\n"
+                        f"📥 **ПЛАНИРУЕМАЯ ЦЕНА ВХОДА:** `{format_price(signal_data['entry'])}`\n\n"
+                        f"🎯 **ЛЕСЕНКА ЗАКРЫТИЯ ЦЕЛЕЙ:**\n"
+                        f"🎯 Цель 1: `{format_price(signal_data['tp1'])}` (+{profit_pct}%)\n"
+                        f"🎯 Цель 2: `{format_price(signal_data['tp2'])}` (+{round(profit_pct*2, 2)}%)\n"
+                        f"🎯 Цель 3: `{format_price(signal_data['tp3'])}` (+{round(profit_pct*3.3, 2)}%)\n\n"
+                        f"🛡 **СТОП-ЛОСС (СТРОГО -0.4% РИСКА):** `{format_price(signal_data['sl'])}`\n\n"
+                        f"📈 **ЖИВОЙ ГРАФИК TRADINGVIEW:** [ОТКРЫТЬ В БРАУЗЕРЕ]({tv_chart_url})\n\n"
+                        f"💡 *Ребята, строго соблюдайте правила риск-менеджмента! Заходите только в подтвержденные сделки и забирайте профит лесенкой!*"
+                    )
+                    
+                    bot.send_message(CHANNEL_ID, signal_msg, parse_mode="Markdown")
+                    cooldowns[inst_id] = time.time()
+                    time.sleep(2)
+            time.sleep(10)
+        except Exception:
+            time.sleep(10)
+
+if __name__ == "__main__":
+    main()

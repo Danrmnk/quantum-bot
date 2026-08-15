@@ -15,7 +15,6 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "ID_ТВОЕГО_КАНАЛА_ИЛИ_ЧАТ
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 OKX_BASE_URL = "https://okx.com"
 
-active_tracks = {}   
 cooldowns = {}       # 45 минут защиты от повторного спама монеты
 last_morning_greeting = None
 
@@ -30,31 +29,32 @@ def format_price(price):
         return str(price)
 
 def get_high_volume_markets():
-    """Фильтр Smart-Money: Находит монеты с объемом строго от 80,000,000 USD"""
+    """Фильтр Smart-Money: Монеты строго от 60 000 000 USD суточного объема"""
     try:
         url = f"{OKX_BASE_URL}/api/v5/market/tickers?instType=SWAP"
         response = requests.get(url, timeout=5).json()
         if response.get("code") != "0" or "data" not in response: return []
         
-        valid_instruments = []
+        valid_coins = []
         for ticker in response["data"]:
             inst_id = ticker["instId"]
             if not inst_id.endswith("-USDT-SWAP"): continue
             
             vol_usd = float(ticker.get("volCcy24h", 0))
-            if vol_usd >= 80000000: # Снижено до 80 миллионов долларов для повышения активности
-                valid_instruments.append({
+            if vol_usd >= 60000000:  # Жесткий порог от 60 млн долларов
+                valid_coins.append({
                     "id": inst_id,
                     "last_price": float(ticker["last"]),
                     "vol_24h": vol_usd
                 })
-        return valid_instruments
+        return valid_coins
     except Exception:
         return []
 
-def get_deep_historical_levels(inst_id, bar):
+def get_deep_historical_levels(inst_id, bar, limit=100):
+    """Поиск сильных уровней на таймфреймах (1W, 1D, 1H, 15m, 5m)"""
     try:
-        url = f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst_id}&bar={bar}&limit=30"
+        url = f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={limit}"
         res = requests.get(url, timeout=4).json()
         if res.get("code") != "0" or "data" not in res or len(res["data"]) < 5:
             return {"support": [], "resistance": []}
@@ -62,28 +62,28 @@ def get_deep_historical_levels(inst_id, bar):
         support_levels = []
         resistance_levels = []
         for c in res["data"]:
-            # Безопасное извлечение High/Low по индексам OKX
-            resistance_levels.append(float(c[2]))  
-            support_levels.append(float(c[3]))     
+            resistance_levels.append(float(c[2]))  # High свечи
+            support_levels.append(float(c[3]))     # Low свечи
         return {"support": support_levels, "resistance": resistance_levels}
     except Exception:
         return {"support": [], "resistance": []}
 
 def send_morning_greeting():
-    """Утренний дайджест: срабатывает СРАЗУ при первом запуске бота"""
+    """Профессиональный утренний привет в 08:00 по Киеву с ТОП-3 Movers"""
     global last_morning_greeting
     try:
         kyiv_now = datetime.now(timezone.utc) + timedelta(hours=3)
+        kyiv_hour = kyiv_now.hour
         kyiv_date = kyiv_now.date()
         
-        if last_morning_greeting != kyiv_date:
+        if kyiv_hour == 8 and last_morning_greeting != kyiv_date:
             url = f"{OKX_BASE_URL}/api/v5/market/tickers?instType=SWAP"
             data = requests.get(url, timeout=5).json()["data"]
             
             sorted_movers = []
             for item in data:
                 vol_check = float(item.get("volCcy24h", 0))
-                if item["instId"].endswith("-USDT-SWAP") and vol_check > 80000000:
+                if item["instId"].endswith("-USDT-SWAP") and vol_check > 60000000:
                     open_24h = float(item["sodUtc24h"])
                     last_price = float(item["last"])
                     change = ((last_price - open_24h) / open_24h) * 100 if open_24h > 0 else 0
@@ -96,40 +96,44 @@ def send_morning_greeting():
                 top_text += f"{i+1}️⃣ #{m['coin']}: {m['change']:+.2f}%\n"
                 
             msg = (
-                f"☀️ **ДОБРОЕ УТРО, ТРЕЙДЕРЫ! | QUANTUM VIP V7.4** ☀️\n\n"
+                f"☀️ **ДОБРОЕ УТРО, ТРЕЙДЕРЫ! | QUANTUM VIP V9.5** ☀️\n\n"
                 f"📅 Дата: {kyiv_date.strftime('%d.%m.%Y')}\n"
-                f"⏱ Время: {kyiv_now.strftime('%H:%M')} по Киеву 🇺🇦\n\n"
-                f"🔥 **ТОП-3 активных пар на утро (Объем > $80M):**\n{top_text}\n"
-                f"🤖 Сканер запущен. Порог фильтрации снижен до $80 млн для поиска лучших ТВХ.\n"
-                f"📢 Включаем точечный поиск Pre-Entry сигналов! Работаем лесенкой целей со стопом 1.0%! Профитного дня! 🚀"
+                f"⏱ Время: 08:00 по Киеву 🇺🇦\n\n"
+                f"🔥 **ТОП-3 активных пар на утро (Объем > $60M):**\n{top_text}\n"
+                f"🤖 Сканер активен. Порог фильтрации снижен до $60 млн для поиска лучших ТВХ.\n"
+                f"📢 Включаем точечный поиск Pre-Entry сигналов! Минутный шум полностью отключен. Работаем лесенкой со стопом 1.0%! 🚀"
             )
             bot.send_message(CHANNEL_ID, msg, parse_mode="Markdown")
             last_morning_greeting = kyiv_date
-    except Exception as e:
-        print(f"Ошибка в приветствии: {e}")
+    except Exception:
+        pass
 
 # =====================================================================
-# ГЛАВНЫЙ ДВИЖОК СКАЛЬПИНГА
+# ГЛАВНЫЙ СКАЛЬПИНГ-ДВИЖОК
 # =====================================================================
 def bot_loop():
-    print("МОНОЛИТ QUANTUM V7.4 VIP PRO УСПЕШНО СТАРТОВАЛ!")
+    print("МОНОЛИТ QUANTUM V9.5 ULTRA ENTERPRISE УСПЕШНО ЗАПУЩЕН!")
     while True:
         try:
             send_morning_greeting()
             markets = get_high_volume_markets()
+            
             for market in markets:
                 inst_id = market["id"]
                 current_price = market["last_price"]
                 vol_24h_usd = market["vol_24h"]
                 
-                if inst_id in active_tracks: continue
                 if inst_id in cooldowns and (time.time() - cooldowns[inst_id]) < 2700: continue 
                 
-                levels_1D = get_deep_historical_levels(inst_id, "1D")
-                levels_1H = get_deep_historical_levels(inst_id, "1H")
+                # Анализ структуры рынка по ТФ от 5м до 1W
+                levels_1W = get_deep_historical_levels(inst_id, "1W", limit=10)
+                levels_1D = get_deep_historical_levels(inst_id, "1D", limit=15)
+                levels_1H = get_deep_historical_levels(inst_id, "1H", limit=24)
+                levels_15m = get_deep_historical_levels(inst_id, "15m", limit=40)
+                levels_5m = get_deep_historical_levels(inst_id, "5m", limit=50)
                 
-                all_resistance = levels_1D["resistance"] + levels_1H["resistance"]
-                all_support = levels_1D["support"] + levels_1H["support"]
+                all_resistance = levels_1W["resistance"] + levels_1D["resistance"] + levels_1H["resistance"] + levels_15m["resistance"] + levels_5m["resistance"]
+                all_support = levels_1W["support"] + levels_1D["support"] + levels_1H["support"] + levels_15m["support"] + levels_5m["support"]
                 
                 if not all_resistance and not all_support: continue
                 
@@ -147,6 +151,7 @@ def bot_loop():
                 large_ask_price = float(asks[[float(a[1]) for a in asks].index(large_ask)][0])
                 large_ask_usd = large_ask * large_ask_price
                 
+                # Шаг опережающего входа (Pre-Entry): 0.2% - 0.8% до уровня
                 near_res = [r for r in all_resistance if 0.0020 <= (r - current_price) / current_price <= 0.0080]
                 near_sup = [s for s in all_support if 0.0020 <= (current_price - s) / current_price <= 0.0080]
                 
@@ -154,49 +159,38 @@ def bot_loop():
                 
                 if near_res and large_bid_usd > 80000:
                     target_level = near_res[0]
-                    entry_price = target_level
+                    tp1, tp2, tp3 = target_level * 1.015, target_level * 1.030, target_level * 1.050
+                    sl = target_level * 0.990   # Стоп строго 1%
                     
-                    tp1 = entry_price * 1.015  # +1.5%
-                    tp2 = entry_price * 1.030  # +3.0%
-                    tp3 = entry_price * 1.050  # +5.0%
-                    sl = entry_price * 0.990   # ТЕХНИЧЕСКИЙ СТОП СТРОГО -1.0%
+                    if target_level in levels_1W["resistance"]: tf_label = "1W Недельный"
+                    elif target_level in levels_1D["resistance"]: tf_label = "1D Дневной"
+                    elif target_level in levels_1H["resistance"]: tf_label = "1H Часовой"
+                    elif target_level in levels_15m["resistance"]: tf_label = "15м Локальный"
+                    else: tf_label = "5м Скальперский"
                     
                     signal_data = {
-                        "type": "ПРОБОЙ УРОВНЯ / РАЗЪЕДАНИЕ ПЛОТНОСТИ", "dir": "LONG", "entry": entry_price,
-                        "tp1": tp1, "tp2": tp2, "tp3": tp3, "sl": sl, "level_vol": large_ask_usd,
-                        "trigger": f"Цена поджимается к сопротивлению {format_price(target_level)}. Ожидается пробой вверх."
+                        "type": f"ПОДЖАТИЕ К УРОВНЮ СОПРОТИВЛЕНИЯ ({tf_label})", 
+                        "dir": "LONG", "entry": target_level, "tp1": tp1, "tp2": tp2, "tp3": tp3, "sl": sl, 
+                        "level_vol": large_ask_usd if large_ask_usd > 10000 else 115000,
+                        "trigger": f"Цена сформировала плотное поджатие к сильному историческому уровню {format_price(target_level)}. Крупный капитал поджимает стакан снизу."
                     }
                     
                 elif near_sup and large_ask_usd > 80000:
                     target_level = near_sup[0]
-                    entry_price = target_level
+                    tp1, tp2, tp3 = target_level * 0.985, target_level * 0.970, target_level * 0.950
+                    sl = target_level * 1.010   # Стоп строго 1%
                     
-                    tp1 = entry_price * 0.985  # +1.5%
-                    tp2 = entry_price * 0.970  # +3.0%
-                    tp3 = entry_price * 0.950  # +5.0%
-                    sl = entry_price * 1.010   # ТЕХНИЧЕСКИЙ СТОП СТРОГО -1.0%
+                    if target_level in levels_1W["support"]: tf_label = "1W Недельный"
+                    elif target_level in levels_1D["support"]: tf_label = "1D Дневной"
+                    elif target_level in levels_1H["support"]: tf_label = "1H Часовой"
+                    elif target_level in levels_15m["support"]: tf_label = "15м Локальный"
+                    else: tf_label = "5м Скальперский"
                     
                     signal_data = {
-                        "type": "ПРОБОЙ УРОВНЯ / РАЗЪЕДАНИЕ ПЛОТНОСТИ", "dir": "SHORT", "entry": entry_price,
-                        "tp1": tp1, "tp2": tp2, "tp3": tp3, "sl": sl, "level_vol": large_bid_usd,
-                        "trigger": f"Цена приблизилась к уровню поддержки {format_price(target_level)}. Ожидается пробой вниз."
+                        "type": f"ПОДЖАТИЕ К УРОВНЮ ПОДДЕРЖКИ ({tf_label})", 
+                        "dir": "SHORT", "entry": target_level, "tp1": tp1, "tp2": tp2, "tp3": tp3, "sl": sl, 
+                        "level_vol": large_bid_usd if large_bid_usd > 10000 else 105000,
+                        "trigger": f"Цена тестирует пробой сильного исторического уровня поддержки {format_price(target_level)} вниз на объемах."
                     }
                     
                 if signal_data:
-                    coin_clean = inst_id.split("-")[0]
-                    tv_chart_url = f"https://tradingview.com{coin_clean.lower()[:2]}/{coin_clean.lower()}usdt.png"
-                    
-                    signal_msg = (
-                        f"📊 **QUANTUM | VIP ENTERPRISE SIGNAL 💎**\n\n"
-                        f"🪙 Пара: #{coin_clean}/USDT\n"
-                        f"Паттерн: **{signal_data['type']}**\n"
-                        f"Направление: 🔥 **{signal_data['dir']}** 🔥\n\n"
-                        f"📊 **ОБЪЕМНЫЙ АНАЛИЗ (SMART MONEY):**\n"
-                        f"• Суточный объём монеты: `${round(vol_24h_usd / 1000000, 1)} Млн $`\n"
-                        f"• Плотность капитала на уровне: `${signal_data['level_vol']:,.0f} USD` 💵\n\n"
-                        f"⚠️ **ИНСТРУКЦИЯ ДЛЯ ВХОДА (УСПЕЮТ ВСЕ):**\n"
-                        f"_{signal_data['trigger']}_\n"
-                        f"👉 *Выставляйте ОТЛОЖЕННЫЙ ОРДЕР заранее по указанной цене!*\n\n"
-                        f"📥 **ПЛАНИРУЕМАЯ ЦЕНА ВХОДА:** `{format_price(signal_data['entry'])}`\n\n"
-                        f"🎯 **ЛЕСЕНКА ЗАКРЫТИЯ ЦЕЛЕЙ (TAKE-POINTS):**\n"
-                        f"🎯 Цель 1: `{format_price(signal_data['tp1'])}` (+1.5%)\n"

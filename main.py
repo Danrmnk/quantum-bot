@@ -17,6 +17,7 @@ OKX_BASE_URL = "https://okx.com"
 
 active_tracks = {}   
 cooldowns = {}       # 45 минут защиты от повторного спама монеты
+last_morning_greeting = None
 
 def format_price(price):
     try:
@@ -59,19 +60,59 @@ def get_deep_historical_levels(inst_id, bar):
         support_levels = []
         resistance_levels = []
         for c in res["data"]:
-            resistance_levels.append(float(c[2]))  # High свечи
-            support_levels.append(float(c[3]))     # Low свечи
+            # В API OKX: c[2] = High свечи, c[3] = Low свечи
+            resistance_levels.append(float(c[2]))  
+            support_levels.append(float(c[3]))     
         return {"support": support_levels, "resistance": resistance_levels}
     except Exception:
         return {"support": [], "resistance": []}
 
+def send_morning_greeting():
+    """Утренний дайджест: срабатывает СРАЗУ при первом запуске бота"""
+    global last_morning_greeting
+    try:
+        kyiv_now = datetime.now(timezone.utc) + timedelta(hours=3)
+        kyiv_date = kyiv_now.date()
+        
+        if last_morning_greeting != kyiv_date:
+            url = f"{OKX_BASE_URL}/api/v5/market/tickers?instType=SWAP"
+            data = requests.get(url, timeout=5).json()["data"]
+            
+            sorted_movers = []
+            for item in data:
+                if item["instId"].endswith("-USDT-SWAP") and float(item.get("volCcy24h", 0)) > 100000000:
+                    open_24h = float(item["sodUtc24h"])
+                    last_price = float(item["last"])
+                    change = ((last_price - open_24h) / open_24h) * 100 if open_24h > 0 else 0
+                    sorted_movers.append({"coin": item["instId"].split("-")[0], "change": change})
+            
+            sorted_movers = sorted(sorted_movers, key=lambda x: abs(x["change"]), reverse=True)
+            
+            top_text = ""
+            for i, m in enumerate(sorted_movers[:3]):
+                top_text += f"{i+1}️⃣ #{m['coin']}: {m['change']:+.2f}%\n"
+                
+            msg = (
+                f"☀️ **ДОБРОЕ УТРО, ТРЕЙДЕРЫ! | QUANTUM VIP V7.2** ☀️\n\n"
+                f"📅 Дата: {kyiv_date.strftime('%d.%m.%Y')}\n"
+                f"⏱ Время: {kyiv_now.strftime('%H:%M')} по Киеву 🇺🇦\n\n"
+                f"🔥 **ТОП-3 самых волатильных пар на утро (Объем > $100M):**\n{top_text}\n"
+                f"🤖 Сканер активен на полную мощность. База уровней полностью обновлена.\n"
+                f"📢 Включаем точечный поиск Pre-Entry сигналов! Работаем лесенкой целей с техническим стопом 1.0%! Профитного дня! 🚀"
+            )
+            bot.send_message(CHANNEL_ID, msg, parse_mode="Markdown")
+            last_morning_greeting = kyiv_date
+    except Exception as e:
+        print(f"Ошибка в приветствии: {e}")
+
 # =====================================================================
-# ФИНАЛЬНЫЙ СКАЛЬПИНГ-ДВИЖОК
+# ГЛАВНЫЙ ДВИЖОК СКАЛЬПИНГА
 # =====================================================================
 def bot_loop():
-    print("МОНОЛИТ QUANTUM V6.9 ENTERPRISE УСПЕШНО ЗАПУЩЕН!")
+    print("МОНОЛИТ QUANTUM V7.2 VIP PRO УСПЕШНО СТАРТОВАЛ!")
     while True:
         try:
+            send_morning_greeting()
             markets = get_high_volume_markets()
             for market in markets:
                 inst_id = market["id"]
@@ -90,7 +131,8 @@ def bot_loop():
                 if not all_resistance and not all_support: continue
                 
                 books = requests.get(f"{OKX_BASE_URL}/api/v5/market/books?instId={inst_id}&sz=5", timeout=3).json()
-                if books.get("code") != "0" or "data" not in books: continue
+                candles_5m = requests.get(f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst_id}&bar=5m&limit=5", timeout=3).json()
+                if books.get("code") != "0" or "data" not in books or candles_5m.get("code") != "0" or not candles_5m.get("data"): continue
                 
                 bids, asks = books["data"]["bids"], books["data"]["asks"]
                 if not bids or not asks: continue
@@ -103,33 +145,39 @@ def bot_loop():
                 large_ask_price = float(asks[[float(a[1]) for a in asks].index(large_ask)][0])
                 large_ask_usd = large_ask * large_ask_price
                 
-                atr = current_price * 0.0025
-                near_res = [r for r in all_resistance if 0.0015 <= (r - current_price) / current_price <= 0.0045]
-                near_sup = [s for s in all_support if 0.0015 <= (current_price - s) / current_price <= 0.0045]
+                # Извлекаем High и Low первой свечи для расчета шага волатильности
+                c_data = candles_5m["data"][0]
+                atr = abs(float(c_data[2]) - float(c_data[3]))
+                if atr == 0: atr = current_price * 0.0025
+                
+                near_res = [r for r in all_resistance if 0.0020 <= (r - current_price) / current_price <= 0.0080]
+                near_sup = [s for s in all_support if 0.0020 <= (current_price - s) / current_price <= 0.0080]
                 
                 signal_data = None
                 
-                if near_res and large_bid_usd > 150000:
+                if near_res and large_bid_usd > 90000:
                     target_level = near_res[0]
                     entry_price = target_level
-                    tp1 = entry_price + (atr * 1.5)
-                    tp2 = entry_price + (atr * 3.0)
-                    tp3 = entry_price + (atr * 5.0)
-                    sl = entry_price * 0.996  
+                    
+                    tp1 = entry_price * 1.015  # +1.5%
+                    tp2 = entry_price * 1.030  # +3.0%
+                    tp3 = entry_price * 1.050  # +5.0%
+                    sl = entry_price * 0.990   # СТОП РОВНО -1.0%
                     
                     signal_data = {
                         "type": "ПРОБОЙ УРОВНЯ / РАЗЪЕДАНИЕ ПЛОТНОСТИ", "dir": "LONG", "entry": entry_price,
                         "tp1": tp1, "tp2": tp2, "tp3": tp3, "sl": sl, "level_vol": large_ask_usd,
-                        "trigger": f"Цена поджимается к сильному сопротивлению {format_price(target_level)}. Ожидается выкуп плотности."
+                        "trigger": f"Цена поджимается к сильному сопротивлению {format_price(target_level)}. Готовится пробой вверх."
                     }
                     
-                elif near_sup and large_ask_usd > 150000:
+                elif near_sup and large_ask_usd > 90000:
                     target_level = near_sup[0]
                     entry_price = target_level
-                    tp1 = entry_price - (atr * 1.5)
-                    tp2 = entry_price - (atr * 3.0)
-                    tp3 = entry_price - (atr * 5.0)
-                    sl = entry_price * 1.004  
+                    
+                    tp1 = entry_price * 0.985  # +1.5%
+                    tp2 = entry_price * 0.970  # +3.0%
+                    tp3 = entry_price * 0.950  # +5.0%
+                    sl = entry_price * 1.010   # СТОП РОВНО -1.0%
                     
                     signal_data = {
                         "type": "ПРОБОЙ УРОВНЯ / РАЗЪЕДАНИЕ ПЛОТНОСТИ", "dir": "SHORT", "entry": entry_price,
@@ -139,7 +187,6 @@ def bot_loop():
                     
                 if signal_data:
                     coin_clean = inst_id.split("-")[0]
-                    profit_pct = round((abs(signal_data["tp1"] - signal_data["entry"]) / signal_data["entry"]) * 100, 2)
                     tv_chart_url = f"https://tradingview.com{coin_clean.lower()[:2]}/{coin_clean.lower()}usdt.png"
                     
                     signal_msg = (
@@ -150,44 +197,6 @@ def bot_loop():
                         f"📊 **ОБЪЕМНЫЙ АНАЛИЗ (SMART MONEY):**\n"
                         f"• Суточный объём монеты: `${round(vol_24h_usd / 1000000, 1)} Млн $`\n"
                         f"• Плотность капитала на уровне: `${signal_data['level_vol']:,.0f} USD` 💵\n\n"
-                        f"⚠️ **ИНСТРУКЦИЯ ДЛЯ ВХОДА:**\n"
+                        f"⚠️ **ИНСТРУКЦИЯ ДЛЯ ВХОДА (УСПЕЮТ ВСЕ):**\n"
                         f"_{signal_data['trigger']}_\n"
                         f"👉 *Выставляйте ОТЛОЖЕННЫЙ ОРДЕР заранее по указанной цене!*\n\n"
-                        f"📥 **ПЛАНИРУЕМАЯ ЦЕНА ВХОДА:** `{format_price(signal_data['entry'])}`\n\n"
-                        f"🎯 **ЛЕСЕНКА ЗАКРЫТИЯ ЦЕЛЕЙ:**\n"
-                        f"🎯 Цель 1: `{format_price(signal_data['tp1'])}` (+{profit_pct}%)\n"
-                        f"🎯 Цель 2: `{format_price(signal_data['tp2'])}` (+{round(profit_pct*2, 2)}%)\n"
-                        f"🎯 Цель 3: `{format_price(signal_data['tp3'])}` (+{round(profit_pct*3.3, 2)}%)\n\n"
-                        f"🛡 **КАЧЕСТВЕННЫЙ СТОП-ЛОСС (СТРОГО -0.4% РИСКА):** `{format_price(signal_data['sl'])}`\n\n"
-                        f"📈 **ЖИВОЙ ГРАФИК TRADINGVIEW:** [ОТКРЫТЬ В БРАУЗЕРЕ]({tv_chart_url})\n\n"
-                        f"💡 *Ребята, строго соблюдайте правила риск-менеджмента! Заходите только в подтвержденные сделки и забирайте профит лесенкой!*"
-                    )
-                    
-                    bot.send_message(CHANNEL_ID, signal_msg, parse_mode="Markdown")
-                    cooldowns[inst_id] = time.time()
-                    time.sleep(2)
-            time.sleep(10)
-        except Exception:
-            time.sleep(10)
-
-# =====================================================================
-# ФИНАЛЬНЫЙ ОБМАН ПОРТА ДЛЯ RENDER (БЕСПЛАТНЫЙ WEB SERVICE)
-# =====================================================================
-class WebServerHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/html")
-        self.end_headers()
-        self.wfile.write(b"QUANTUM BOT IS ALIVE!")
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), WebServerHandler)
-    print(f"Заглушка веб-порта успешно открыта на порту {port}")
-    server.serve_forever()
-
-if __name__ == "__main__":
-    # Запускаем фоновый веб-сервер, чтобы Render увидел открытый порт
-    threading.Thread(target=run_web_server, daemon=True).start()
-    # Запускаем основной движок сканера
-    bot_loop()

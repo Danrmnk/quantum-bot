@@ -197,4 +197,6 @@ def bot_loop():
                     tv_chart_url = f"https://tradingview.com{coin_clean.lower()[:2]}/{coin_clean.lower()}usdt.png"
                     
                     signal_msg = (
-                        f"📊 **QUANTUM | PREMIUM VIP SIGNAL** 💎\n\n"
+                        f"📊 **QUANTUM | PREMIUM VIP SIGNAL** 💎\n\n" 
+                    )
+

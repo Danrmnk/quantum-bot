@@ -1,1547 +1,1057 @@
 import os
+import io
 import time
-import threading
+import math
 import logging
+import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
-import telebot
-
+import numpy as np
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
+
+import telebot
 
 
 # ============================================================
-# QUANTUM SCALPER V3
-# FREE RENDER WEB SERVICE
+# QUANTUM SCALPER V4
+# ============================================================
+# Strategy engine:
+# 1. Horizontal Level Breakout
+# 2. Trendline Compression Breakout
+# 3. Momentum Breakout
 #
-# НЕ ТОРГУЕТ АВТОМАТИЧЕСКИ.
-# Только анализирует рынок OKX и отправляет сигналы Telegram.
+# Timeframes:
+# 1H  -> market structure / direction
+# 15M -> setup / level / compression
+# 5M  -> entry confirmation
+#
+# IMPORTANT:
+# This bot sends signals only when the setup is formed BEFORE
+# the expected breakout, so the user has time to prepare an order.
 # ============================================================
 
 
 # ============================================================
-# ENV
+# CONFIG
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
 
-PORT = int(os.getenv("PORT", "10000"))
+OKX_BASE_URL = "https://openapi.okx.com"
 
-# Минимальный score.
-MIN_SCORE = int(os.getenv("MIN_SCORE", "80"))
+MIN_VOLUME_24H = 60_000_000
+MIN_SCORE = 80
 
-# Минимальный 24H оборот в USD.
-MIN_VOLUME_USD = float(
-    os.getenv("MIN_VOLUME_USD", "20000000")
-)
+SCAN_INTERVAL = 30
 
-# Сколько наиболее ликвидных монет проверять.
-MAX_SYMBOLS = int(
-    os.getenv("MAX_SYMBOLS", "15")
-)
+# We analyse the highest-volume liquid markets.
+# The volume filter is applied to the whole ticker list first.
+MAX_CANDIDATES = 20
 
-# Интервал между полными сканами.
-SCAN_INTERVAL = int(
-    os.getenv("SCAN_INTERVAL", "30")
-)
+# Signal frequency protection
+GLOBAL_SIGNAL_COOLDOWN = 12 * 60          # 12 min
+SYMBOL_SIGNAL_COOLDOWN = 60 * 60          # 60 min
+MAX_SIGNALS_PER_HOUR = 5
 
-# Повторный сигнал по той же монете.
-COOLDOWN_MINUTES = int(
-    os.getenv("COOLDOWN_MINUTES", "60")
-)
+# A signal should be close enough to the trigger
+# to remain actionable, but not already extended.
+MAX_ENTRY_DISTANCE = 0.0040               # 0.40%
 
-# READY живёт максимум столько.
-READY_MINUTES = int(
-    os.getenv("READY_MINUTES", "12")
-)
-
-# Максимум новых сигналов за час.
-MAX_SIGNALS_PER_HOUR = int(
-    os.getenv("MAX_SIGNALS_PER_HOUR", "5")
-)
-
-# Не входить, если цена уже слишком далеко убежала.
-MAX_CHASE_PERCENT = float(
-    os.getenv("MAX_CHASE_PERCENT", "0.45")
-)
-
-# Morning greeting.
-MORNING_ENABLED = (
-    os.getenv(
-        "MORNING_ENABLED",
-        "true"
-    ).lower() == "true"
-)
-
-MORNING_HOUR = int(
-    os.getenv("MORNING_HOUR", "9")
-)
-
-MORNING_MINUTE = int(
-    os.getenv("MORNING_MINUTE", "0")
-)
+# Avoid extremely tight / noisy setups.
+MIN_ATR_PERCENT = 0.0015                  # 0.15%
+MAX_ATR_PERCENT = 0.0350                   # 3.50%
 
 KYIV = ZoneInfo("Europe/Kyiv")
 
-
-# ============================================================
-# VALIDATION
-# ============================================================
-
-if not TELEGRAM_TOKEN:
-    raise RuntimeError(
-        "TELEGRAM_TOKEN is missing"
-    )
-
-if not CHANNEL_ID:
-    raise RuntimeError(
-        "CHANNEL_ID is missing"
-    )
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
 logging.basicConfig(
     level=logging.INFO,
-    format=(
-        "%(asctime)s | "
-        "%(levelname)s | "
-        "%(message)s"
-    )
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-log = logging.getLogger("QUANTUM")
+log = logging.getLogger("quantum")
 
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN is missing")
 
-# ============================================================
-# TELEGRAM
-# ============================================================
+if not CHANNEL_ID:
+    raise RuntimeError("CHANNEL_ID is missing")
 
-bot = telebot.TeleBot(
-    TELEGRAM_TOKEN
-)
-
-
-# ============================================================
-# HTTP / OKX
-# ============================================================
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 session = requests.Session()
-
 session.headers.update({
-    "User-Agent": "QuantumScalperV3/1.0",
-    "Accept": "application/json",
+    "User-Agent": "QuantumScalper/4.0"
 })
-
-
-OKX_URL = "https://www.okx.com"
 
 
 # ============================================================
 # STATE
 # ============================================================
 
-state_lock = threading.Lock()
+last_signal_by_symbol = {}
+signal_times = []
 
-cooldowns = {}
+oi_history = {}
 
-ready_signals = {}
-
-signals_last_hour = []
-
-oi_previous = {}
-
-last_scan_timestamp = 0
-
+last_morning_message_date = None
 scan_number = 0
 
-signals_today = 0
-
-last_morning_date = None
-
 
 # ============================================================
-# HELPERS
+# BASIC HELPERS
 # ============================================================
 
-def current_time():
-    return time.time()
-
-
-def kyiv_now():
+def now_kyiv():
     return datetime.now(KYIV)
 
 
 def fmt_price(value):
     try:
-        value = float(value)
+        p = float(value)
 
-        if value >= 10000:
-            return f"{value:,.0f}".replace(",", " ")
+        if p >= 1000:
+            return f"{p:,.2f}".replace(",", " ")
 
-        if value >= 1000:
-            return f"{value:,.2f}".replace(",", " ")
+        if p >= 100:
+            return f"{p:.2f}"
 
-        if value >= 100:
-            return f"{value:.2f}"
+        if p >= 1:
+            return f"{p:.4f}".rstrip("0").rstrip(".")
 
-        if value >= 1:
-            return (
-                f"{value:.4f}"
-                .rstrip("0")
-                .rstrip(".")
-            )
+        if p >= 0.01:
+            return f"{p:.6f}".rstrip("0").rstrip(".")
 
-        return (
-            f"{value:.8f}"
-            .rstrip("0")
-            .rstrip(".")
-        )
+        return f"{p:.8f}".rstrip("0").rstrip(".")
 
     except Exception:
         return str(value)
 
 
-def pct_distance(a, b):
-    if b == 0:
-        return 999.0
+def fmt_money(value):
+    try:
+        v = float(value)
 
-    return abs(a - b) / b * 100.0
+        if v >= 1_000_000_000:
+            return f"${v / 1_000_000_000:.2f}B"
+
+        if v >= 1_000_000:
+            return f"${v / 1_000_000:.1f}M"
+
+        if v >= 1_000:
+            return f"${v / 1_000:.1f}K"
+
+        return f"${v:.0f}"
+
+    except Exception:
+        return "$0"
+
+
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def percent(a, b):
+    if b == 0:
+        return 0.0
+    return (a - b) / b * 100.0
 
 
 def score_label(score):
     if score >= 95:
-        return "🚀 ELITE"
-
+        return "ELITE"
     if score >= 90:
-        return "🔥 PREMIUM"
-
+        return "PREMIUM"
     if score >= 85:
-        return "💎 STRONG"
-
-    return "⚡ SIGNAL"
-
-
-def volume_grade(volume):
-    if volume >= 1_000_000_000:
-        return "VERY HIGH"
-
-    if volume >= 250_000_000:
-        return "HIGH"
-
-    if volume >= 100_000_000:
-        return "GOOD"
-
-    return "MEDIUM"
-
-
-def clean_old_hour_signals():
-    now = current_time()
-
-    with state_lock:
-        signals_last_hour[:] = [
-            x
-            for x in signals_last_hour
-            if now - x < 3600
-        ]
+        return "STRONG"
+    return "STANDARD"
 
 
 # ============================================================
-# OKX REQUEST
+# OKX API
 # ============================================================
 
-def okx_get(
-    endpoint,
-    params=None,
-    retries=3
-):
-    url = OKX_URL + endpoint
+def okx_get(path, params=None, timeout=8):
+    """
+    Public OKX request with retries.
+
+    We deliberately do not let a failed request kill the scanner.
+    """
 
     last_error = None
 
-    for attempt in range(
-        1,
-        retries + 1
-    ):
+    for attempt in range(3):
         try:
-
             response = session.get(
-                url,
+                OKX_BASE_URL + path,
                 params=params,
-                timeout=8
+                timeout=timeout
             )
 
             response.raise_for_status()
 
             data = response.json()
 
-            if data.get("code") != "0":
+            if str(data.get("code")) != "0":
                 raise RuntimeError(
-                    data.get(
-                        "msg",
-                        "Unknown OKX error"
-                    )
+                    f"OKX error {data.get('code')}: {data.get('msg')}"
                 )
 
-            return data
+            return data.get("data", [])
 
-        except Exception as error:
+        except Exception as exc:
+            last_error = exc
 
-            last_error = error
+            if attempt < 2:
+                time.sleep(0.8 * (attempt + 1))
 
-            log.warning(
-                "OKX request failed "
-                "%s/%s: %s",
-                attempt,
-                retries,
-                error
-            )
+    log.warning("OKX request failed: %s %s", path, last_error)
+    return None
 
-            time.sleep(
-                attempt * 1.5
-            )
-
-    raise RuntimeError(
-        f"OKX request failed: {last_error}"
-    )
-
-
-# ============================================================
-# TICKERS
-# ============================================================
 
 def get_tickers():
-
-    data = okx_get(
+    return okx_get(
         "/api/v5/market/tickers",
-        {
-            "instType": "SWAP"
-        }
+        {"instType": "SWAP"}
     )
 
-    markets = []
 
-    for item in data.get(
-        "data",
-        []
-    ):
-
-        inst_id = item.get(
-            "instId",
-            ""
-        )
-
-        if not inst_id.endswith(
-            "-USDT-SWAP"
-        ):
-            continue
-
-        try:
-
-            price = float(
-                item["last"]
-            )
-
-            # Для SWAP volCcy24h — объём
-            # в базовой валюте.
-            # Переводим приблизительно
-            # в USD через текущую цену.
-            vol_base = float(
-                item.get(
-                    "volCcy24h",
-                    0
-                ) or 0
-            )
-
-            volume_usd = (
-                vol_base * price
-            )
-
-            high = float(
-                item.get(
-                    "high24h",
-                    0
-                ) or 0
-            )
-
-            low = float(
-                item.get(
-                    "low24h",
-                    0
-                ) or 0
-            )
-
-            if price <= 0:
-                continue
-
-            if volume_usd < MIN_VOLUME_USD:
-                continue
-
-            markets.append({
-                "inst_id": inst_id,
-                "price": price,
-                "volume_usd": volume_usd,
-                "high": high,
-                "low": low,
-            })
-
-        except Exception:
-            continue
-
-    markets.sort(
-        key=lambda x: x[
-            "volume_usd"
-        ],
-        reverse=True
-    )
-
-    return markets[
-        :MAX_SYMBOLS
-    ]
-
-
-# ============================================================
-# CANDLES
-# ============================================================
-
-def get_candles(
-    inst_id,
-    timeframe,
-    limit=100
-):
-
+def get_candles(inst_id, bar, limit=100):
     data = okx_get(
         "/api/v5/market/candles",
         {
             "instId": inst_id,
-            "bar": timeframe,
-            "limit": str(limit),
+            "bar": bar,
+            "limit": str(limit)
         }
     )
 
+    if not data:
+        return []
+
     candles = []
 
-    for row in reversed(
-        data.get(
-            "data",
-            []
-        )
-    ):
-
-        try:
-
-            candles.append({
-                "ts": int(row[0]),
-
-                "open": float(row[1]),
-                "high": float(row[2]),
-                "low": float(row[3]),
-                "close": float(row[4]),
-
-                "volume": float(row[5]),
-
-                # Для OKX candle row[7]
-                # является объёмом в quote currency.
-                "quote_volume": float(
-                    row[7]
-                ),
-
-                # row[8] = confirm
-                "confirmed": (
-                    str(row[8]) == "1"
-                ),
-            })
-
-        except Exception:
+    for row in data:
+        if len(row) < 9:
             continue
+
+        candles.append({
+            "ts": int(row[0]),
+            "o": safe_float(row[1]),
+            "h": safe_float(row[2]),
+            "l": safe_float(row[3]),
+            "c": safe_float(row[4]),
+            "vol": safe_float(row[5]),
+            "vol_ccy": safe_float(row[6]),
+            "confirm": row[8]
+        })
+
+    # OKX normally returns newest first.
+    candles.sort(key=lambda x: x["ts"])
+
+    # Ignore the currently forming candle.
+    if candles and candles[-1]["confirm"] != "1":
+        candles = candles[:-1]
 
     return candles
 
 
-# ============================================================
-# OPEN INTEREST
-# ============================================================
-
-def get_open_interest(
-    inst_id
-):
-
+def get_open_interest(inst_id):
     data = okx_get(
         "/api/v5/public/open-interest",
         {
             "instType": "SWAP",
-            "instId": inst_id,
+            "instId": inst_id
         }
     )
 
-    rows = data.get(
-        "data",
-        []
-    )
+    if not data:
+        return 0.0
 
-    if not rows:
-        return None
-
-    try:
-
-        # OI в контрактах.
-        return float(
-            rows[0]["oi"]
-        )
-
-    except Exception:
-
-        return None
+    return safe_float(data[0].get("oi"), 0.0)
 
 
 # ============================================================
-# EMA
+# MARKET SELECTION
 # ============================================================
 
-def calculate_ema(
-    values,
-    period
-):
+def get_liquid_markets():
+    """
+    IMPORTANT:
+    The $60M filter is applied BEFORE technical analysis.
 
-    if not values:
+    Therefore low-volume coins never reach the expensive
+    1H / 15M / 5M analysis.
+    """
+
+    tickers = get_tickers()
+
+    if not tickers:
         return []
 
-    multiplier = 2.0 / (
-        period + 1
+    markets = []
+
+    for ticker in tickers:
+
+        inst_id = ticker.get("instId", "")
+
+        if not inst_id.endswith("-USDT-SWAP"):
+            continue
+
+        last = safe_float(ticker.get("last"))
+        volume = safe_float(ticker.get("volCcy24h"))
+
+        if last <= 0:
+            continue
+
+        if volume < MIN_VOLUME_24H:
+            continue
+
+        markets.append({
+            "inst_id": inst_id,
+            "coin": inst_id.split("-")[0],
+            "price": last,
+            "volume": volume,
+            "high24h": safe_float(ticker.get("high24h")),
+            "low24h": safe_float(ticker.get("low24h"))
+        })
+
+    markets.sort(
+        key=lambda x: x["volume"],
+        reverse=True
     )
 
-    result = [
-        values[0]
-    ]
+    return markets[:MAX_CANDIDATES]
 
-    for value in values[1:]:
 
-        result.append(
-            (
-                value
-                * multiplier
-            )
-            +
-            (
-                result[-1]
-                * (
-                    1
-                    - multiplier
-                )
-            )
-        )
+# ============================================================
+# INDICATORS
+# ============================================================
+
+def ema(values, period):
+    values = np.asarray(values, dtype=float)
+
+    if len(values) < period:
+        return None
+
+    alpha = 2.0 / (period + 1.0)
+
+    result = np.zeros_like(values)
+    result[0] = values[0]
+
+    for i in range(1, len(values)):
+        result[i] = alpha * values[i] + (1 - alpha) * result[i - 1]
 
     return result
 
 
-# ============================================================
-# ATR
-# ============================================================
+def atr(candles, period=14):
+    if len(candles) < period + 1:
+        return 0.0
 
-def calculate_atr(
-    candles,
-    period=14
-):
+    highs = np.array([x["h"] for x in candles], dtype=float)
+    lows = np.array([x["l"] for x in candles], dtype=float)
+    closes = np.array([x["c"] for x in candles], dtype=float)
 
-    if len(candles) < (
-        period + 2
-    ):
-        return 0
+    tr = []
 
-    true_ranges = []
-
-    for i in range(
-        1,
-        len(candles)
-    ):
-
-        current = candles[i]
-        previous = candles[i - 1]
-
-        tr = max(
-            current["high"]
-            - current["low"],
-
-            abs(
-                current["high"]
-                - previous["close"]
-            ),
-
-            abs(
-                current["low"]
-                - previous["close"]
-            ),
+    for i in range(1, len(candles)):
+        tr.append(
+            max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1])
+            )
         )
 
-        true_ranges.append(tr)
-
-    if len(true_ranges) < period:
-        return 0
-
-    return (
-        sum(
-            true_ranges[-period:]
-        )
-        / period
-    )
+    return float(np.mean(tr[-period:]))
 
 
-# ============================================================
-# VOLUME RATIO
-# ============================================================
+def volume_ratio(candles, lookback=20):
+    if len(candles) < lookback + 1:
+        return 1.0
 
-def get_volume_ratio(
-    candles
-):
-
-    if len(candles) < 22:
-        return 0
-
-    current = candles[-1][
-        "quote_volume"
-    ]
+    current = candles[-1]["vol_ccy"]
 
     previous = [
-        x["quote_volume"]
-        for x in candles[
-            -21:-1
-        ]
-        if x["quote_volume"] > 0
+        x["vol_ccy"]
+        for x in candles[-lookback - 1:-1]
+        if x["vol_ccy"] > 0
     ]
 
     if not previous:
-        return 0
+        return 1.0
 
-    average = (
-        sum(previous)
-        / len(previous)
-    )
+    avg = float(np.mean(previous))
 
-    if average <= 0:
-        return 0
+    if avg == 0:
+        return 1.0
 
-    return current / average
+    return current / avg
 
 
-# ============================================================
-# PIVOTS
-# ============================================================
+def linreg_slope(values):
+    if len(values) < 2:
+        return 0.0
 
-def pivot_highs(
-    candles
-):
+    y = np.asarray(values, dtype=float)
+    x = np.arange(len(y), dtype=float)
 
-    levels = []
+    slope = np.polyfit(x, y, 1)[0]
 
-    for i in range(
-        2,
-        len(candles) - 2
-    ):
-
-        h = candles[i][
-            "high"
-        ]
-
-        if (
-            h >= candles[i - 1]["high"]
-            and h >= candles[i - 2]["high"]
-            and h >= candles[i + 1]["high"]
-            and h >= candles[i + 2]["high"]
-        ):
-            levels.append(h)
-
-    return levels
-
-
-def pivot_lows(
-    candles
-):
-
-    levels = []
-
-    for i in range(
-        2,
-        len(candles) - 2
-    ):
-
-        low = candles[i][
-            "low"
-        ]
-
-        if (
-            low <= candles[i - 1]["low"]
-            and low <= candles[i - 2]["low"]
-            and low <= candles[i + 1]["low"]
-            and low <= candles[i + 2]["low"]
-        ):
-            levels.append(low)
-
-    return levels
+    return float(slope)
 
 
 # ============================================================
-# 1H DIRECTION
+# 1H MARKET STRUCTURE
 # ============================================================
 
-def get_1h_direction(
-    candles
-):
+def analyse_1h(candles):
+    if len(candles) < 60:
+        return {
+            "direction": "NEUTRAL",
+            "score": 0,
+            "text": "INSUFFICIENT DATA"
+        }
 
-    confirmed = [
-        c
-        for c in candles
-        if c["confirmed"]
-    ]
+    closes = np.array([x["c"] for x in candles], dtype=float)
 
-    if len(confirmed) < 60:
-        return None
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
 
-    closes = [
-        c["close"]
-        for c in confirmed
-    ]
+    if e20 is None or e50 is None:
+        return {
+            "direction": "NEUTRAL",
+            "score": 0,
+            "text": "INSUFFICIENT DATA"
+        }
 
-    ema20 = calculate_ema(
-        closes,
-        20
-    )[-1]
+    price = closes[-1]
 
-    ema50 = calculate_ema(
-        closes,
-        50
-    )[-1]
-
-    recent = confirmed[
-        -12:
-    ]
-
-    first = recent[:6]
-    second = recent[6:]
-
-    first_high = max(
-        x["high"]
-        for x in first
-    )
-
-    second_high = max(
-        x["high"]
-        for x in second
-    )
-
-    first_low = min(
-        x["low"]
-        for x in first
-    )
-
-    second_low = min(
-        x["low"]
-        for x in second
-    )
+    slope20 = linreg_slope(e20[-12:])
 
     bullish = (
-        ema20 > ema50
-        and second_high >= first_high
-        and second_low >= first_low
+        price > e20[-1]
+        and e20[-1] > e50[-1]
+        and slope20 > 0
     )
 
     bearish = (
-        ema20 < ema50
-        and second_high <= first_high
-        and second_low <= first_low
+        price < e20[-1]
+        and e20[-1] < e50[-1]
+        and slope20 < 0
     )
 
     if bullish:
-        return "LONG"
+        return {
+            "direction": "LONG",
+            "score": 20,
+            "text": "BULLISH STRUCTURE"
+        }
 
     if bearish:
-        return "SHORT"
+        return {
+            "direction": "SHORT",
+            "score": 20,
+            "text": "BEARISH STRUCTURE"
+        }
 
-    return None
+    # weaker structure
+    if price > e20[-1]:
+        return {
+            "direction": "LONG",
+            "score": 11,
+            "text": "WEAK BULLISH"
+        }
 
+    if price < e20[-1]:
+        return {
+            "direction": "SHORT",
+            "score": 11,
+            "text": "WEAK BEARISH"
+        }
 
-# ============================================================
-# LEVEL FINDER
-# ============================================================
-
-def find_key_level(
-    candles_15m,
-    candles_1h,
-    price,
-    direction
-):
-
-    candidates = []
-
-    # --------------------------------------------------------
-    # 1H major levels
-    # --------------------------------------------------------
-
-    if len(candles_1h) >= 30:
-
-        historical = (
-            candles_1h[-25:-1]
-        )
-
-        major_high = max(
-            x["high"]
-            for x in historical
-        )
-
-        major_low = min(
-            x["low"]
-            for x in historical
-        )
-
-        if direction == "LONG":
-
-            if major_high > price:
-                candidates.append(
-                    (
-                        major_high,
-                        "1H"
-                    )
-                )
-
-        else:
-
-            if major_low < price:
-                candidates.append(
-                    (
-                        major_low,
-                        "1H"
-                    )
-                )
-
-    # --------------------------------------------------------
-    # 15M pivots
-    # --------------------------------------------------------
-
-    if direction == "LONG":
-
-        for level in pivot_highs(
-            candles_15m
-        )[-20:]:
-
-            if level > price:
-                candidates.append(
-                    (
-                        level,
-                        "15M"
-                    )
-                )
-
-    else:
-
-        for level in pivot_lows(
-            candles_15m
-        )[-20:]:
-
-            if level < price:
-                candidates.append(
-                    (
-                        level,
-                        "15M"
-                    )
-                )
-
-    if not candidates:
-        return None, None
-
-    if direction == "LONG":
-
-        candidates.sort(
-            key=lambda x: x[0]
-        )
-
-    else:
-
-        candidates.sort(
-            key=lambda x: x[0],
-            reverse=True
-        )
-
-    return candidates[0]
+    return {
+        "direction": "NEUTRAL",
+        "score": 0,
+        "text": "NEUTRAL"
+    }
 
 
 # ============================================================
-# COMPRESSION / TRENDLINE
+# LEVEL DETECTION
 # ============================================================
 
-def check_compression(
-    candles,
-    direction
-):
+def detect_horizontal_level(candles, direction):
+    """
+    Finds a recent swing level.
+
+    For LONG:
+        resistance = recent swing highs
+
+    For SHORT:
+        support = recent swing lows
+    """
 
     if len(candles) < 30:
-        return False, 0
+        return None
 
-    recent = candles[
-        -20:
-    ]
-
-    ranges = [
-        x["high"] - x["low"]
-        for x in recent
-    ]
-
-    first_avg = (
-        sum(ranges[:8])
-        / 8
-    )
-
-    last_avg = (
-        sum(ranges[-8:])
-        / 8
-    )
-
-    if first_avg <= 0:
-        return False, 0
-
-    compression = (
-        1
-        - (
-            last_avg
-            / first_avg
-        )
-    )
-
-    points = 0
-
-    if compression >= 0.15:
-        points += 10
-
-    if compression >= 0.25:
-        points += 5
-
-    valid = False
+    recent = candles[-45:-2]
 
     if direction == "LONG":
 
-        lows = pivot_lows(
-            recent
+        highs = np.array(
+            [x["h"] for x in recent],
+            dtype=float
         )
 
-        if len(lows) >= 2:
+        level = float(np.percentile(highs, 85))
 
-            if lows[-1] >= lows[-2]:
+        # closest meaningful high cluster
+        candidates = [
+            x["h"]
+            for x in recent
+            if x["h"] >= level
+        ]
 
-                valid = True
-                points += 10
+        if not candidates:
+            return None
+
+        return float(np.median(candidates))
 
     else:
 
-        highs = pivot_highs(
-            recent
+        lows = np.array(
+            [x["l"] for x in recent],
+            dtype=float
         )
 
-        if len(highs) >= 2:
+        level = float(np.percentile(lows, 15))
 
-            if highs[-1] <= highs[-2]:
+        candidates = [
+            x["l"]
+            for x in recent
+            if x["l"] <= level
+        ]
 
-                valid = True
-                points += 10
+        if not candidates:
+            return None
 
-    return (
-        valid,
-        min(points, 25)
-    )
+        return float(np.median(candidates))
 
 
 # ============================================================
-# OI CONFIRMATION
+# STRATEGY 1
+# HORIZONTAL LEVEL BREAKOUT
 # ============================================================
 
-def update_oi(
-    inst_id,
-    current_oi
-):
+def horizontal_strategy(c15, c5, direction, current_price):
+    level = detect_horizontal_level(c15, direction)
 
-    if current_oi is None:
-        return False, 0.0
+    if not level or level <= 0:
+        return None
 
-    with state_lock:
+    atr5 = atr(c5)
 
-        previous = oi_previous.get(
-            inst_id
+    if atr5 <= 0:
+        return None
+
+    distance = abs(current_price - level) / current_price
+
+    if distance > MAX_ENTRY_DISTANCE:
+        return None
+
+    last5 = c5[-1]
+    prev5 = c5[-2]
+
+    vr = volume_ratio(c5)
+
+    if direction == "LONG":
+
+        approaching = current_price <= level
+
+        candle_confirm = (
+            last5["c"] > prev5["c"]
+            and last5["c"] > last5["o"]
         )
 
-        oi_previous[
-            inst_id
-        ] = current_oi
+        # We want price close to resistance,
+        # but NOT already too far above it.
+        if not approaching and current_price > level * 1.003:
+            return None
 
-    if previous is None:
-        return False, 0.0
+        confirmation = candle_confirm
 
-    if previous <= 0:
-        return False, 0.0
+        strength = 0
 
-    change = (
-        (
-            current_oi
-            - previous
+        if approaching:
+            strength += 20
+
+        if confirmation:
+            strength += 15
+
+        if vr >= 1.15:
+            strength += 5
+
+        return {
+            "name": "Horizontal Level Breakout",
+            "level": level,
+            "score": strength,
+            "ready": True,
+            "reason": "Цена поджата к сопротивлению; 5M показывает бычье давление."
+        }
+
+    else:
+
+        approaching = current_price >= level
+
+        candle_confirm = (
+            last5["c"] < prev5["c"]
+            and last5["c"] < last5["o"]
         )
-        / previous
-        * 100
-    )
 
-    # Для breakout хотим рост OI.
-    confirmed = (
-        change >= 0.20
-    )
+        if not approaching and current_price < level * 0.997:
+            return None
 
-    return confirmed, change
+        confirmation = candle_confirm
+
+        strength = 0
+
+        if approaching:
+            strength += 20
+
+        if confirmation:
+            strength += 15
+
+        if vr >= 1.15:
+            strength += 5
+
+        return {
+            "name": "Horizontal Level Breakout",
+            "level": level,
+            "score": strength,
+            "ready": True,
+            "reason": "Цена поджата к поддержке; 5M показывает медвежье давление."
+        }
 
 
 # ============================================================
-# ANALYZER
+# STRATEGY 2
+# TRENDLINE COMPRESSION BREAKOUT
 # ============================================================
 
-def analyze_market(
-    ticker,
-    candles_1h,
-    candles_15m,
-    candles_5m,
-    oi_confirmed,
-    oi_change
-):
+def trendline_strategy(c15, c5, direction, current_price):
+    if len(c15) < 35:
+        return None
 
-    price = ticker[
-        "price"
+    closes = np.array(
+        [x["c"] for x in c15[-30:]],
+        dtype=float
+    )
+
+    highs = np.array(
+        [x["h"] for x in c15[-30:]],
+        dtype=float
+    )
+
+    lows = np.array(
+        [x["l"] for x in c15[-30:]],
+        dtype=float
+    )
+
+    upper_slope = linreg_slope(highs)
+    lower_slope = linreg_slope(lows)
+
+    width_now = highs[-1] - lows[-1]
+    width_old = highs[:8].mean() - lows[:8].mean()
+
+    if width_old <= 0:
+        return None
+
+    compression = width_now / width_old
+
+    # Need visible compression.
+    if compression > 0.72:
+        return None
+
+    if direction == "LONG":
+
+        # descending resistance + rising support
+        if upper_slope >= 0 or lower_slope <= 0:
+            return None
+
+        resistance = float(
+            np.mean(highs[-5:])
+        )
+
+        distance = abs(current_price - resistance) / current_price
+
+        if distance > MAX_ENTRY_DISTANCE:
+            return None
+
+        return {
+            "name": "Trendline Compression Breakout",
+            "level": resistance,
+            "score": 25,
+            "ready": True,
+            "reason": "15M сжимается между нисходящей верхней и восходящей нижней линиями."
+        }
+
+    else:
+
+        if upper_slope <= 0 or lower_slope >= 0:
+            return None
+
+        support = float(
+            np.mean(lows[-5:])
+        )
+
+        distance = abs(current_price - support) / current_price
+
+        if distance > MAX_ENTRY_DISTANCE:
+            return None
+
+        return {
+            "name": "Trendline Compression Breakout",
+            "level": support,
+            "score": 25,
+            "ready": True,
+            "reason": "15M сжимается между восходящей верхней и нисходящей нижней линиями."
+        }
+
+
+# ============================================================
+# STRATEGY 3
+# MOMENTUM BREAKOUT
+# ============================================================
+
+def momentum_strategy(c5, direction, current_price):
+    if len(c5) < 30:
+        return None
+
+    closes = np.array(
+        [x["c"] for x in c5],
+        dtype=float
+    )
+
+    atr5 = atr(c5)
+
+    if atr5 <= 0:
+        return None
+
+    e9 = ema(closes, 9)
+    e20 = ema(closes, 20)
+
+    if e9 is None or e20 is None:
+        return None
+
+    recent_high = max(
+        x["h"] for x in c5[-12:-1]
+    )
+
+    recent_low = min(
+        x["l"] for x in c5[-12:-1]
+    )
+
+    vr = volume_ratio(c5)
+
+    if direction == "LONG":
+
+        if e9[-1] <= e20[-1]:
+            return None
+
+        if current_price < recent_high * 0.996:
+            return None
+
+        if vr < 1.10:
+            return None
+
+        return {
+            "name": "Momentum Breakout",
+            "level": recent_high,
+            "score": 24,
+            "ready": True,
+            "reason": "5M EMA9 выше EMA20, цена у локального импульсного максимума, объём повышен."
+        }
+
+    else:
+
+        if e9[-1] >= e20[-1]:
+            return None
+
+        if current_price > recent_low * 1.004:
+            return None
+
+        if vr < 1.10:
+            return None
+
+        return {
+            "name": "Momentum Breakout",
+            "level": recent_low,
+            "score": 24,
+            "ready": True,
+            "reason": "5M EMA9 ниже EMA20, цена у локального импульсного минимума, объём повышен."
+        }
+
+
+# ============================================================
+# OI ANALYSIS
+# ============================================================
+
+def update_oi(inst_id, oi):
+    now = time.time()
+
+    if inst_id not in oi_history:
+        oi_history[inst_id] = []
+
+    oi_history[inst_id].append((now, oi))
+
+    # Keep last 10 minutes.
+    cutoff = now - 600
+
+    oi_history[inst_id] = [
+        item
+        for item in oi_history[inst_id]
+        if item[0] >= cutoff
     ]
 
-    # ========================================================
-    # 1H = DIRECTION
-    # ========================================================
 
-    direction = get_1h_direction(
-        candles_1h
+def get_oi_state(inst_id, current_oi, direction):
+    if current_oi <= 0:
+        return "UNAVAILABLE", 0
+
+    history = oi_history.get(inst_id, [])
+
+    if len(history) < 2:
+        return "WAITING", 0
+
+    # Compare against approximately 2 minutes ago.
+    target_time = time.time() - 120
+
+    old = min(
+        history,
+        key=lambda x: abs(x[0] - target_time)
     )
 
-    if not direction:
-        return None
+    old_oi = old[1]
 
-    # ========================================================
-    # LEVEL
-    # ========================================================
+    if old_oi <= 0:
+        return "WAITING", 0
 
-    level, level_tf = (
-        find_key_level(
-            candles_15m,
-            candles_1h,
-            price,
-            direction
-        )
-    )
+    change = (current_oi - old_oi) / old_oi * 100
 
-    if level is None:
-        return None
+    if abs(change) < 0.35:
+        return "FLAT", 0
 
-    distance = pct_distance(
-        price,
-        level
-    )
+    if change > 0:
 
-    # Нам нужен рынок возле уровня.
-    if distance > 0.65:
-        return None
+        # Rising OI is useful when direction agrees with structure.
+        return "RISING", 8
 
-    # ========================================================
-    # CONFIRMED 5M
-    # ========================================================
+    return "FALLING", 2
 
-    confirmed_5m = [
-        x
-        for x in candles_5m
-        if x["confirmed"]
-    ]
 
-    if len(confirmed_5m) < 40:
-        return None
+# ============================================================
+# SCORE
+# ============================================================
 
-    current = confirmed_5m[-1]
-    previous = confirmed_5m[-2]
-
+def calculate_score(
+    strategy,
+    structure,
+    c15,
+    c5,
+    volume24h,
+    oi_state,
+    oi_points,
+    direction
+):
     score = 0
 
-    strategy = None
+    # Strategy quality: max 25
+    score += min(strategy["score"], 25)
 
-    reason = ""
+    # 1H structure: max 20
+    score += min(structure["score"], 20)
 
-    # ========================================================
-    # 1H STRUCTURE
-    # ========================================================
-
-    score += 15
-
-    # ========================================================
-    # LEVEL QUALITY
-    # ========================================================
-
-    if level_tf == "1H":
-        score += 20
-    else:
-        score += 14
-
-    # ========================================================
-    # STRATEGY 1
-    # HORIZONTAL LEVEL BREAKOUT
-    # ========================================================
-
-    if direction == "LONG":
-
-        breakout = (
-            previous["close"] <= level
-            and current["close"] > level
-        )
-
-        near_level = (
-            distance <= 0.40
-        )
-
-        if breakout:
-
-            strategy = (
-                "Horizontal Level Breakout"
-            )
-
-            score += 25
-
-            reason = (
-                "5M свеча закрылась выше "
-                "ключевого сопротивления."
-            )
-
-        elif near_level:
-
-            strategy = (
-                "Horizontal Level Breakout"
-            )
-
-            score += 10
-
-            reason = (
-                "Цена сжимается возле "
-                "ключевого сопротивления "
-                "перед возможным пробоем."
-            )
-
-    else:
-
-        breakout = (
-            previous["close"] >= level
-            and current["close"] < level
-        )
-
-        near_level = (
-            distance <= 0.40
-        )
-
-        if breakout:
-
-            strategy = (
-                "Horizontal Level Breakout"
-            )
-
-            score += 25
-
-            reason = (
-                "5M свеча закрылась ниже "
-                "ключевой поддержки."
-            )
-
-        elif near_level:
-
-            strategy = (
-                "Horizontal Level Breakout"
-            )
-
-            score += 10
-
-            reason = (
-                "Цена сжимается возле "
-                "ключевой поддержки "
-                "перед возможным пробоем."
-            )
-
-    # ========================================================
-    # STRATEGY 2
-    # TRENDLINE COMPRESSION
-    # ========================================================
-
-    compression, compression_points = (
-        check_compression(
-            candles_15m,
-            direction
-        )
-    )
-
-    if compression:
-
-        strategy = (
-            "Trendline Compression Breakout"
-        )
-
-        score += compression_points
-
-        if direction == "LONG":
-
-            reason = (
-                "15M показывает сжатие "
-                "с повышающимися минимумами "
-                "перед сопротивлением."
-            )
-
-        else:
-
-            reason = (
-                "15M показывает сжатие "
-                "с понижающимися максимумами "
-                "перед поддержкой."
-            )
-
-    # ========================================================
-    # STRATEGY 3
-    # MOMENTUM BREAKOUT
-    # ========================================================
-
-    closes = [
-        x["close"]
-        for x in confirmed_5m
-    ]
-
-    ema9 = calculate_ema(
-        closes,
-        9
-    )[-1]
-
-    ema21 = calculate_ema(
-        closes,
-        21
-    )[-1]
-
-    previous_high = max(
-        x["high"]
-        for x in confirmed_5m[
-            -13:-1
-        ]
-    )
-
-    previous_low = min(
-        x["low"]
-        for x in confirmed_5m[
-            -13:-1
-        ]
-    )
-
-    momentum_long = (
-        direction == "LONG"
-        and ema9 > ema21
-        and current["close"]
-        > previous_high
-    )
-
-    momentum_short = (
-        direction == "SHORT"
-        and ema9 < ema21
-        and current["close"]
-        < previous_low
-    )
-
-    if (
-        momentum_long
-        or momentum_short
-    ):
-
-        strategy = (
-            "Momentum Breakout"
-        )
-
+    # Volume quality: max 15
+    if volume24h >= 500_000_000:
         score += 15
-
-        reason = (
-            "5M показывает импульсный "
-            "выход из локального диапазона."
-        )
-
-    if strategy is None:
-        return None
-
-    # ========================================================
-    # VOLUME
-    # ========================================================
-
-    vol_ratio = get_volume_ratio(
-        confirmed_5m
-    )
-
-    if vol_ratio >= 1.20:
-        score += 8
-
-    if vol_ratio >= 1.50:
-        score += 5
-
-    if vol_ratio >= 2.00:
-        score += 5
-
-    # ========================================================
-    # OI
-    # ========================================================
-
-    if oi_confirmed:
-
+    elif volume24h >= 250_000_000:
+        score += 13
+    elif volume24h >= 100_000_000:
         score += 10
+    else:
+        score += 7
 
-    # ========================================================
-    # LIQUIDITY
-    # ========================================================
+    # 5M volume confirmation: max 10
+    vr5 = volume_ratio(c5)
 
-    volume = ticker[
-        "volume_usd"
-    ]
-
-    if volume >= 1_000_000_000:
-
+    if vr5 >= 1.50:
+        score += 10
+    elif vr5 >= 1.25:
+        score += 8
+    elif vr5 >= 1.10:
         score += 5
 
-    elif volume >= 250_000_000:
+    # 15M structure / compression: max 10
+    vr15 = volume_ratio(c15)
 
+    if vr15 >= 1.25:
+        score += 10
+    elif vr15 >= 1.10:
+        score += 7
+    else:
         score += 4
 
-    elif volume >= 100_000_000:
+    # OI: max 8
+    score += min(oi_points, 8)
 
-        score += 2
+    # Price action candle quality: max 7
+    last = c5[-1]
 
-    # ========================================================
-    # ATR
-    # ========================================================
+    body = abs(last["c"] - last["o"])
+    candle_range = max(last["h"] - last["l"], 1e-12)
 
-    atr = calculate_atr(
-        confirmed_5m
-    )
+    body_ratio = body / candle_range
 
-    if atr <= 0:
-        return None
+    if body_ratio >= 0.65:
+        score += 7
+    elif body_ratio >= 0.45:
+        score += 5
+    elif body_ratio >= 0.30:
+        score += 3
 
-    atr_percent = (
-        atr
-        / price
-        * 100
-    )
+    # Do not allow a fake direction.
+    if direction == "LONG" and last["c"] < last["o"]:
+        score -= 4
 
-    # Слишком мёртвый рынок.
-    if atr_percent < 0.03:
-        return None
+    if direction == "SHORT" and last["c"] > last["o"]:
+        score -= 4
 
-    # Слишком бешеный рынок.
-    if atr_percent > 2.0:
-        return None
+    return int(clamp(score, 0, 100))
 
-    # ========================================================
-    # SCORE
-    # ========================================================
 
-    score = max(
-        0,
-        min(
-            100,
-            int(score)
-        )
-    )
+# ============================================================
+# RISK / TRADE PLAN
+# ============================================================
 
-    if score < MIN_SCORE:
-        return None
+def build_trade_plan(direction, level, current_price, atr5):
+    """
+    Entry is built around the breakout level.
 
-    # ========================================================
-    # ENTRY ZONE
-    # ========================================================
+    We intentionally don't wait for a huge breakout candle.
+    The level is the trigger area.
 
-    zone_percent = min(
-        max(
-            atr_percent * 0.35,
-            0.08
-        ),
-        0.22
-    )
-
-    entry_low = (
-        level
-        * (
-            1
-            - zone_percent / 100
-        )
-    )
-
-    entry_high = (
-        level
-        * (
-            1
-            + zone_percent / 100
-        )
-    )
-
-    # ========================================================
-    # STRUCTURAL SL
-    # ========================================================
-
-    recent_15m = (
-        candles_15m[-18:]
-    )
+    Stop is based on volatility rather than an arbitrary fixed 1%.
+    """
 
     if direction == "LONG":
 
-        structure_low = min(
-            x["low"]
-            for x in recent_15m
+        entry_low = level * 0.9990
+        entry_high = level * 1.0015
+
+        entry = level
+
+        sl_distance = max(
+            atr5 * 1.25,
+            entry * 0.006
         )
 
-        sl = (
-            structure_low
-            - atr * 0.25
-        )
+        sl = entry - sl_distance
 
-        if sl >= price:
-            return None
+        risk = (entry - sl) / entry
 
-        risk = price - sl
+        tp1 = entry + risk * entry * 1.20
+        tp2 = entry + risk * entry * 2.00
+        tp3 = entry + risk * entry * 3.00
 
     else:
 
-        structure_high = max(
-            x["high"]
-            for x in recent_15m
+        entry_low = level * 0.9985
+        entry_high = level * 1.0010
+
+        entry = level
+
+        sl_distance = max(
+            atr5 * 1.25,
+            entry * 0.006
         )
 
-        sl = (
-            structure_high
-            + atr * 0.25
-        )
+        sl = entry + sl_distance
 
-        if sl <= price:
-            return None
+        risk = (sl - entry) / entry
 
-        risk = sl - price
+        tp1 = entry - risk * entry * 1.20
+        tp2 = entry - risk * entry * 2.00
+        tp3 = entry - risk * entry * 3.00
 
-    risk_percent = (
-        risk
-        / price
-        * 100
-    )
-
-    # Скальперский риск.
-    if risk_percent < 0.15:
-        return None
-
-    if risk_percent > 1.80:
-        return None
-
-    # ========================================================
-    # TAKE PROFITS
-    # ========================================================
-
+    # Avoid nonsensical plans.
     if direction == "LONG":
-
-        tp1 = price + risk * 1.0
-        tp2 = price + risk * 2.0
-        tp3 = price + risk * 3.0
-
-    else:
-
-        tp1 = price - risk * 1.0
-        tp2 = price - risk * 2.0
-        tp3 = price - risk * 3.0
-
-    # ========================================================
-    # CHASE FILTER
-    # ========================================================
-
-    if direction == "LONG":
-
-        if price > (
-            level
-            * (
-                1
-                + MAX_CHASE_PERCENT / 100
-            )
-        ):
+        if sl >= entry or tp1 <= entry:
             return None
-
     else:
-
-        if price < (
-            level
-            * (
-                1
-                - MAX_CHASE_PERCENT / 100
-            )
-        ):
+        if sl <= entry or tp1 >= entry:
             return None
 
     return {
-        "inst_id": ticker[
-            "inst_id"
-        ],
-
-        "coin": ticker[
-            "inst_id"
-        ].replace(
-            "-USDT-SWAP",
-            ""
-        ),
-
-        "direction": direction,
-
-        "strategy": strategy,
-
-        "price": price,
-
-        "level": level,
-
-        "level_tf": level_tf,
-
+        "entry": entry,
         "entry_low": entry_low,
-
         "entry_high": entry_high,
-
         "sl": sl,
-
         "tp1": tp1,
-
         "tp2": tp2,
-
         "tp3": tp3,
-
-        "risk_percent": risk_percent,
-
-        "score": score,
-
-        "volume_usd": volume,
-
-        "volume_ratio": vol_ratio,
-
-        "liquidity": volume_grade(
-            volume
-        ),
-
-        "oi_change": oi_change,
-
-        "oi_confirmed": oi_confirmed,
-
-        "atr_percent": atr_percent,
-
-        "reason": reason,
-
-        "candles": confirmed_5m[
-            -70:
-        ],
+        "risk_pct": risk * 100
     }
+
+
+# ============================================================
+# SIGNAL COOLDOWN
+# ============================================================
+
+def clean_signal_times():
+    global signal_times
+
+    cutoff = time.time() - 3600
+
+    signal_times = [
+        t for t in signal_times
+        if t >= cutoff
+    ]
+
+
+def can_send_signal(inst_id):
+    clean_signal_times()
+
+    if len(signal_times) >= MAX_SIGNALS_PER_HOUR:
+        return False
+
+    now = time.time()
+
+    last_global = signal_times[-1] if signal_times else 0
+
+    if now - last_global < GLOBAL_SIGNAL_COOLDOWN:
+        return False
+
+    last_symbol = last_signal_by_symbol.get(inst_id, 0)
+
+    if now - last_symbol < SYMBOL_SIGNAL_COOLDOWN:
+        return False
+
+    return True
 
 
 # ============================================================
@@ -1549,304 +1059,245 @@ def analyze_market(
 # ============================================================
 
 def create_chart(
-    signal
+    coin,
+    candles,
+    direction,
+    level,
+    plan,
+    strategy_name
 ):
+    """
+    Creates a clean 5M chart.
 
-    filename = (
-        "/tmp/"
-        f'{signal["coin"]}_'
-        f'{int(time.time() * 1000)}.png'
-    )
+    The image is sent BEFORE the text message,
+    so Telegram shows the chart above the signal.
+    """
 
-    candles = signal[
-        "candles"
-    ]
+    data = candles[-60:]
+
+    x = np.arange(len(data))
+
+    opens = np.array([x["o"] for x in data])
+    highs = np.array([x["h"] for x in data])
+    lows = np.array([x["l"] for x in data])
+    closes = np.array([x["c"] for x in data])
 
     fig, ax = plt.subplots(
-        figsize=(12, 7),
+        figsize=(12, 6),
         dpi=130
     )
 
-    fig.patch.set_facecolor(
-        "#080d19"
-    )
+    fig.patch.set_facecolor("#0b1020")
+    ax.set_facecolor("#0b1020")
 
-    ax.set_facecolor(
-        "#080d19"
-    )
+    for i in range(len(data)):
 
-    candle_width = 0.62
-
-    for i, candle in enumerate(
-        candles
-    ):
-
-        bullish = (
-            candle["close"]
-            >= candle["open"]
-        )
-
-        color = (
-            "#18c98b"
-            if bullish
-            else "#ef5350"
-        )
+        color = "#22c55e" if closes[i] >= opens[i] else "#ef4444"
 
         ax.plot(
             [i, i],
-            [
-                candle["low"],
-                candle["high"]
-            ],
+            [lows[i], highs[i]],
             color=color,
             linewidth=1
         )
 
-        body_low = min(
-            candle["open"],
-            candle["close"]
-        )
+        bottom = min(opens[i], closes[i])
+        height = abs(closes[i] - opens[i])
 
-        body_height = abs(
-            candle["close"]
-            - candle["open"]
-        )
-
-        if body_height <= 0:
-            body_height = (
-                candle["close"]
-                * 0.00001
+        if height == 0:
+            height = max(
+                (highs[i] - lows[i]) * 0.02,
+                1e-12
             )
 
-        rect = Rectangle(
-            (
-                i
-                - candle_width / 2,
-                body_low
-            ),
-            candle_width,
-            body_height,
-            facecolor=color,
-            edgecolor=color
+        ax.add_patch(
+            plt.Rectangle(
+                (i - 0.32, bottom),
+                0.64,
+                height,
+                facecolor=color,
+                edgecolor=color
+            )
         )
 
-        ax.add_patch(rect)
-
-    # LEVEL
     ax.axhline(
-        signal["level"],
-        color="#f6c945",
+        level,
+        color="#facc15",
         linewidth=2,
-        linestyle="--"
+        linestyle="--",
+        label="BREAKOUT LEVEL"
     )
 
-    # ENTRY
-    ax.axhspan(
-        signal["entry_low"],
-        signal["entry_high"],
-        color="#00a8ff",
-        alpha=0.13
-    )
-
-    # SL
     ax.axhline(
-        signal["sl"],
-        color="#ff453a",
-        linewidth=1.8,
-        linestyle="-."
+        plan["sl"],
+        color="#ef4444",
+        linewidth=1.5,
+        linestyle=":",
+        label="STOP"
     )
 
-    # TP
-    for tp in [
-        signal["tp1"],
-        signal["tp2"],
-        signal["tp3"]
-    ]:
-
-        ax.axhline(
-            tp,
-            color="#ffd166",
-            linewidth=1.2,
-            alpha=0.85
-        )
-
-    last_x = (
-        len(candles) - 1
+    ax.axhline(
+        plan["tp1"],
+        color="#38bdf8",
+        linewidth=1,
+        linestyle=":",
+        label="TP1"
     )
 
-    ax.text(
-        last_x,
-        signal["level"],
-        " LEVEL",
-        color="#f6c945",
-        fontsize=10,
-        fontweight="bold"
+    ax.axhline(
+        plan["tp2"],
+        color="#38bdf8",
+        linewidth=1,
+        linestyle=":",
+        label="TP2"
     )
 
-    ax.text(
-        last_x,
-        signal["sl"],
-        " SL",
-        color="#ff453a",
-        fontsize=10,
-        fontweight="bold"
-    )
-
-    ax.text(
-        last_x,
-        signal["tp1"],
-        " TP1",
-        color="#ffd166",
-        fontsize=9
-    )
-
-    ax.text(
-        last_x,
-        signal["tp2"],
-        " TP2",
-        color="#ffd166",
-        fontsize=9
-    )
-
-    ax.text(
-        last_x,
-        signal["tp3"],
-        " TP3",
-        color="#ffd166",
-        fontsize=9
-    )
-
-    title = (
-        f'{signal["coin"]}USDT  '
-        f'{signal["direction"]}\n'
-        f'{signal["strategy"]}  |  '
-        f'SCORE {signal["score"]}/100'
+    ax.axhline(
+        plan["tp3"],
+        color="#a78bfa",
+        linewidth=1,
+        linestyle=":",
+        label="TP3"
     )
 
     ax.set_title(
-        title,
+        f"{coin}/USDT • 5M • {direction} • {strategy_name}",
         color="white",
         fontsize=14,
         fontweight="bold"
     )
 
-    ax.grid(
-        color="white",
-        alpha=0.08
-    )
-
     ax.tick_params(
-        colors="#9ca3af"
+        colors="#94a3b8"
     )
 
     for spine in ax.spines.values():
-        spine.set_color(
-            "#263247"
-        )
+        spine.set_color("#334155")
+
+    ax.grid(
+        alpha=0.12,
+        color="white"
+    )
+
+    ax.legend(
+        facecolor="#111827",
+        edgecolor="#334155",
+        labelcolor="white"
+    )
 
     plt.tight_layout()
 
-    fig.savefig(
-        filename,
-        facecolor=fig.get_facecolor(),
-        bbox_inches="tight"
+    buffer = io.BytesIO()
+
+    plt.savefig(
+        buffer,
+        format="png",
+        bbox_inches="tight",
+        facecolor=fig.get_facecolor()
     )
 
     plt.close(fig)
 
-    return filename
+    buffer.seek(0)
+
+    return buffer
 
 
 # ============================================================
-# TELEGRAM TEXT
+# TELEGRAM SIGNAL
 # ============================================================
 
-def signal_caption(
-    signal
+def build_signal_text(
+    market,
+    direction,
+    strategy,
+    structure,
+    plan,
+    score,
+    oi_state,
+    c15,
+    c5
 ):
+    coin = market["coin"]
+    volume = market["volume"]
 
-    return (
-        f'🔥 *{signal["coin"]}USDT — '
-        f'{signal["direction"]}*\n'
-        f'{score_label(signal["score"])}\n'
-        f'{signal["strategy"]}'
-    )
+    quality = score_label(score)
 
+    vr5 = volume_ratio(c5)
 
-def signal_text(
-    signal
-):
+    if oi_state == "RISING":
+        oi_text = "RISING — подтверждает интерес"
+    elif oi_state == "FALLING":
+        oi_text = "FALLING — подтверждение слабое"
+    elif oi_state == "FLAT":
+        oi_text = "FLAT"
+    else:
+        oi_text = oi_state
 
-    oi_text = (
-        f'CONFIRMED '
-        f'(+{signal["oi_change"]:.2f}%)'
-        if signal["oi_confirmed"]
-        else
-        f'FLAT '
-        f'({signal["oi_change"]:+.2f}%)'
-    )
+    arrow = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
 
-    return (
-        f'🔥 *{signal["coin"]}USDT — '
-        f'{signal["direction"]}*\n\n'
+    risk = plan["risk_pct"]
 
-        f'💰 *Цена:* '
-        f'`{fmt_price(signal["price"])}`\n'
+    return f"""
+🔥 <b>{coin}USDT — {direction}</b>
 
-        f'📊 *Объём 24H:* '
-        f'`${signal["volume_usd"] / 1_000_000:.1f}M`\n'
+💰 <b>Текущая цена:</b> {fmt_price(market["price"])}
+💵 <b>24H объём:</b> {fmt_money(volume)}
 
-        f'📈 *Объём 5M:* '
-        f'`{signal["volume_ratio"]:.2f}x`\n\n'
+⭐ <b>SIGNAL SCORE: {score}/100 — {quality}</b>
 
-        f'🧠 *ЛОГИКА СДЕЛКИ*\n'
-        f'{signal["reason"]}\n\n'
+🧠 <b>ЛОГИКА СДЕЛКИ</b>
 
-        f'🎯 *ТОЧКА ВХОДА*\n'
-        f'`{fmt_price(signal["entry_low"])}` – '
-        f'`{fmt_price(signal["entry_high"])}`\n\n'
+Стратегия: <b>{strategy["name"]}</b>
 
-        f'🛑 *STOP LOSS*\n'
-        f'`{fmt_price(signal["sl"])}`\n'
-        f'Риск: `−{signal["risk_percent"]:.2f}%`\n\n'
+{strategy["reason"]}
 
-        f'🪜 *ЗАКРЫТИЕ ЛЕСЕНКОЙ*\n'
-        f'TP1 — 30% → '
-        f'`{fmt_price(signal["tp1"])}`\n'
+📊 <b>1H:</b> {structure["text"]}
+📊 <b>15M:</b> SETUP
+⚡ <b>5M:</b> ENTRY CONFIRMATION
 
-        f'TP2 — 30% → '
-        f'`{fmt_price(signal["tp2"])}`\n'
+💧 <b>ЛИКВИДНОСТЬ:</b> HIGH
+📦 <b>ОБЪЁМ:</b> HIGH
+⚡ <b>OI:</b> {oi_text}
 
-        f'TP3 — 40% → '
-        f'`{fmt_price(signal["tp3"])}`\n\n'
+🎯 <b>ТОЧКА ВХОДА</b>
 
-        f'🔒 После TP1 → SL в BE\n\n'
+{fmt_price(plan["entry_low"])} — {fmt_price(plan["entry_high"])}
 
-        f'📊 *Стратегия:*\n'
-        f'`{signal["strategy"]}`\n\n'
+🛑 <b>STOP LOSS</b>
 
-        f'📍 *Основной уровень:*\n'
-        f'`{signal["level_tf"]}` — '
-        f'`{fmt_price(signal["level"])}`\n\n'
+{fmt_price(plan["sl"])}
+Риск: −{risk:.2f}%
 
-        f'💧 *Ликвидность:* '
-        f'`{signal["liquidity"]}`\n'
+🪜 <b>ЗАКРЫТИЕ ЛЕСЕНКОЙ</b>
 
-        f'⚡ *OI:* `{oi_text}`\n\n'
+TP1 — 30%
+{fmt_price(plan["tp1"])}
 
-        f'⭐ *SIGNAL SCORE:* '
-        f'`{signal["score"]}/100` '
-        f'{score_label(signal["score"])}\n\n'
+TP2 — 30%
+{fmt_price(plan["tp2"])}
 
-        f'🟡 *READY*\n'
-        f'Сетап активен до '
-        f'`{READY_MINUTES} мин`.\n\n'
+TP3 — 40%
+{fmt_price(plan["tp3"])}
 
-        f'⚠️ Не догоняем рынок. '
-        f'Не увеличиваем риск после убытка.\n\n'
+🔒 После TP1 → SL в BE
 
-        f'*Качество важнее количества.*'
-    )
+📍 <b>Основной уровень:</b> {fmt_price(strategy["level"])}
+
+📈 <b>Рабочий таймфрейм входа:</b> 5M
+🧭 <b>Фильтр направления:</b> 1H
+🔎 <b>Формирование сетапа:</b> 15M
+
+⚠️ <b>ВАЖНО</b>
+
+Это PRE-ENTRY сигнал около уровня.
+Не догоняем цену после сильной свечи.
+
+Если рынок уже ушёл далеко от указанной зоны —
+сделку пропускаем.
+
+<b>Качество важнее количества.</b>
+""".strip()
 
 
 # ============================================================
@@ -1854,312 +1305,318 @@ def signal_text(
 # ============================================================
 
 def send_signal(
-    signal
+    market,
+    direction,
+    strategy,
+    structure,
+    plan,
+    score,
+    oi_state,
+    c15,
+    c5
 ):
+    inst_id = market["inst_id"]
 
-    chart_file = None
+    if not can_send_signal(inst_id):
+        log.info(
+            "SIGNAL BLOCKED BY COOLDOWN: %s",
+            inst_id
+        )
+        return False
+
+    chart = create_chart(
+        market["coin"],
+        c5,
+        direction,
+        strategy["level"],
+        plan,
+        strategy["name"]
+    )
+
+    text = build_signal_text(
+        market,
+        direction,
+        strategy,
+        structure,
+        plan,
+        score,
+        oi_state,
+        c15,
+        c5
+    )
 
     try:
-
-        chart_file = create_chart(
-            signal
-        )
-
-        with open(
-            chart_file,
-            "rb"
-        ) as image:
-
-            bot.send_photo(
-                CHANNEL_ID,
-                image,
-                caption=signal_caption(
-                    signal
-                ),
-                parse_mode="Markdown"
-            )
-
-        message = bot.send_message(
+        # Photo first.
+        bot.send_photo(
             CHANNEL_ID,
-            signal_text(
-                signal
-            ),
-            parse_mode="Markdown"
+            chart
         )
 
-        log.info(
-            "TELEGRAM SIGNAL SENT | "
-            "%s | %s | score=%s",
-            signal["coin"],
-            signal["direction"],
-            signal["score"]
-        )
-
-        return message.message_id
-
-    except Exception as error:
-
-        log.exception(
-            "TELEGRAM SIGNAL ERROR: %s",
-            error
-        )
-
-        return None
-
-    finally:
-
-        if chart_file:
-
-            try:
-                os.remove(
-                    chart_file
-                )
-            except Exception:
-                pass
-
-
-# ============================================================
-# READY / ACTIVE
-# ============================================================
-
-def can_create_signal(
-    inst_id
-):
-
-    clean_old_hour_signals()
-
-    now = current_time()
-
-    with state_lock:
-
-        if inst_id in ready_signals:
-            return False
-
-        last = cooldowns.get(
-            inst_id,
-            0
-        )
-
-        if (
-            now - last
-            < COOLDOWN_MINUTES * 60
-        ):
-            return False
-
-        if len(
-            signals_last_hour
-        ) >= MAX_SIGNALS_PER_HOUR:
-            return False
-
-    return True
-
-
-def check_ready_signal(
-    inst_id,
-    current_price
-):
-
-    with state_lock:
-
-        signal = ready_signals.get(
-            inst_id
-        )
-
-    if not signal:
-        return
-
-    age = (
-        current_time()
-        - signal["created"]
-    )
-
-    # ========================================================
-    # EXPIRE
-    # ========================================================
-
-    if age > (
-        READY_MINUTES * 60
-    ):
-
-        with state_lock:
-            ready_signals.pop(
-                inst_id,
-                None
-            )
-
-        log.info(
-            "READY EXPIRED | %s",
-            inst_id
-        )
-
-        return
-
-    # ========================================================
-    # CHASE PROTECTION
-    # ========================================================
-
-    level = signal[
-        "level"
-    ]
-
-    distance = pct_distance(
-        current_price,
-        level
-    )
-
-    if distance > (
-        MAX_CHASE_PERCENT
-    ):
-        return
-
-    # ========================================================
-    # BREAKOUT
-    # ========================================================
-
-    direction = signal[
-        "direction"
-    ]
-
-    triggered = False
-
-    if direction == "LONG":
-
-        if current_price >= level:
-            triggered = True
-
-    else:
-
-        if current_price <= level:
-            triggered = True
-
-    if not triggered:
-        return
-
-    try:
-
+        # Text second.
         bot.send_message(
             CHANNEL_ID,
-            (
-                f'🟢 *ENTRY ACTIVE — '
-                f'{signal["coin"]}USDT '
-                f'{direction}*\n\n'
-
-                f'💥 Уровень '
-                f'`{fmt_price(level)}` '
-                f'подтверждён.\n\n'
-
-                f'🎯 Entry: '
-                f'`{fmt_price(signal["entry_low"])}` – '
-                f'`{fmt_price(signal["entry_high"])}`\n\n'
-
-                f'🛑 SL: '
-                f'`{fmt_price(signal["sl"])}`\n\n'
-
-                f'🎯 TP1: '
-                f'`{fmt_price(signal["tp1"])}`\n'
-
-                f'🎯 TP2: '
-                f'`{fmt_price(signal["tp2"])}`\n'
-
-                f'🏆 TP3: '
-                f'`{fmt_price(signal["tp3"])}`\n\n'
-
-                f'🔒 После TP1 → SL в BE\n\n'
-
-                f'⭐ Score: '
-                f'`{signal["score"]}/100`'
-            ),
-            parse_mode="Markdown"
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True
         )
+
+        last_signal_by_symbol[inst_id] = time.time()
+        signal_times.append(time.time())
 
         log.info(
-            "ENTRY ACTIVE | %s | %s",
-            signal["coin"],
-            direction
+            "SIGNAL SENT | %s | %s | %s | SCORE=%d",
+            inst_id,
+            direction,
+            strategy["name"],
+            score
         )
+
+        return True
 
     except Exception:
-
         log.exception(
-            "ACTIVE TELEGRAM ERROR"
-        )
-
-    with state_lock:
-
-        ready_signals.pop(
-            inst_id,
-            None
-        )
-
-        cooldowns[
+            "TELEGRAM SIGNAL ERROR: %s",
             inst_id
-        ] = current_time()
+        )
+        return False
 
 
 # ============================================================
 # MORNING MESSAGE
 # ============================================================
 
-def send_morning_message():
+def send_morning_message_if_needed():
+    global last_morning_message_date
 
-    global last_morning_date
+    current = now_kyiv()
+    current_date = current.date()
 
-    if not MORNING_ENABLED:
+    if last_morning_message_date == current_date:
         return
 
-    now = kyiv_now()
-
-    today = now.date()
-
-    if (
-        now.hour != MORNING_HOUR
-        or now.minute != MORNING_MINUTE
-    ):
+    # Send after 08:00 Kyiv.
+    if current.hour < 8:
         return
 
-    if last_morning_date == today:
-        return
+    message = """
+🌅 <b>Доброе утро, ребята!</b>
 
-    text = (
-        "🌅 *ДОБРОЕ УТРО, РЕБЯТА!*\n\n"
+Начинаем новый торговый день вместе с QUANTUM.
 
-        "Начинаем новый торговый день. 🚀\n\n"
+Сегодня работаем спокойно и дисциплинированно:
 
-        "Сегодня работаем спокойно "
-        "и строго по системе:\n\n"
+🧠 ждём только качественные сетапы;
+🎯 не догоняем рынок;
+🛑 соблюдаем Stop Loss;
+💰 не рискуем депозитом одной сделкой;
+⏳ если хорошей сделки нет — просто ждём.
 
-        "🎯 Ждём только качественные сетапы.\n"
-        "🚫 Не догоняем рынок.\n"
-        "🛑 Соблюдаем риск-менеджмент.\n"
-        "💰 Не перегружаем депозит.\n"
-        "⏳ Если хорошего входа нет — ждём.\n\n"
+Наш принцип:
 
-        "У нас нет задачи брать каждое "
-        "движение рынка.\n\n"
+<b>Качество важнее количества.</b>
 
-        "*Качество важнее количества.*\n\n"
-
-        "Всем продуктивного торгового дня! 🔥"
-    )
+Удачного торгового дня! 🚀
+""".strip()
 
     try:
-
         bot.send_message(
             CHANNEL_ID,
-            text,
-            parse_mode="Markdown"
+            message,
+            parse_mode="HTML"
         )
 
-        last_morning_date = today
+        last_morning_message_date = current_date
 
         log.info(
             "MORNING MESSAGE SENT"
         )
 
     except Exception:
-
         log.exception(
             "MORNING MESSAGE ERROR"
+        )
+
+
+# ============================================================
+# ANALYSE ONE MARKET
+# ============================================================
+
+def analyse_market(market):
+    inst_id = market["inst_id"]
+
+    try:
+
+        c1h = get_candles(
+            inst_id,
+            "1H",
+            100
+        )
+
+        c15 = get_candles(
+            inst_id,
+            "15m",
+            100
+        )
+
+        c5 = get_candles(
+            inst_id,
+            "5m",
+            100
+        )
+
+        if (
+            len(c1h) < 60
+            or len(c15) < 50
+            or len(c5) < 50
+        ):
+            log.info(
+                "SKIP %s | insufficient candles",
+                inst_id
+            )
+            return
+
+        structure = analyse_1h(c1h)
+
+        if structure["direction"] == "NEUTRAL":
+            return
+
+        direction = structure["direction"]
+
+        atr5 = atr(c5)
+
+        if atr5 <= 0:
+            return
+
+        atr_pct = atr5 / market["price"]
+
+        if not (
+            MIN_ATR_PERCENT
+            <= atr_pct
+            <= MAX_ATR_PERCENT
+        ):
+            return
+
+        current_price = market["price"]
+
+        # Current OI
+        oi = get_open_interest(inst_id)
+
+        update_oi(
+            inst_id,
+            oi
+        )
+
+        oi_state, oi_points = get_oi_state(
+            inst_id,
+            oi,
+            direction
+        )
+
+        strategies = []
+
+        s1 = horizontal_strategy(
+            c15,
+            c5,
+            direction,
+            current_price
+        )
+
+        if s1:
+            strategies.append(s1)
+
+        s2 = trendline_strategy(
+            c15,
+            c5,
+            direction,
+            current_price
+        )
+
+        if s2:
+            strategies.append(s2)
+
+        s3 = momentum_strategy(
+            c5,
+            direction,
+            current_price
+        )
+
+        if s3:
+            strategies.append(s3)
+
+        if not strategies:
+            return
+
+        # Pick the strongest strategy.
+        strategies.sort(
+            key=lambda x: x["score"],
+            reverse=True
+        )
+
+        strategy = strategies[0]
+
+        # Price must be reasonably close to trigger level.
+        distance = abs(
+            current_price - strategy["level"]
+        ) / current_price
+
+        if distance > MAX_ENTRY_DISTANCE:
+            return
+
+        score = calculate_score(
+            strategy,
+            structure,
+            c15,
+            c5,
+            market["volume"],
+            oi_state,
+            oi_points,
+            direction
+        )
+
+        log.info(
+            "CANDIDATE | %s | %s | %s | SCORE=%d | OI=%s | VOL=%s",
+            inst_id,
+            direction,
+            strategy["name"],
+            score,
+            oi_state,
+            fmt_money(market["volume"])
+        )
+
+        if score < MIN_SCORE:
+            return
+
+        plan = build_trade_plan(
+            direction,
+            strategy["level"],
+            current_price,
+            atr5
+        )
+
+        if not plan:
+            return
+
+        # Avoid absurdly wide stops.
+        if plan["risk_pct"] > 3.5:
+            return
+
+        send_signal(
+            market,
+            direction,
+            strategy,
+            structure,
+            plan,
+            score,
+            oi_state,
+            c15,
+            c5
+        )
+
+    except Exception:
+        # One bad coin can NEVER kill the scanner.
+        log.exception(
+            "MARKET ANALYSIS ERROR: %s",
+            inst_id
         )
 
 
@@ -2168,310 +1625,130 @@ def send_morning_message():
 # ============================================================
 
 def scanner_loop():
-
-    global last_scan_timestamp
     global scan_number
-    global signals_today
 
-    log.info(
-        "SCANNER STARTED"
-    )
+    log.info("=" * 50)
+    log.info("QUANTUM SCALPER V4 STARTING")
+    log.info("MIN 24H VOLUME: $%s", f"{MIN_VOLUME_24H:,}")
+    log.info("MIN SCORE: %d", MIN_SCORE)
+    log.info("MAX CANDIDATES: %d", MAX_CANDIDATES)
+    log.info("SCAN INTERVAL: %ds", SCAN_INTERVAL)
+    log.info("TIMEZONE: Europe/Kyiv")
+    log.info("=" * 50)
 
-    while True:
+    try:
+        bot.send_message(
+            CHANNEL_ID,
+            """
+🚀 <b>QUANTUM SCALPER V4 ONLINE</b>
 
-        try:
+🟢 OKX Market Data
+🟢 24H Volume Filter ≥ $60M
+🟢 Open Interest
+🟢 1H Structure
+🟢 15M Setup
+🟢 5M Confirmation
+🟢 Telegram
+🟢 Chart Generation
+🟢 Render Web Service
 
-            scan_number += 1
+🧠 <b>3 стратегии:</b>
 
-            last_scan_timestamp = (
-                current_time()
-            )
+1️⃣ Horizontal Level Breakout
+2️⃣ Trendline Compression Breakout
+3️⃣ Momentum Breakout
 
-            log.info(
-                "=============================="
-            )
+⭐ <b>Минимальный Score:</b> 80/100
 
-            log.info(
-                "SCAN #%s",
-                scan_number
-            )
+🟡 READY → 🟢 ACTIVE
 
-            # ------------------------------------------------
-            # TICKERS
-            # ------------------------------------------------
-
-            tickers = get_tickers()
-
-            log.info(
-                "Liquid markets: %s",
-                len(tickers)
-            )
-
-            for ticker in tickers:
-
-                inst_id = ticker[
-                    "inst_id"
-                ]
-
-                try:
-
-                    # ----------------------------------------
-                    # Existing READY
-                    # ----------------------------------------
-
-                    check_ready_signal(
-                        inst_id,
-                        ticker["price"]
-                    )
-
-                    if not can_create_signal(
-                        inst_id
-                    ):
-                        continue
-
-                    # ----------------------------------------
-                    # 1H
-                    # ----------------------------------------
-
-                    candles_1h = (
-                        get_candles(
-                            inst_id,
-                            "1H",
-                            100
-                        )
-                    )
-
-                    if len(
-                        candles_1h
-                    ) < 60:
-                        continue
-
-                    # ----------------------------------------
-                    # 15M
-                    # ----------------------------------------
-
-                    candles_15m = (
-                        get_candles(
-                            inst_id,
-                            "15m",
-                            100
-                        )
-                    )
-
-                    if len(
-                        candles_15m
-                    ) < 50:
-                        continue
-
-                    # ----------------------------------------
-                    # 5M
-                    # ----------------------------------------
-
-                    candles_5m = (
-                        get_candles(
-                            inst_id,
-                            "5m",
-                            100
-                        )
-                    )
-
-                    if len(
-                        candles_5m
-                    ) < 50:
-                        continue
-
-                    # ----------------------------------------
-                    # OI
-                    # ----------------------------------------
-
-                    current_oi = (
-                        get_open_interest(
-                            inst_id
-                        )
-                    )
-
-                    oi_confirmed, oi_change = (
-                        update_oi(
-                            inst_id,
-                            current_oi
-                        )
-                    )
-
-                    # ----------------------------------------
-                    # ANALYZE
-                    # ----------------------------------------
-
-                    signal = (
-                        analyze_market(
-                            ticker,
-                            candles_1h,
-                            candles_15m,
-                            candles_5m,
-                            oi_confirmed,
-                            oi_change
-                        )
-                    )
-
-                    if signal is None:
-                        continue
-
-                    log.info(
-                        "CANDIDATE | %s | %s | "
-                        "%s | SCORE=%s | "
-                        "OI=%+.2f%%",
-                        signal["coin"],
-                        signal["direction"],
-                        signal["strategy"],
-                        signal["score"],
-                        signal["oi_change"]
-                    )
-
-                    # ----------------------------------------
-                    # TELEGRAM
-                    # ----------------------------------------
-
-                    message_id = (
-                        send_signal(
-                            signal
-                        )
-                    )
-
-                    if message_id is None:
-
-                        log.error(
-                            "SIGNAL NOT REGISTERED "
-                            "BECAUSE TELEGRAM FAILED"
-                        )
-
-                        continue
-
-                    # ----------------------------------------
-                    # SAVE READY
-                    # ----------------------------------------
-
-                    with state_lock:
-
-                        ready_signals[
-                            inst_id
-                        ] = {
-                            **signal,
-                            "created": (
-                                current_time()
-                            ),
-                            "message_id": (
-                                message_id
-                            )
-                        }
-
-                        cooldowns[
-                            inst_id
-                        ] = current_time()
-
-                        signals_last_hour.append(
-                            current_time()
-                        )
-
-                        signals_today += 1
-
-                    log.info(
-                        "READY CREATED | %s",
-                        signal["coin"]
-                    )
-
-                    # Не бомбим API.
-                    time.sleep(
-                        0.15
-                    )
-
-                except Exception as error:
-
-                    # Одна монета НИКОГДА
-                    # не должна убивать scanner.
-                    log.exception(
-                        "SYMBOL ERROR | %s | %s",
-                        inst_id,
-                        error
-                    )
-
-                    continue
-
-            log.info(
-                "SCAN #%s COMPLETE",
-                scan_number
-            )
-
-        except Exception as error:
-
-            log.exception(
-                "SCANNER CRITICAL ERROR | %s",
-                error
-            )
-
-            time.sleep(10)
-
-        time.sleep(
-            SCAN_INTERVAL
+<b>Качество важнее количества.</b>
+""".strip(),
+            parse_mode="HTML"
         )
 
+        log.info("STARTUP MESSAGE SENT")
 
-# ============================================================
-# WATCHDOG
-# ============================================================
-
-def watchdog_loop():
+    except Exception:
+        log.exception(
+            "STARTUP MESSAGE ERROR"
+        )
 
     while True:
 
+        scan_number += 1
+
+        started = time.time()
+
+        log.info("=" * 30)
+        log.info("SCAN #%d", scan_number)
+
         try:
 
-            if last_scan_timestamp:
+            send_morning_message_if_needed()
 
-                age = (
-                    current_time()
-                    - last_scan_timestamp
+            markets = get_liquid_markets()
+
+            if not markets:
+
+                log.warning(
+                    "NO MARKETS ABOVE $60M"
                 )
 
-                if age > 180:
+            else:
 
-                    log.warning(
-                        "WATCHDOG: scanner "
-                        "has not started scan "
-                        "for %s seconds",
-                        int(age)
+                log.info(
+                    "Markets >= $60M: %d",
+                    len(markets)
+                )
+
+                for index, market in enumerate(markets, start=1):
+
+                    log.info(
+                        "ANALYSE %d/%d | %s | VOL=%s",
+                        index,
+                        len(markets),
+                        market["inst_id"],
+                        fmt_money(market["volume"])
                     )
 
-        except Exception:
+                    analyse_market(market)
 
+                    # Small delay prevents unnecessary API bursts.
+                    time.sleep(0.15)
+
+        except Exception:
             log.exception(
-                "WATCHDOG ERROR"
+                "SCAN LOOP ERROR"
             )
 
-        time.sleep(30)
+        elapsed = time.time() - started
+
+        log.info(
+            "SCAN #%d COMPLETE | %.1fs",
+            scan_number,
+            elapsed
+        )
+
+        sleep_for = max(
+            2,
+            SCAN_INTERVAL - elapsed
+        )
+
+        time.sleep(sleep_for)
 
 
 # ============================================================
-# WEB SERVER
+# RENDER WEB SERVER
 # ============================================================
 
-class HealthHandler(
-    BaseHTTPRequestHandler
-):
-
-    def log_message(
-        self,
-        format,
-        *args
-    ):
-        # Не засоряем Render Logs.
-        return
+class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
 
-        if self.path == "/":
+        if self.path in ("/", "/health"):
 
-            self.send_response(
-                200
-            )
+            self.send_response(200)
 
             self.send_header(
                 "Content-Type",
@@ -2481,223 +1758,61 @@ class HealthHandler(
             self.end_headers()
 
             self.wfile.write(
-                b"QUANTUM SCALPER V3 ONLINE"
+                b"QUANTUM SCALPER V4 ACTIVE"
             )
 
             return
 
-        if self.path == "/health":
+        self.send_response(200)
+        self.end_headers()
 
-            if last_scan_timestamp:
-
-                scanner_age = int(
-                    current_time()
-                    - last_scan_timestamp
-                )
-
-            else:
-
-                scanner_age = -1
-
-            with state_lock:
-
-                ready_count = len(
-                    ready_signals
-                )
-
-            body = (
-                "{"
-                '"status":"ok",'
-                f'"scan_number":{scan_number},'
-                f'"scanner_age":{scanner_age},'
-                f'"ready":{ready_count}'
-                "}"
-            )
-
-            self.send_response(
-                200
-            )
-
-            self.send_header(
-                "Content-Type",
-                "application/json"
-            )
-
-            self.end_headers()
-
-            self.wfile.write(
-                body.encode()
-            )
-
-            return
-
-        self.send_response(
-            404
+        self.wfile.write(
+            b"QUANTUM SCALPER V4"
         )
 
+    def do_HEAD(self):
+
+        self.send_response(200)
         self.end_headers()
+
+    def log_message(self, format, *args):
+        # Keep Render logs clean.
+        return
 
 
 def run_web_server():
 
-    server = ThreadingHTTPServer(
-        (
-            "0.0.0.0",
-            PORT
-        ),
+    port = int(
+        os.environ.get(
+            "PORT",
+            "10000"
+        )
+    )
+
+    server = HTTPServer(
+        ("0.0.0.0", port),
         HealthHandler
     )
 
     log.info(
-        "WEB SERVER: 0.0.0.0:%s",
-        PORT
+        "WEB SERVER: 0.0.0.0:%d",
+        port
     )
 
     server.serve_forever()
 
 
 # ============================================================
-# STARTUP MESSAGE
-# ============================================================
-
-def send_startup_message():
-
-    try:
-
-        bot.send_message(
-            CHANNEL_ID,
-            (
-                "🚀 *QUANTUM SCALPER V3 ONLINE*\n\n"
-
-                "🟢 OKX Market Data\n"
-                "🟢 Open Interest\n"
-                "🟢 1H Structure\n"
-                "🟢 15M Setup\n"
-                "🟢 5M Confirmation\n"
-                "🟢 Telegram\n"
-                "🟢 Render Web Service\n\n"
-
-                "🧠 *3 стратегии:*\n"
-                "1️⃣ Horizontal Level Breakout\n"
-                "2️⃣ Trendline Compression Breakout\n"
-                "3️⃣ Momentum Breakout\n\n"
-
-                "⭐ Минимальный Score: "
-                f"`{MIN_SCORE}/100`\n\n"
-
-                "🟡 READY → 🟢 ACTIVE\n\n"
-
-                "*Качество важнее количества.*"
-            ),
-            parse_mode="Markdown"
-        )
-
-        log.info(
-            "STARTUP MESSAGE SENT"
-        )
-
-    except Exception:
-
-        log.exception(
-            "STARTUP TELEGRAM ERROR"
-        )
-
-
-# ============================================================
 # MAIN
 # ============================================================
 
-def main():
+if __name__ == "__main__":
 
-    log.info(
-        "======================================"
-    )
-
-    log.info(
-        "QUANTUM SCALPER V3 STARTING"
-    )
-
-    log.info(
-        "MIN SCORE: %s",
-        MIN_SCORE
-    )
-
-    log.info(
-        "MIN VOLUME: $%s",
-        f"{MIN_VOLUME_USD:,.0f}"
-    )
-
-    log.info(
-        "MAX SYMBOLS: %s",
-        MAX_SYMBOLS
-    )
-
-    log.info(
-        "SCAN INTERVAL: %ss",
-        SCAN_INTERVAL
-    )
-
-    log.info(
-        "TIMEZONE: Europe/Kyiv"
-    )
-
-    log.info(
-        "======================================"
-    )
-
-    # --------------------------------------------------------
-    # WEB
-    # --------------------------------------------------------
-
-    threading.Thread(
+    web_thread = threading.Thread(
         target=run_web_server,
         daemon=True
-    ).start()
+    )
 
-    # --------------------------------------------------------
-    # SCANNER
-    # --------------------------------------------------------
+    web_thread.start()
 
-    threading.Thread(
-        target=scanner_loop,
-        daemon=True
-    ).start()
-
-    # --------------------------------------------------------
-    # WATCHDOG
-    # --------------------------------------------------------
-
-    threading.Thread(
-        target=watchdog_loop,
-        daemon=True
-    ).start()
-
-    # --------------------------------------------------------
-    # TELEGRAM
-    # --------------------------------------------------------
-
-    send_startup_message()
-
-    # --------------------------------------------------------
-    # MAIN
-    # --------------------------------------------------------
-
-    while True:
-
-        try:
-
-            send_morning_message()
-
-        except Exception:
-
-            log.exception(
-                "MAIN LOOP ERROR"
-            )
-
-        time.sleep(20)
-
-
-# ============================================================
-
-if __name__ == "__main__":
-    main()
+    scanner_loop()

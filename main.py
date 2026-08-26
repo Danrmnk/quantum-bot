@@ -1,4 +1,27 @@
-ю
+import os
+import time
+import logging
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+import requests
+import telebot
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+BOT_TOKEN = os.getenv(
+    "BOT_TOKEN",
+    ""
+).strip()
+
+CHANNEL_ID = os.getenv(
     "CHANNEL_ID",
     ""
 ).strip()
@@ -7,10 +30,11 @@ OKX_BASE_URL = os.getenv(
     "OKX_BASE_URL",
     "https://www.okx.com"
 ).rstrip("/")
-
 TIMEZONE = os.getenv(
     "BOT_TIMEZONE",
     "Europe/Kyiv"
+)
+
 )
 
 # ------------------------------------------------------------

@@ -698,95 +698,159 @@ def okx_get(
             response.raise_for_status()
 
             payload = response.json()
-
-            if payload.get("code") != "0":
-
-                raise RuntimeError(
-                    "OKX error: "
-                    f"{payload.get('code')} "
-                    f"{payload.get('msg')}"
-                )
-
-            return payload
-
-        except Exception as exc:
-
-            last_error = exc
-
-            log.warning(
-                "OKX ошибка %s/%s %s: %s",
-                attempt,
-                retries,
-                path,
-                exc
-            )
-
-            if attempt < retries:
-
-                time.sleep(
-                    attempt
-                )
-
-    raise RuntimeError(
-        f"OKX request failed: "
-        f"{last_error}"
-    )
-
-
-# ============================================================
-# TICKERS
-# ============================================================
-
 def get_tickers() -> Dict[str, dict]:
+    """Получение USDT-SWAP тикеров OKX с диагностикой."""
 
-    payload = okx_get(
-        "/api/v5/market/tickers",
-        {
-            "instType": "SWAP"
-        }
+    log.info(
+        "OKX DEBUG | requesting SWAP tickers | base=%s",
+        OKX_BASE_URL
     )
 
-    result = {}
-
-    for item in payload.get(
-        "data",
-        []
-    ):
-
-        inst_id = item.get(
-            "instId",
-            ""
+    try:
+        payload = okx_get(
+            "/api/v5/market/tickers",
+            {"instType": "SWAP"}
         )
 
-        if not inst_id.endswith(
-            "-USDT-SWAP"
-        ):
-            continue
+        raw_data = payload.get("data", [])
 
-        try:
+        log.info(
+            "OKX DEBUG | code=%s | msg=%s | raw_items=%s",
+            payload.get("code"),
+            payload.get("msg", ""),
+            len(raw_data)
+        )
 
-            last = float(
-                item.get(
-                    "last",
-                    0
+        if not raw_data:
+            log.warning(
+                "OKX DEBUG | EMPTY SWAP RESPONSE"
+            )
+            return {}
+
+        first = raw_data[0]
+
+        log.info(
+            "OKX DEBUG | first | instId=%s | "
+            "last=%s | volCcy24h=%s | "
+            "volCcyQuote24h=%s",
+            first.get("instId"),
+            first.get("last"),
+            first.get("volCcy24h"),
+            first.get("volCcyQuote24h")
+        )
+
+        result = {}
+
+        total = 0
+        usdt_swap = 0
+        bad_price = 0
+        bad_volume = 0
+        invalid = 0
+
+        for item in raw_data:
+
+            if not isinstance(item, dict):
+                invalid += 1
+                continue
+
+            total += 1
+
+            inst_id = str(
+                item.get("instId", "")
+            ).strip()
+
+            if not inst_id:
+                invalid += 1
+                continue
+
+            if not inst_id.endswith("-USDT-SWAP"):
+                continue
+
+            usdt_swap += 1
+
+            try:
+                last = float(
+                    item.get("last") or 0
                 )
-                or 0
+
+                high24h = float(
+                    item.get("high24h") or 0
+                )
+
+                low24h = float(
+                    item.get("low24h") or 0
+                )
+
+                volume = float(
+                    item.get("volCcyQuote24h") or 0
+                )
+
+                if volume <= 0:
+                    volume = float(
+                        item.get("volCcy24h") or 0
+                    )
+
+                ts = int(
+                    float(
+                        item.get("ts") or 0
+                    )
+                )
+
+            except (
+                TypeError,
+                ValueError,
+                OverflowError
+            ):
+                invalid += 1
+                continue
+
+            if last <= 0:
+                bad_price += 1
+                continue
+
+            if volume <= 0:
+                bad_volume += 1
+                continue
+
+            result[inst_id] = {
+                "last": last,
+                "high24h": high24h,
+                "low24h": low24h,
+                "volume_24h": volume,
+                "ts": ts,
+            }
+
+        log.info(
+            "OKX DEBUG | total=%s | USDT-SWAP=%s | "
+            "valid=%s | bad_price=%s | "
+            "bad_volume=%s | invalid=%s",
+            total,
+            usdt_swap,
+            len(result),
+            bad_price,
+            bad_volume,
+            invalid
+        )
+
+        if result:
+            log.info(
+                "OKX DEBUG | sample=%s",
+                ", ".join(
+                    list(result.keys())[:5]
+                )
+            )
+        else:
+            log.warning(
+                "OKX DEBUG | NO VALID USDT-SWAP"
             )
 
-            volume = float(
-                item.get(
-                    "volCcyQuote24h",
-                    0
-                )
-                or 0
-            )
+        return result
 
-            high24h = float(
-                item.get(
-                    "high24h",
-                    0
-                )
-                or 0
+    except Exception:
+        log.exception(
+            "OKX DEBUG | get_tickers FAILED"
+        )
+        return {}
             )
 
             low24h = float(

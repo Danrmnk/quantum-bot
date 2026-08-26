@@ -1,30 +1,46 @@
 # ============================================================
-# QUANTUM SCALPER V2
-# ============================================================
+# QUANTUM SCALPER V3
+# BINANCE USDⓈ-M FUTURES
+# MARKET ANALYSIS -> SIGNALS -> TELEGRAM -> STATISTICS
 #
-# OKX PUBLIC MARKET DATA
-# ->
-# MARKET ANALYSIS
-# ->
-# SCALPING SIGNAL ENGINE
-# ->
-# TELEGRAM
+# Бот НЕ торгует и НЕ использует Binance API Key.
+# Он только получает публичные данные рынка,
+# анализирует их и публикует сигналы.
 #
-# ВАЖНО:
-# БОТ НЕ ТОРГУЕТ.
-# Только анализирует рынок и публикует сигналы.
-#
+# Основные возможности:
+# - Binance USDⓈ-M Futures
+# - все USDT perpetual-контракты
+# - фильтр 24h quote volume >= $100,000,000
+# - 1H trend
+# - 15M structure
+# - 5M confirmation
+# - breakout / compression / momentum
+# - volume confirmation
+# - funding rate
+# - score 0..100
+# - entry zone
+# - stop
+# - TP1 / TP2 / TP3
+# - автоматическое сопровождение сигналов
+# - честная статистика в R
+# - утреннее сообщение
+# - дневная статистика
+# - недельная статистика
+# - SQLite
+# - восстановление после перезапуска
+# - retry / timeout / защита от падения цикла
 # ============================================================
 
 import os
 import time
 import math
-import logging
-import sqlite3
 import uuid
+import sqlite3
+import logging
+import threading
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict, Tuple
 
@@ -32,6 +48,7 @@ import requests
 import telebot
 
 import matplotlib
+
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
@@ -42,12 +59,20 @@ from matplotlib.patches import Rectangle
 # CONFIG
 # ============================================================
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+TELEGRAM_TOKEN = os.getenv(
+    "TELEGRAM_TOKEN",
+    ""
+).strip()
 
-OKX_BASE_URL = os.getenv(
-    "OKX_BASE_URL",
-    "https://www.okx.com"
+CHANNEL_ID = os.getenv(
+    "CHANNEL_ID",
+    ""
+).strip()
+
+# Binance USDⓈ-M Futures public API
+BINANCE_BASE_URL = os.getenv(
+    "BINANCE_BASE_URL",
+    "https://fapi.binance.com"
 ).rstrip("/")
 
 TIMEZONE = os.getenv(
@@ -55,19 +80,21 @@ TIMEZONE = os.getenv(
     "Europe/Kyiv"
 )
 
-MAX_SYMBOLS = int(
-    os.getenv("MAX_SYMBOLS", "25")
-)
-
+# Главное условие пользователя:
+# НЕ ограничиваем количество монет.
+# Фильтруем все подходящие USDT perpetual.
 MIN_24H_VOLUME_USD = float(
     os.getenv(
         "MIN_24H_VOLUME_USD",
-        "20000000"
+        "100000000"
     )
 )
 
 MIN_SCORE = int(
-    os.getenv("MIN_SCORE", "82")
+    os.getenv(
+        "MIN_SCORE",
+        "82"
+    )
 )
 
 READY_TTL_MINUTES = int(
@@ -84,17 +111,10 @@ COOLDOWN_MINUTES = int(
     )
 )
 
-MAX_SIGNALS_PER_HOUR = int(
-    os.getenv(
-        "MAX_SIGNALS_PER_HOUR",
-        "6"
-    )
-)
-
 SCAN_INTERVAL_SECONDS = int(
     os.getenv(
         "SCAN_INTERVAL_SECONDS",
-        "30"
+        "60"
     )
 )
 
@@ -105,6 +125,21 @@ MAX_CHASE_PCT = float(
     )
 )
 
+MAX_RISK_PCT = float(
+    os.getenv(
+        "MAX_RISK_PCT",
+        "1.50"
+    )
+)
+
+MIN_RISK_PCT = float(
+    os.getenv(
+        "MIN_RISK_PCT",
+        "0.15"
+    )
+)
+
+# Час утреннего сообщения
 MORNING_ENABLED = (
     os.getenv(
         "MORNING_ENABLED",
@@ -126,20 +161,100 @@ MORNING_MINUTE = int(
     )
 )
 
+# Время дневной статистики
+DAILY_REPORT_ENABLED = (
+    os.getenv(
+        "DAILY_REPORT_ENABLED",
+        "true"
+    ).lower() == "true"
+)
+
+DAILY_REPORT_HOUR = int(
+    os.getenv(
+        "DAILY_REPORT_HOUR",
+        "23"
+    )
+)
+
+DAILY_REPORT_MINUTE = int(
+    os.getenv(
+        "DAILY_REPORT_MINUTE",
+        "50"
+    )
+)
+
+# Недельный отчёт:
+# 0 = понедельник
+WEEKLY_REPORT_ENABLED = (
+    os.getenv(
+        "WEEKLY_REPORT_ENABLED",
+        "true"
+    ).lower() == "true"
+)
+
+WEEKLY_REPORT_DAY = int(
+    os.getenv(
+        "WEEKLY_REPORT_DAY",
+        "6"
+    )
+)
+
+WEEKLY_REPORT_HOUR = int(
+    os.getenv(
+        "WEEKLY_REPORT_HOUR",
+        "23"
+    )
+)
+
+WEEKLY_REPORT_MINUTE = int(
+    os.getenv(
+        "WEEKLY_REPORT_MINUTE",
+        "55"
+    )
+)
+
 DB_PATH = os.getenv(
     "DB_PATH",
     "quantum_scalper.db"
 )
 
+HTTP_TIMEOUT = int(
+    os.getenv(
+        "HTTP_TIMEOUT",
+        "10"
+    )
+)
+
+HTTP_RETRIES = int(
+    os.getenv(
+        "HTTP_RETRIES",
+        "3"
+    )
+)
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError(
-        "TELEGRAM_TOKEN не найден."
+        "TELEGRAM_TOKEN не найден в Environment Variables."
     )
 
 if not CHANNEL_ID:
     raise RuntimeError(
-        "CHANNEL_ID не найден."
+        "CHANNEL_ID не найден в Environment Variables."
+    )
+
+if MIN_24H_VOLUME_USD <= 0:
+    raise RuntimeError(
+        "MIN_24H_VOLUME_USD должен быть > 0."
+    )
+
+if MIN_SCORE < 1 or MIN_SCORE > 100:
+    raise RuntimeError(
+        "MIN_SCORE должен быть от 1 до 100."
     )
 
 
@@ -178,7 +293,7 @@ bot = telebot.TeleBot(
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "QuantumScalper/2.0",
+    "User-Agent": "QuantumScalper/3.0",
     "Accept": "application/json",
 })
 
@@ -187,43 +302,76 @@ session.headers.update({
 # DATABASE
 # ============================================================
 
+db_lock = threading.RLock()
+
 db = sqlite3.connect(
     DB_PATH,
     check_same_thread=False
 )
 
+db.execute(
+    "PRAGMA journal_mode=WAL"
+)
+
+db.execute(
+    "PRAGMA synchronous=NORMAL"
+)
+
 db.execute("""
 CREATE TABLE IF NOT EXISTS signals (
+
     id INTEGER PRIMARY KEY AUTOINCREMENT,
 
     signal_id TEXT UNIQUE NOT NULL,
 
-    inst_id TEXT NOT NULL,
-    coin TEXT NOT NULL,
+    symbol TEXT NOT NULL,
 
     direction TEXT NOT NULL,
+
     strategy TEXT NOT NULL,
 
     level REAL NOT NULL,
 
     entry_low REAL NOT NULL,
+
     entry_high REAL NOT NULL,
+
+    planned_entry REAL NOT NULL,
+
+    actual_entry REAL,
 
     sl REAL NOT NULL,
 
     tp1 REAL NOT NULL,
+
     tp2 REAL NOT NULL,
+
     tp3 REAL NOT NULL,
 
     score INTEGER NOT NULL,
 
+    volume_24h REAL NOT NULL,
+
+    volume_ratio REAL NOT NULL,
+
+    funding_rate REAL NOT NULL,
+
+    atr_pct REAL NOT NULL,
+
+    level_tf TEXT NOT NULL,
+
     status TEXT NOT NULL,
 
     created_at REAL NOT NULL,
+
+    expires_at REAL NOT NULL,
+
     activated_at REAL,
 
     tp1_hit_at REAL,
+
     tp2_hit_at REAL,
+
     tp3_hit_at REAL,
 
     closed_at REAL,
@@ -232,16 +380,34 @@ CREATE TABLE IF NOT EXISTS signals (
 
     result_r REAL,
 
-    expires_at REAL NOT NULL,
+    realized_r REAL DEFAULT 0,
 
     photo_message_id INTEGER,
+
     text_message_id INTEGER
 )
 """)
 
 db.execute("""
+CREATE INDEX IF NOT EXISTS idx_signals_symbol
+ON signals(symbol)
+""")
+
+db.execute("""
+CREATE INDEX IF NOT EXISTS idx_signals_created
+ON signals(created_at)
+""")
+
+db.execute("""
+CREATE INDEX IF NOT EXISTS idx_signals_status
+ON signals(status)
+""")
+
+db.execute("""
 CREATE TABLE IF NOT EXISTS bot_state (
+
     key TEXT PRIMARY KEY,
+
     value TEXT NOT NULL
 )
 """)
@@ -274,13 +440,14 @@ class Setup:
 
     signal_id: str
 
-    inst_id: str
-    coin: str
+    symbol: str
 
     direction: str
+
     strategy: str
 
     level: float
+
     current_price: float
 
     entry_low: float
@@ -294,15 +461,15 @@ class Setup:
 
     score: int
 
-    liquidity: str
-    volume_grade: str
-
     level_tf: str
 
     reason: str
 
     volume_24h: float
+
     volume_ratio: float
+
+    funding_rate: float
 
     atr_pct: float
 
@@ -315,16 +482,22 @@ class ActiveSignal:
     setup: Setup
 
     created_at: float
+
     expires_at: float
 
     photo_message_id: Optional[int] = None
+
     text_message_id: Optional[int] = None
 
     activated: bool = False
 
+    actual_entry: Optional[float] = None
+
     tp1_hit: bool = False
     tp2_hit: bool = False
     tp3_hit: bool = False
+
+    realized_r: float = 0.0
 
 
 # ============================================================
@@ -338,16 +511,15 @@ active_signals: Dict[
 
 signals_hour: List[float] = []
 
-last_scan_ts = 0.0
 scan_count = 0
 
-signals_today = 0
-
 last_morning_date = None
+last_daily_report_date = None
+last_weekly_report_key = None
 
 
 # ============================================================
-# GENERAL HELPERS
+# TIME HELPERS
 # ============================================================
 
 def now_ts() -> float:
@@ -361,33 +533,94 @@ def local_now() -> datetime:
     )
 
 
+def date_key() -> str:
+
+    return str(
+        local_now().date()
+    )
+
+
+def week_key() -> str:
+
+    current = local_now()
+
+    monday = (
+        current.date()
+        - timedelta(
+            days=current.weekday()
+        )
+    )
+
+    return str(monday)
+
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
 def fmt_price(
     price: float
 ) -> str:
 
     if price >= 1000:
+
         return (
             f"{price:,.2f}"
             .replace(",", " ")
         )
 
     if price >= 100:
+
         return (
-            f"{price:,.2f}"
+            f"{price:,.3f}"
             .replace(",", " ")
         )
 
     if price >= 1:
+
         return (
             f"{price:,.4f}"
             .replace(",", " ")
         )
 
+    if price >= 0.01:
+
+        return (
+            f"{price:.6f}"
+            .rstrip("0")
+            .rstrip(".")
+        )
+
     return (
-        f"{price:.8f}"
+        f"{price:.10f}"
         .rstrip("0")
         .rstrip(".")
     )
+
+
+def fmt_usd(
+    value: float
+) -> str:
+
+    if value >= 1_000_000_000:
+
+        return (
+            f"${value / 1_000_000_000:.2f}B"
+        )
+
+    if value >= 1_000_000:
+
+        return (
+            f"${value / 1_000_000:.1f}M"
+        )
+
+    if value >= 1_000:
+
+        return (
+            f"${value / 1_000:.1f}K"
+        )
+
+    return f"${value:.0f}"
 
 
 def percentage(
@@ -417,25 +650,14 @@ def clamp(
     )
 
 
-def coin_name(
-    inst_id: str
-) -> str:
-
-    return inst_id.replace(
-        "-USDT-SWAP",
-        ""
-    )
-
-
 def direction_ru(
     direction: str
 ) -> str:
 
-    return (
-        "ЛОНГ"
-        if direction == "LONG"
-        else "ШОРТ"
-    )
+    if direction == "LONG":
+        return "ЛОНГ"
+
+    return "ШОРТ"
 
 
 def strategy_ru(
@@ -448,16 +670,10 @@ def strategy_ru(
             "Пробой ключевого уровня",
 
         "COMPRESSION_BREAKOUT":
-            "Пробой после сжатия",
+            "Сжатие → пробой",
 
         "MOMENTUM_BREAKOUT":
             "Импульсный пробой",
-
-        "LEVEL_REJECTION":
-            "Отбой от ключевого уровня",
-
-        "FALSE_BREAKOUT":
-            "Ложный пробой",
 
     }
 
@@ -483,18 +699,27 @@ def score_label(
     return "🎯 СИГНАЛ"
 
 
+def funding_label(
+    funding: float
+) -> str:
+
+    pct = funding * 100
+
+    return f"{pct:+.4f}%"
+
+
 # ============================================================
-# OKX
+# BINANCE PUBLIC API
 # ============================================================
 
-def okx_get(
+def binance_get(
     path: str,
-    params: dict,
-    retries: int = 3
+    params: Optional[dict] = None,
+    retries: int = HTTP_RETRIES
 ):
 
     url = (
-        f"{OKX_BASE_URL}"
+        f"{BINANCE_BASE_URL}"
         f"{path}"
     )
 
@@ -509,30 +734,34 @@ def okx_get(
 
             response = session.get(
                 url,
-                params=params,
-                timeout=10
+                params=params or {},
+                timeout=HTTP_TIMEOUT
             )
+
+            # Rate limit / server errors
+            if response.status_code in (
+                418,
+                429,
+                500,
+                502,
+                503,
+                504
+            ):
+
+                raise RuntimeError(
+                    f"HTTP {response.status_code}"
+                )
 
             response.raise_for_status()
 
-            payload = response.json()
-
-            if payload.get("code") != "0":
-
-                raise RuntimeError(
-                    "OKX error: "
-                    f"{payload.get('code')} "
-                    f"{payload.get('msg')}"
-                )
-
-            return payload
+            return response.json()
 
         except Exception as exc:
 
             last_error = exc
 
             log.warning(
-                "OKX ошибка "
+                "Binance ошибка "
                 "%s/%s %s: %s",
                 attempt,
                 retries,
@@ -541,90 +770,150 @@ def okx_get(
             )
 
             if attempt < retries:
+
                 time.sleep(
-                    attempt * 2
+                    min(
+                        2 ** attempt,
+                        8
+                    )
                 )
 
     raise RuntimeError(
-        f"OKX request failed: "
+        f"Binance request failed: "
         f"{last_error}"
     )
 
 
 # ============================================================
-# TICKERS
+# EXCHANGE INFO
+# ============================================================
+
+def get_exchange_symbols() -> set:
+
+    payload = binance_get(
+        "/fapi/v1/exchangeInfo"
+    )
+
+    symbols = set()
+
+    for item in payload.get(
+        "symbols",
+        []
+    ):
+
+        try:
+
+            symbol = item["symbol"]
+
+            contract_type = item.get(
+                "contractType"
+            )
+
+            status = item.get(
+                "status"
+            )
+
+            quote_asset = item.get(
+                "quoteAsset"
+            )
+
+            if (
+                status == "TRADING"
+                and quote_asset == "USDT"
+                and contract_type == "PERPETUAL"
+            ):
+
+                symbols.add(
+                    symbol
+                )
+
+        except Exception:
+            continue
+
+    return symbols
+
+
+# ============================================================
+# 24H TICKERS
 # ============================================================
 
 def get_tickers() -> Dict[str, dict]:
 
-    payload = okx_get(
-        "/api/v5/market/tickers",
-        {
-            "instType": "SWAP"
-        }
+    payload = binance_get(
+        "/fapi/v1/ticker/24hr"
     )
 
     result = {}
 
-    for item in payload.get(
-        "data",
-        []
-    ):
-
-        inst_id = item.get(
-            "instId",
-            ""
-        )
-
-        if not inst_id.endswith(
-            "-USDT-SWAP"
-        ):
-            continue
+    for item in payload:
 
         try:
 
+            symbol = item.get(
+                "symbol",
+                ""
+            )
+
+            if not symbol:
+                continue
+
             last = float(
                 item.get(
-                    "last",
+                    "lastPrice",
                     0
                 )
             )
 
             volume = float(
                 item.get(
-                    "volCcyQuote24h",
+                    "quoteVolume",
                     0
-                ) or 0
+                )
             )
 
-            if last <= 0:
+            high = float(
+                item.get(
+                    "highPrice",
+                    0
+                )
+            )
+
+            low = float(
+                item.get(
+                    "lowPrice",
+                    0
+                )
+            )
+
+            if (
+                last <= 0
+                or volume <= 0
+            ):
                 continue
 
-            result[inst_id] = {
+            result[symbol] = {
 
                 "last": last,
 
-                "high24h": float(
-                    item.get(
-                        "high24h",
-                        0
-                    ) or 0
-                ),
+                "high24h": high,
 
-                "low24h": float(
-                    item.get(
-                        "low24h",
-                        0
-                    ) or 0
-                ),
+                "low24h": low,
 
                 "volume_24h": volume,
 
-                "ts": int(
+                "price_change_pct": float(
                     item.get(
-                        "ts",
+                        "priceChangePercent",
                         0
-                    ) or 0
+                    )
+                ),
+
+                "weighted_price": float(
+                    item.get(
+                        "weightedAvgPrice",
+                        0
+                    )
+                    or 0
                 ),
             }
 
@@ -638,40 +927,99 @@ def get_tickers() -> Dict[str, dict]:
 
 
 # ============================================================
-# CANDLES
+# FUNDING
+# ============================================================
+
+def get_funding_map(
+    symbols: set
+) -> Dict[str, float]:
+
+    result = {}
+
+    try:
+
+        payload = binance_get(
+            "/fapi/v1/premiumIndex"
+        )
+
+        for item in payload:
+
+            symbol = item.get(
+                "symbol"
+            )
+
+            if symbol not in symbols:
+                continue
+
+            try:
+
+                result[symbol] = float(
+                    item.get(
+                        "lastFundingRate",
+                        0
+                    )
+                    or 0
+                )
+
+            except (
+                TypeError,
+                ValueError
+            ):
+                result[symbol] = 0.0
+
+    except Exception:
+
+        log.exception(
+            "Не удалось получить funding."
+        )
+
+    return result
+
+
+# ============================================================
+# KLINES
 # ============================================================
 
 def get_candles(
-    inst_id: str,
-    bar: str,
+    symbol: str,
+    interval: str,
     limit: int = 120
 ) -> List[Candle]:
 
-    payload = okx_get(
-        "/api/v5/market/candles",
+    payload = binance_get(
+        "/fapi/v1/klines",
         {
-            "instId": inst_id,
-            "bar": bar,
-            "limit": str(
-                min(limit, 300)
+            "symbol": symbol,
+            "interval": interval,
+            "limit": min(
+                limit,
+                1000
             )
         }
     )
 
     result = []
 
-    for row in reversed(
-        payload.get(
-            "data",
-            []
-        )
-    ):
+    now_ms = int(
+        time.time() * 1000
+    )
+
+    for row in payload:
 
         try:
 
+            open_time = int(
+                row[0]
+            )
+
+            close_time = int(
+                row[6]
+            )
+
             result.append(
                 Candle(
-                    ts=int(row[0]),
+
+                    ts=open_time,
 
                     open=float(row[1]),
                     high=float(row[2]),
@@ -679,15 +1027,16 @@ def get_candles(
                     close=float(row[4]),
 
                     volume=float(
-                        row[5] or 0
+                        row[5]
                     ),
 
                     quote_volume=float(
-                        row[7] or 0
+                        row[7]
                     ),
 
                     confirmed=(
-                        row[8] == "1"
+                        close_time
+                        < now_ms
                     )
                 )
             )
@@ -697,6 +1046,7 @@ def get_candles(
             TypeError,
             ValueError
         ):
+
             continue
 
     return result
@@ -714,8 +1064,9 @@ def ema(
     if not values:
         return []
 
-    alpha = 2.0 / (
-        period + 1.0
+    alpha = (
+        2.0
+        / (period + 1.0)
     )
 
     result = [
@@ -753,7 +1104,7 @@ def atr(
         current = candles[i]
         previous = candles[i - 1]
 
-        true_range = max(
+        tr = max(
 
             current.high
             - current.low,
@@ -769,9 +1120,10 @@ def atr(
             )
         )
 
-        trs.append(
-            true_range
-        )
+        trs.append(tr)
+
+    if len(trs) < period:
+        return 0.0
 
     return (
         sum(
@@ -813,12 +1165,13 @@ def volume_ratio(
         return 0.0
 
     return (
-        current / average
+        current
+        / average
     )
 
 
 # ============================================================
-# STRUCTURE
+# MARKET STRUCTURE
 # ============================================================
 
 def market_structure(
@@ -869,6 +1222,7 @@ def market_structure(
         and second_high >= first_high
         and second_low >= first_low
     ):
+
         return "LONG"
 
     if (
@@ -876,6 +1230,7 @@ def market_structure(
         and second_high <= first_high
         and second_low <= first_low
     ):
+
         return "SHORT"
 
     return "NEUTRAL"
@@ -892,6 +1247,11 @@ def pivot_highs(
 ) -> List[Tuple[int, float]]:
 
     result = []
+
+    if len(candles) < (
+        left + right + 1
+    ):
+        return result
 
     for i in range(
         left,
@@ -911,10 +1271,13 @@ def pivot_highs(
                 continue
 
             if candles[j].high > value:
+
                 valid = False
+
                 break
 
         if valid:
+
             result.append(
                 (i, value)
             )
@@ -929,6 +1292,11 @@ def pivot_lows(
 ) -> List[Tuple[int, float]]:
 
     result = []
+
+    if len(candles) < (
+        left + right + 1
+    ):
+        return result
 
     for i in range(
         left,
@@ -948,10 +1316,13 @@ def pivot_lows(
                 continue
 
             if candles[j].low < value:
+
                 valid = False
+
                 break
 
         if valid:
+
             result.append(
                 (i, value)
             )
@@ -960,7 +1331,7 @@ def pivot_lows(
 
 
 # ============================================================
-# LEVEL ENGINE
+# KEY LEVEL
 # ============================================================
 
 def find_key_level(
@@ -983,13 +1354,9 @@ def find_key_level(
         candles_15m
     )
 
-    # ------------------------------------------
-    # LONG -> resistance above price
-    # ------------------------------------------
-
     if direction == "LONG":
 
-        for _, level in highs[-20:]:
+        for _, level in highs[-25:]:
 
             distance = abs(
                 percentage(
@@ -1000,7 +1367,7 @@ def find_key_level(
 
             if (
                 level > current
-                and distance <= 1.2
+                and distance <= 1.5
             ):
 
                 candidates.append(
@@ -1010,8 +1377,6 @@ def find_key_level(
                         distance
                     )
                 )
-
-        # 1H resistance
 
         if len(candles_1h) >= 30:
 
@@ -1033,7 +1398,7 @@ def find_key_level(
 
             if (
                 level > current
-                and distance <= 2.0
+                and distance <= 2.5
             ):
 
                 candidates.append(
@@ -1044,13 +1409,9 @@ def find_key_level(
                     )
                 )
 
-    # ------------------------------------------
-    # SHORT -> support below price
-    # ------------------------------------------
-
     else:
 
-        for _, level in lows[-20:]:
+        for _, level in lows[-25:]:
 
             distance = abs(
                 percentage(
@@ -1061,7 +1422,7 @@ def find_key_level(
 
             if (
                 level < current
-                and distance <= 1.2
+                and distance <= 1.5
             ):
 
                 candidates.append(
@@ -1092,7 +1453,7 @@ def find_key_level(
 
             if (
                 level < current
-                and distance <= 2.0
+                and distance <= 2.5
             ):
 
                 candidates.append(
@@ -1104,11 +1465,13 @@ def find_key_level(
                 )
 
     if not candidates:
+
         return None, ""
 
     candidates.sort(
         key=lambda x: (
-            0 if x[1] == "1H"
+            0
+            if x[1] == "1H"
             else 1,
             x[2]
         )
@@ -1124,12 +1487,13 @@ def find_key_level(
 # COMPRESSION
 # ============================================================
 
-def compression(
+def compression_score(
     candles: List[Candle],
     direction: str
 ) -> Tuple[int, bool]:
 
     if len(candles) < 30:
+
         return 0, False
 
     recent = candles[-20:]
@@ -1141,6 +1505,7 @@ def compression(
     ]
 
     if len(ranges) < 15:
+
         return 0, False
 
     first_avg = (
@@ -1154,6 +1519,7 @@ def compression(
     )
 
     if first_avg <= 0:
+
         return 0, False
 
     reduction = (
@@ -1218,55 +1584,56 @@ def compression(
     if reduction >= 0.25:
         score += 5
 
-    return min(
-        score,
-        25
-    ), valid
+    return (
+        min(score, 25),
+        valid
+    )
 
 
 # ============================================================
-# SIGNAL ENGINE
+# SIGNAL ANALYSIS
 # ============================================================
 
 def analyze_symbol(
-    inst_id: str,
+    symbol: str,
     ticker: dict,
+    funding_rate: float,
     candles_1h: List[Candle],
     candles_15m: List[Candle],
     candles_5m: List[Candle]
 ) -> Optional[Setup]:
 
-    confirmed_5m = [
-        c
-        for c in candles_5m
-        if c.confirmed
-    ]
-
-    confirmed_15m = [
-        c
-        for c in candles_15m
-        if c.confirmed
-    ]
-
-    confirmed_1h = [
+    c1h = [
         c
         for c in candles_1h
         if c.confirmed
     ]
 
-    if len(confirmed_5m) < 60:
+    c15 = [
+        c
+        for c in candles_15m
+        if c.confirmed
+    ]
+
+    c5 = [
+        c
+        for c in candles_5m
+        if c.confirmed
+    ]
+
+    if len(c1h) < 60:
         return None
 
-    if len(confirmed_15m) < 60:
+    if len(c15) < 60:
         return None
 
-    if len(confirmed_1h) < 60:
+    if len(c5) < 60:
         return None
 
     current = ticker["last"]
 
     trend = market_structure(
-        confirmed_1h
+        c1h
     )
 
     if trend == "NEUTRAL":
@@ -1275,8 +1642,8 @@ def analyze_symbol(
     direction = trend
 
     level, level_tf = find_key_level(
-        confirmed_15m,
-        confirmed_1h,
+        c15,
+        c1h,
         current,
         direction
     )
@@ -1285,7 +1652,7 @@ def analyze_symbol(
         return None
 
     atr_value = atr(
-        confirmed_5m,
+        c5,
         14
     )
 
@@ -1298,8 +1665,6 @@ def analyze_symbol(
         * 100
     )
 
-    # Фильтр слишком спокойного/безумного рынка.
-
     if atr_pct < 0.03:
         return None
 
@@ -1307,27 +1672,19 @@ def analyze_symbol(
         return None
 
     v_ratio = volume_ratio(
-        confirmed_5m,
+        c5,
         20
     )
 
-    current_candle = (
-        confirmed_5m[-1]
-    )
-
-    previous_candle = (
-        confirmed_5m[-2]
-    )
-
-    # ========================================================
-    # SCORE
-    # ========================================================
+    current_candle = c5[-1]
+    previous_candle = c5[-2]
 
     score = 0
-
     reasons = []
 
-    # 1H trend
+    # ========================================================
+    # TREND
+    # ========================================================
 
     score += 15
 
@@ -1335,7 +1692,9 @@ def analyze_symbol(
         "тренд 1H подтверждает направление"
     )
 
-    # Strong level
+    # ========================================================
+    # LEVEL
+    # ========================================================
 
     if level_tf == "1H":
 
@@ -1353,11 +1712,13 @@ def analyze_symbol(
             "локальный уровень 15M"
         )
 
-    # Compression
+    # ========================================================
+    # COMPRESSION
+    # ========================================================
 
     compression_points, compression_valid = (
-        compression(
-            confirmed_15m,
+        compression_score(
+            c15,
             direction
         )
     )
@@ -1400,7 +1761,7 @@ def analyze_symbol(
 
     closes = [
         c.close
-        for c in confirmed_5m
+        for c in c5
     ]
 
     ema9 = ema(
@@ -1419,9 +1780,7 @@ def analyze_symbol(
 
         previous_high = max(
             c.high
-            for c in confirmed_5m[
-                -13:-1
-            ]
+            for c in c5[-13:-1]
         )
 
         momentum = (
@@ -1434,9 +1793,7 @@ def analyze_symbol(
 
         previous_low = min(
             c.low
-            for c in confirmed_5m[
-                -13:-1
-            ]
+            for c in c5[-13:-1]
         )
 
         momentum = (
@@ -1448,8 +1805,6 @@ def analyze_symbol(
     # ========================================================
     # STRATEGY
     # ========================================================
-
-    strategy = None
 
     if breakout:
 
@@ -1492,9 +1847,6 @@ def analyze_symbol(
 
     else:
 
-        # Пока нет подтверждения.
-        # Не отправляем READY.
-
         return None
 
     # ========================================================
@@ -1512,7 +1864,7 @@ def analyze_symbol(
     if v_ratio >= 1.50:
         score += 4
 
-    if v_ratio >= 2.0:
+    if v_ratio >= 2.00:
         score += 3
 
     # ========================================================
@@ -1527,20 +1879,56 @@ def analyze_symbol(
 
         score += 5
 
-        liquidity = "ВЫСОКАЯ"
+        reasons.append(
+            "24H ликвидность > $1B"
+        )
 
     elif volume_24h >= 250_000_000:
 
         score += 3
 
-        liquidity = "ХОРОШАЯ"
+        reasons.append(
+            "24H высокая ликвидность"
+        )
 
     else:
 
-        liquidity = "СРЕДНЯЯ"
+        reasons.append(
+            "24H объём проходит фильтр"
+        )
 
     # ========================================================
-    # DISTANCE
+    # FUNDING
+    # ========================================================
+
+    funding_abs = abs(
+        funding_rate
+    )
+
+    if funding_abs <= 0.0005:
+
+        score += 4
+
+        reasons.append(
+            "funding нейтральный"
+        )
+
+    elif funding_abs <= 0.001:
+
+        score += 2
+
+        reasons.append(
+            "funding умеренный"
+        )
+
+    else:
+
+        reasons.append(
+            "funding повышенный"
+        )
+
+    # ========================================================
+    # DISTANCE FROM LEVEL
     # ========================================================
 
     distance = abs(
@@ -1551,22 +1939,21 @@ def analyze_symbol(
     )
 
     if distance > 1.0:
-        return None
 
-    # После полноценного пробоя цена может быть немного
-    # выше/ниже уровня, но не должна убегать.
+        return None
 
     if breakout:
 
         if distance > (
-            MAX_CHASE_PCT
-            + 0.20
+            MAX_CHASE_PCT + 0.20
         ):
+
             return None
 
     else:
 
         if distance > 0.40:
+
             return None
 
     # ========================================================
@@ -1579,21 +1966,35 @@ def analyze_symbol(
         0.22
     )
 
-    entry_low = (
-        level
-        * (1 - zone_pct / 100)
-    )
+    if direction == "LONG":
 
-    entry_high = (
-        level
-        * (1 + zone_pct / 100)
-    )
+        entry_low = (
+            level
+            * (1 - zone_pct / 100)
+        )
+
+        entry_high = (
+            level
+            * (1 + zone_pct / 100)
+        )
+
+    else:
+
+        entry_low = (
+            level
+            * (1 - zone_pct / 100)
+        )
+
+        entry_high = (
+            level
+            * (1 + zone_pct / 100)
+        )
 
     # ========================================================
     # STOP
     # ========================================================
 
-    recent = confirmed_15m[-18:]
+    recent = c15[-18:]
 
     if direction == "LONG":
 
@@ -1639,27 +2040,69 @@ def analyze_symbol(
         * 100
     )
 
-    if risk_pct < 0.15:
+    if risk_pct < MIN_RISK_PCT:
         return None
 
-    if risk_pct > 1.50:
+    if risk_pct > MAX_RISK_PCT:
         return None
+
+    # ========================================================
+    # PLANNED ENTRY
+    # ========================================================
+
+    planned_entry = clamp(
+        level,
+        entry_low,
+        entry_high
+    )
 
     # ========================================================
     # TP
     # ========================================================
 
+    # Расстояние TP считается от planned entry,
+    # а не от случайной цены публикации.
+
+    entry_risk = abs(
+        planned_entry - sl
+    )
+
+    if entry_risk <= 0:
+        return None
+
     if direction == "LONG":
 
-        tp1 = current + risk * 1.0
-        tp2 = current + risk * 2.0
-        tp3 = current + risk * 3.0
+        tp1 = (
+            planned_entry
+            + entry_risk * 1.0
+        )
+
+        tp2 = (
+            planned_entry
+            + entry_risk * 2.0
+        )
+
+        tp3 = (
+            planned_entry
+            + entry_risk * 3.0
+        )
 
     else:
 
-        tp1 = current - risk * 1.0
-        tp2 = current - risk * 2.0
-        tp3 = current - risk * 3.0
+        tp1 = (
+            planned_entry
+            - entry_risk * 1.0
+        )
+
+        tp2 = (
+            planned_entry
+            - entry_risk * 2.0
+        )
+
+        tp3 = (
+            planned_entry
+            - entry_risk * 3.0
+        )
 
     # ========================================================
     # FINAL SCORE
@@ -1677,23 +2120,30 @@ def analyze_symbol(
         return None
 
     signal_id = (
-        f"Q-"
-        f"{local_now().strftime('%y%m%d')}-"
-        f"{coin_name(inst_id)}-"
-        f"{uuid.uuid4().hex[:6].upper()}"
+        "Q-"
+        + local_now().strftime(
+            "%y%m%d"
+        )
+        + "-"
+        + symbol
+        + "-"
+        + uuid.uuid4().hex[
+            :6
+        ].upper()
     )
 
     reason = (
         "• "
-        + "\n• ".join(reasons)
+        + "\n• ".join(
+            reasons
+        )
     )
 
     return Setup(
 
         signal_id=signal_id,
 
-        inst_id=inst_id,
-        coin=coin_name(inst_id),
+        symbol=symbol,
 
         direction=direction,
 
@@ -1714,21 +2164,6 @@ def analyze_symbol(
 
         score=score,
 
-        liquidity=liquidity,
-
-        volume_grade=(
-            "ОЧЕНЬ ВЫСОКИЙ"
-            if v_ratio >= 2.0
-            else
-            "ВЫСОКИЙ"
-            if v_ratio >= 1.5
-            else
-            "ХОРОШИЙ"
-            if v_ratio >= 1.25
-            else
-            "ОБЫЧНЫЙ"
-        ),
-
         level_tf=level_tf,
 
         reason=reason,
@@ -1737,11 +2172,11 @@ def analyze_symbol(
 
         volume_ratio=v_ratio,
 
+        funding_rate=funding_rate,
+
         atr_pct=atr_pct,
 
-        candles_5m=(
-            confirmed_5m[-80:]
-        )
+        candles_5m=c5[-80:]
     )
 
 
@@ -1749,54 +2184,91 @@ def analyze_symbol(
 # DATABASE HELPERS
 # ============================================================
 
+def db_execute(
+    query: str,
+    params: tuple = (),
+    commit: bool = False
+):
+
+    with db_lock:
+
+        cursor = db.execute(
+            query,
+            params
+        )
+
+        if commit:
+            db.commit()
+
+        return cursor
+
+
 def save_signal(
-    setup: Setup,
     active: ActiveSignal
 ):
 
-    created = active.created_at
+    setup = active.setup
 
-    expires = active.expires_at
-
-    db.execute(
+    db_execute(
         """
         INSERT INTO signals (
+
             signal_id,
-            inst_id,
-            coin,
+            symbol,
             direction,
             strategy,
+
             level,
+
             entry_low,
             entry_high,
+            planned_entry,
+
             sl,
+
             tp1,
             tp2,
             tp3,
+
             score,
+
+            volume_24h,
+            volume_ratio,
+            funding_rate,
+            atr_pct,
+
+            level_tf,
+
             status,
+
             created_at,
             expires_at,
+
             photo_message_id,
             text_message_id
+
         )
         VALUES (
-            ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+            ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
         )
         """,
         (
+
             setup.signal_id,
 
-            setup.inst_id,
-            setup.coin,
+            setup.symbol,
 
             setup.direction,
+
             setup.strategy,
 
             setup.level,
 
             setup.entry_low,
+
             setup.entry_high,
+
+            setup.level,
 
             setup.sl,
 
@@ -1806,67 +2278,131 @@ def save_signal(
 
             setup.score,
 
+            setup.volume_24h,
+
+            setup.volume_ratio,
+
+            setup.funding_rate,
+
+            setup.atr_pct,
+
+            setup.level_tf,
+
             "READY",
 
-            created,
+            active.created_at,
 
-            expires,
+            active.expires_at,
 
             active.photo_message_id,
-            active.text_message_id,
-        )
+
+            active.text_message_id
+        ),
+        commit=True
     )
 
-    db.commit()
 
-
-def update_status(
+def update_signal(
     signal_id: str,
-    status: str
+    **fields
 ):
 
-    db.execute(
-        """
-        UPDATE signals
-        SET status = ?
-        WHERE signal_id = ?
-        """,
-        (
-            status,
-            signal_id
+    if not fields:
+        return
+
+    columns = []
+    values = []
+
+    for key, value in fields.items():
+
+        columns.append(
+            f"{key} = ?"
         )
+
+        values.append(value)
+
+    values.append(
+        signal_id
     )
 
-    db.commit()
+    query = (
+        "UPDATE signals SET "
+        + ", ".join(columns)
+        + " WHERE signal_id = ?"
+    )
 
+    db_execute(
+        query,
+        tuple(values),
+        commit=True
+    )
+
+
+# ============================================================
+# RESTORE
+# ============================================================
 
 def restore_active_signals():
 
-    rows = db.execute(
+    rows = db_execute(
         """
         SELECT
+
             signal_id,
-            inst_id,
-            coin,
+            symbol,
             direction,
             strategy,
+
             level,
+
             entry_low,
             entry_high,
+
+            planned_entry,
+
+            actual_entry,
+
             sl,
+
             tp1,
             tp2,
             tp3,
+
             score,
+
+            volume_24h,
+            volume_ratio,
+            funding_rate,
+            atr_pct,
+
+            level_tf,
+
+            status,
+
             created_at,
             expires_at,
+
+            activated_at,
+
+            tp1_hit_at,
+            tp2_hit_at,
+            tp3_hit_at,
+
+            realized_r,
+
             photo_message_id,
             text_message_id
+
         FROM signals
+
         WHERE status IN (
             'READY',
-            'ACTIVE'
+            'ACTIVE',
+            'TP1',
+            'TP2'
         )
+
+        ORDER BY created_at ASC
         """
     ).fetchall()
 
@@ -1874,132 +2410,191 @@ def restore_active_signals():
 
     for row in rows:
 
-        (
-            signal_id,
-            inst_id,
-            coin,
-            direction,
-            strategy,
-            level,
-            entry_low,
-            entry_high,
-            sl,
-            tp1,
-            tp2,
-            tp3,
-            score,
-            created_at,
-            expires_at,
-            photo_message_id,
-            text_message_id
-        ) = row
+        try:
 
-        if (
-            float(expires_at)
-            < now_ts()
-            and (
-                # ACTIVE не должен исчезать только
-                # из-за READY TTL.
-                # READY после TTL исчезает.
-                db.execute(
-                    """
-                    SELECT status
-                    FROM signals
-                    WHERE signal_id = ?
-                    """,
-                    (signal_id,)
-                ).fetchone()[0]
-                == "READY"
-            )
-        ):
-            update_status(
+            (
                 signal_id,
-                "EXPIRED"
-            )
-            continue
+                symbol,
+                direction,
+                strategy,
 
-        # После рестарта нам нужны свежие свечи.
-        # Поэтому Setup временно создаём без chart data.
-        setup = Setup(
+                level,
 
-            signal_id=signal_id,
+                entry_low,
+                entry_high,
 
-            inst_id=inst_id,
-            coin=coin,
+                planned_entry,
 
-            direction=direction,
-            strategy=strategy,
+                actual_entry,
 
-            level=float(level),
-            current_price=0.0,
+                sl,
 
-            entry_low=float(
-                entry_low
-            ),
-            entry_high=float(
-                entry_high
-            ),
+                tp1,
+                tp2,
+                tp3,
 
-            sl=float(sl),
+                score,
 
-            tp1=float(tp1),
-            tp2=float(tp2),
-            tp3=float(tp3),
+                volume_24h,
+                volume_ratio,
+                funding_rate,
+                atr_pct,
 
-            score=int(score),
+                level_tf,
 
-            liquidity="—",
-            volume_grade="—",
+                status,
 
-            level_tf="—",
+                created_at,
+                expires_at,
 
-            reason="Восстановлено после перезапуска.",
+                activated_at,
 
-            volume_24h=0.0,
-            volume_ratio=0.0,
+                tp1_hit_at,
+                tp2_hit_at,
+                tp3_hit_at,
 
-            atr_pct=0.0,
+                realized_r,
 
-            candles_5m=[]
-        )
-
-        active = ActiveSignal(
-            setup=setup,
-
-            created_at=float(
-                created_at
-            ),
-
-            expires_at=float(
-                expires_at
-            ),
-
-            photo_message_id=(
-                photo_message_id
-            ),
-
-            text_message_id=(
+                photo_message_id,
                 text_message_id
-            ),
 
-            activated=(
-                db.execute(
-                    """
-                    SELECT status
-                    FROM signals
-                    WHERE signal_id = ?
-                    """,
-                    (signal_id,)
-                ).fetchone()[0]
-                == "ACTIVE"
+            ) = row
+
+            # READY истёк
+            if (
+                status == "READY"
+                and expires_at < now_ts()
+            ):
+
+                update_signal(
+                    signal_id,
+                    status="EXPIRED",
+                    closed_at=now_ts()
+                )
+
+                continue
+
+            setup = Setup(
+
+                signal_id=signal_id,
+
+                symbol=symbol,
+
+                direction=direction,
+
+                strategy=strategy,
+
+                level=float(level),
+
+                current_price=(
+                    float(actual_entry)
+                    if actual_entry
+                    else float(planned_entry)
+                ),
+
+                entry_low=float(
+                    entry_low
+                ),
+
+                entry_high=float(
+                    entry_high
+                ),
+
+                sl=float(sl),
+
+                tp1=float(tp1),
+                tp2=float(tp2),
+                tp3=float(tp3),
+
+                score=int(score),
+
+                level_tf=level_tf,
+
+                reason=(
+                    "Сигнал восстановлен "
+                    "после перезапуска."
+                ),
+
+                volume_24h=float(
+                    volume_24h
+                ),
+
+                volume_ratio=float(
+                    volume_ratio
+                ),
+
+                funding_rate=float(
+                    funding_rate
+                ),
+
+                atr_pct=float(
+                    atr_pct
+                ),
+
+                candles_5m=[]
             )
-        )
 
-        active_signals[
-            inst_id
-        ] = active
+            active = ActiveSignal(
 
-        restored += 1
+                setup=setup,
+
+                created_at=float(
+                    created_at
+                ),
+
+                expires_at=float(
+                    expires_at
+                ),
+
+                photo_message_id=(
+                    photo_message_id
+                ),
+
+                text_message_id=(
+                    text_message_id
+                ),
+
+                activated=(
+                    status != "READY"
+                ),
+
+                actual_entry=(
+                    float(actual_entry)
+                    if actual_entry
+                    else None
+                ),
+
+                tp1_hit=(
+                    tp1_hit_at
+                    is not None
+                ),
+
+                tp2_hit=(
+                    tp2_hit_at
+                    is not None
+                ),
+
+                tp3_hit=(
+                    tp3_hit_at
+                    is not None
+                ),
+
+                realized_r=float(
+                    realized_r or 0
+                )
+            )
+
+            active_signals[
+                symbol
+            ] = active
+
+            restored += 1
+
+        except Exception:
+
+            log.exception(
+                "Ошибка восстановления сигнала."
+            )
 
     log.info(
         "Восстановлено активных сигналов: %s",
@@ -2012,51 +2607,56 @@ def restore_active_signals():
 # ============================================================
 
 def can_create_signal(
-    inst_id: str
+    symbol: str
 ) -> bool:
 
-    if inst_id in active_signals:
+    if symbol in active_signals:
         return False
 
-    row = db.execute(
+    row = db_execute(
         """
         SELECT created_at
         FROM signals
-        WHERE inst_id = ?
+        WHERE symbol = ?
         ORDER BY created_at DESC
         LIMIT 1
         """,
-        (inst_id,)
+        (symbol,)
     ).fetchone()
 
     if row:
 
-        last = float(
+        last_created = float(
             row[0]
         )
 
         if (
-            now_ts() - last
+            now_ts()
+            - last_created
             < COOLDOWN_MINUTES * 60
         ):
+
             return False
 
+    return True
+
+
+# ============================================================
+# HOURLY SIGNAL LIMIT
+# ============================================================
+
+def clean_hour_history():
+
     cutoff = (
-        now_ts() - 3600
+        now_ts()
+        - 3600
     )
 
     signals_hour[:] = [
-        ts
-        for ts in signals_hour
-        if ts >= cutoff
+        value
+        for value in signals_hour
+        if value >= cutoff
     ]
-
-    if len(
-        signals_hour
-    ) >= MAX_SIGNALS_PER_HOUR:
-        return False
-
-    return True
 
 
 # ============================================================
@@ -2067,9 +2667,7 @@ def make_chart(
     setup: Setup
 ) -> str:
 
-    candles = setup.candles_5m[
-        -70:
-    ]
+    candles = setup.candles_5m[-70:]
 
     if len(candles) < 10:
 
@@ -2078,10 +2676,13 @@ def make_chart(
         )
 
     path = (
-        f"/tmp/"
-        f"{setup.coin}_"
-        f"{int(time.time())}_"
-        f"{setup.signal_id}.png"
+        "/tmp/"
+        + setup.symbol
+        + "_"
+        + str(int(time.time()))
+        + "_"
+        + setup.signal_id
+        + ".png"
     )
 
     fig, ax = plt.subplots(
@@ -2090,11 +2691,11 @@ def make_chart(
     )
 
     fig.patch.set_facecolor(
-        "#090e1a"
+        "#080d18"
     )
 
     ax.set_facecolor(
-        "#090e1a"
+        "#080d18"
     )
 
     width = 0.65
@@ -2105,10 +2706,8 @@ def make_chart(
 
         color = (
             "#16c784"
-            if candle.close
-            >= candle.open
-            else
-            "#ea3943"
+            if candle.close >= candle.open
+            else "#ea3943"
         )
 
         ax.plot(
@@ -2151,6 +2750,7 @@ def make_chart(
             )
         )
 
+    # LEVEL
     ax.axhline(
         setup.level,
         color="#f5c542",
@@ -2158,6 +2758,7 @@ def make_chart(
         linestyle="--"
     )
 
+    # ENTRY ZONE
     ax.axhspan(
         setup.entry_low,
         setup.entry_high,
@@ -2165,6 +2766,7 @@ def make_chart(
         alpha=0.10
     )
 
+    # STOP
     ax.axhline(
         setup.sl,
         color="#ff3b30",
@@ -2172,6 +2774,7 @@ def make_chart(
         linestyle="-."
     )
 
+    # TARGETS
     for target in (
         setup.tp1,
         setup.tp2,
@@ -2204,9 +2807,9 @@ def make_chart(
 
     ax.set_title(
         (
-            f"{setup.coin}USDT | "
-            f"{direction_ru(setup.direction)}\n"
-            f"{strategy_ru(setup.strategy)} | "
+            "BINANCE ФЬЮЧЕРСЫ\n"
+            f"{setup.symbol} · "
+            f"{direction_ru(setup.direction)} · "
             f"{setup.score}/100"
         ),
         color="white",
@@ -2224,6 +2827,7 @@ def make_chart(
     )
 
     for spine in ax.spines.values():
+
         spine.set_color(
             "#29334d"
         )
@@ -2242,83 +2846,105 @@ def make_chart(
 
 
 # ============================================================
-# TELEGRAM TEXT
+# SIGNAL TEXT
 # ============================================================
 
 def build_signal_text(
     setup: Setup
 ) -> str:
 
-    risk = (
-        abs(
-            setup.current_price
-            - setup.sl
-        )
-        / setup.current_price
-        * 100
+    planned_risk = abs(
+        setup.level
+        - setup.sl
     )
+
+    if setup.level > 0:
+
+        risk_pct = (
+            planned_risk
+            / setup.level
+            * 100
+        )
+
+    else:
+
+        risk_pct = 0
 
     return (
 
-        f"🔥 *{setup.coin}USDT — "
-        f"{direction_ru(setup.direction)}*\n\n"
+        "🔥 *BINANCE ФЬЮЧЕРСЫ*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
 
-        f"🟡 *ГОТОВ К ВХОДУ*\n"
-        f"Сетап подтверждён. "
-        f"Не догоняем цену.\n\n"
+        f"*{setup.symbol} · "
+        f"{direction_ru(setup.direction)}*\n"
 
-        f"🆔 *ID:* `{setup.signal_id}`\n\n"
+        f"{score_label(setup.score)} · "
+        f"`{setup.score}/100`\n"
 
-        f"💰 *Текущая цена:*\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        "📈 *НАПРАВЛЕНИЕ*\n"
+        f"`{direction_ru(setup.direction)}`\n\n"
+
+        "💰 *ТЕКУЩАЯ ЦЕНА*\n"
         f"`{fmt_price(setup.current_price)}`\n\n"
 
-        f"🎯 *ЗОНА ВХОДА:*\n"
-        f"`{fmt_price(setup.entry_low)}` — "
+        "🎯 *ЗОНА ВХОДА*\n"
+        f"`{fmt_price(setup.entry_low)}`"
+        " — "
         f"`{fmt_price(setup.entry_high)}`\n\n"
 
-        f"🛑 *СТОП:*\n"
+        "🛑 *СТОП*\n"
         f"`{fmt_price(setup.sl)}`\n"
-        f"Риск: `-{risk:.2f}%`\n\n"
+        f"Риск: `-{risk_pct:.2f}%`\n\n"
 
-        f"🎯 *TP1 — 30%*\n"
-        f"`{fmt_price(setup.tp1)}`\n\n"
+        "🎯 *TP1 · 30%*\n"
+        f"`{fmt_price(setup.tp1)}`\n"
+        "R/R `1 : 1`\n\n"
 
-        f"🎯 *TP2 — 30%*\n"
-        f"`{fmt_price(setup.tp2)}`\n\n"
+        "🎯 *TP2 · 30%*\n"
+        f"`{fmt_price(setup.tp2)}`\n"
+        "R/R `1 : 2`\n\n"
 
-        f"🏆 *TP3 — 40%*\n"
-        f"`{fmt_price(setup.tp3)}`\n\n"
+        "🏆 *TP3 · 40%*\n"
+        f"`{fmt_price(setup.tp3)}`\n"
+        "R/R `1 : 3`\n\n"
 
-        f"🧠 *ПОЧЕМУ СИГНАЛ:*\n"
-        f"{setup.reason}\n\n"
-
-        f"📊 *СТРАТЕГИЯ:*\n"
+        "🧠 *СЕТАП*\n"
         f"`{strategy_ru(setup.strategy)}`\n\n"
 
-        f"📍 *УРОВЕНЬ:*\n"
-        f"{setup.level_tf} — "
-        f"`{fmt_price(setup.level)}`\n\n"
+        "📊 *ПОДТВЕРЖДЕНИЯ*\n"
+        f"{setup.reason}\n\n"
 
-        f"📦 *ОБЪЁМ 5M:*\n"
-        f"`{setup.volume_ratio:.2f}x`\n\n"
+        f"📍 Уровень: `{fmt_price(setup.level)}` "
+        f"({setup.level_tf})\n"
 
-        f"💧 *ЛИКВИДНОСТЬ:*\n"
-        f"`{setup.liquidity}`\n\n"
+        f"📦 Объём 5M: "
+        f"`{setup.volume_ratio:.2f}x`\n"
 
-        f"⭐ *ОЦЕНКА СИГНАЛА:*\n"
-        f"`{setup.score}/100` "
-        f"{score_label(setup.score)}\n\n"
+        f"💧 24H объём: "
+        f"`{fmt_usd(setup.volume_24h)}`\n"
 
-        f"⏱ Сетап действует "
-        f"`{READY_TTL_MINUTES} мин`.\n\n"
+        f"💵 Funding: "
+        f"`{funding_label(setup.funding_rate)}`\n"
 
-        f"⚠️ *Не увеличиваем риск после убытка.*\n"
-        f"*Качество важнее количества.*"
+        f"📐 ATR 5M: "
+        f"`{setup.atr_pct:.2f}%`\n\n"
+
+        "⏱ *Сетап действителен:* "
+        f"`{READY_TTL_MINUTES} мин`\n"
+
+        "🔒 *Пауза по паре:* "
+        f"`{COOLDOWN_MINUTES} мин`\n\n"
+
+        "🔥 *Движение подтверждено.*\n"
+        "🎯 Работаем строго по плану.\n"
+        "⚡ Не догоняем цену."
     )
 
 
 # ============================================================
-# TELEGRAM SEND
+# PUBLISH
 # ============================================================
 
 def publish_signal(
@@ -2337,10 +2963,16 @@ def publish_signal(
         )
 
         caption = (
-            f"🔥 *{setup.coin}USDT — "
+
+            "🔥 *BINANCE ФЬЮЧЕРСЫ*\n"
+
+            f"*{setup.symbol} · "
             f"{direction_ru(setup.direction)}*\n"
+
             f"{score_label(setup.score)} · "
-            f"{strategy_ru(setup.strategy)}"
+            f"`{setup.score}/100`\n"
+
+            f"`{strategy_ru(setup.strategy)}`"
         )
 
         with open(
@@ -2386,50 +3018,172 @@ def publish_signal(
         if chart_path:
 
             try:
+
                 os.remove(
                     chart_path
                 )
+
             except OSError:
                 pass
 
 
 # ============================================================
-# ACTIVE SIGNAL MANAGEMENT
+# ENTRY DETECTION
 # ============================================================
 
-def send_entry_message(
+def price_in_entry_zone(
+    setup: Setup,
+    price: float
+) -> bool:
+
+    return (
+        setup.entry_low
+        <= price
+        <= setup.entry_high
+    )
+
+
+def activate_signal(
     active: ActiveSignal,
     price: float
 ):
 
+    if active.activated:
+        return
+
     setup = active.setup
+
+    active.activated = True
+    active.actual_entry = price
+
+    # Реальный риск считается от фактической активации.
+    risk = abs(
+        price - setup.sl
+    )
+
+    if risk <= 0:
+        risk = abs(
+            setup.planned_entry
+            - setup.sl
+        )
+
+    # Пересчитываем TP от реального entry.
+    if setup.direction == "LONG":
+
+        setup.tp1 = (
+            price + risk * 1.0
+        )
+
+        setup.tp2 = (
+            price + risk * 2.0
+        )
+
+        setup.tp3 = (
+            price + risk * 3.0
+        )
+
+    else:
+
+        setup.tp1 = (
+            price - risk * 1.0
+        )
+
+        setup.tp2 = (
+            price - risk * 2.0
+        )
+
+        setup.tp3 = (
+            price - risk * 3.0
+        )
+
+    update_signal(
+        setup.signal_id,
+
+        status="ACTIVE",
+
+        activated_at=now_ts(),
+
+        actual_entry=price,
+
+        tp1=setup.tp1,
+
+        tp2=setup.tp2,
+
+        tp3=setup.tp3
+    )
 
     text = (
 
-        f"🟢 *ВХОД АКТИВИРОВАН*\n\n"
+        "🟢 *ВХОД АКТИВИРОВАН*\n\n"
 
-        f"{setup.coin}USDT — "
-        f"{direction_ru(setup.direction)}\n\n"
+        "🔥 *BINANCE ФЬЮЧЕРСЫ*\n"
+
+        f"*{setup.symbol} · "
+        f"{direction_ru(setup.direction)}*\n\n"
 
         f"🆔 `{setup.signal_id}`\n\n"
 
-        f"Цена: `{fmt_price(price)}`\n"
-        f"Уровень: `{fmt_price(setup.level)}`\n\n"
+        f"💰 Цена входа: "
+        f"`{fmt_price(price)}`\n\n"
 
-        f"🛑 Стоп: `{fmt_price(setup.sl)}`\n"
-        f"🎯 TP1: `{fmt_price(setup.tp1)}`\n"
-        f"🎯 TP2: `{fmt_price(setup.tp2)}`\n"
-        f"🏆 TP3: `{fmt_price(setup.tp3)}`\n\n"
+        f"🛑 Стоп: "
+        f"`{fmt_price(setup.sl)}`\n"
 
-        f"Работаем по плану. "
-        f"Не увеличиваем риск."
+        f"🎯 TP1: "
+        f"`{fmt_price(setup.tp1)}`\n"
+
+        f"🎯 TP2: "
+        f"`{fmt_price(setup.tp2)}`\n"
+
+        f"🏆 TP3: "
+        f"`{fmt_price(setup.tp3)}`\n\n"
+
+        "🎯 Вход подтверждён.\n"
+        "🔥 Работаем по плану."
     )
 
-    bot.send_message(
-        CHANNEL_ID,
-        text,
-        parse_mode="Markdown"
-    )
+    try:
+
+        bot.send_message(
+            CHANNEL_ID,
+            text,
+            parse_mode="Markdown"
+        )
+
+    except Exception:
+
+        log.exception(
+            "Ошибка ENTRY message."
+        )
+
+
+# ============================================================
+# TP / STOP HELPERS
+# ============================================================
+
+def stop_price_hit(
+    setup: Setup,
+    price: float
+) -> bool:
+
+    if setup.direction == "LONG":
+
+        return price <= setup.sl
+
+    return price >= setup.sl
+
+
+def target_hit(
+    setup: Setup,
+    price: float,
+    target: float
+) -> bool:
+
+    if setup.direction == "LONG":
+
+        return price >= target
+
+    return price <= target
 
 
 def send_tp_message(
@@ -2444,55 +3198,76 @@ def send_tp_message(
 
         text = (
 
-            f"🎯 *{setup.coin}USDT — TP1*\n\n"
+            "🎯 *TP1 ДОСТИГНУТ*\n\n"
+
+            "🔥 *BINANCE ФЬЮЧЕРСЫ*\n"
+
+            f"*{setup.symbol} · "
+            f"{direction_ru(setup.direction)}*\n\n"
 
             f"🆔 `{setup.signal_id}`\n\n"
 
-            f"TP1 достигнут:\n"
-            f"`{fmt_price(price)}`\n\n"
+            f"Цена: `{fmt_price(price)}`\n\n"
 
-            f"Закрытие: *30%*\n"
-            f"Стоп → *БЕЗУБЫТОК*\n\n"
+            "Закрываем *30%*.\n"
+            "🛡 Стоп переводится в *БЕЗУБЫТОК*.\n\n"
 
-            f"Оставляем сделку по плану."
+            "🔥 Сделка развивается по плану."
         )
 
     elif number == 2:
 
         text = (
 
-            f"🎯 *{setup.coin}USDT — TP2*\n\n"
+            "🎯 *TP2 ДОСТИГНУТ*\n\n"
+
+            "🔥 *BINANCE ФЬЮЧЕРСЫ*\n"
+
+            f"*{setup.symbol} · "
+            f"{direction_ru(setup.direction)}*\n\n"
 
             f"🆔 `{setup.signal_id}`\n\n"
 
             f"Цена: `{fmt_price(price)}`\n\n"
 
-            f"Закрытие: *ещё 30%*\n\n"
+            "Закрываем ещё *30%*.\n"
+            "Оставшиеся *40%* направляем к TP3.\n\n"
 
-            f"Оставшиеся 40% "
-            f"держим к TP3."
+            "🏆 Держим план."
         )
 
     else:
 
         text = (
 
-            f"🏆 *{setup.coin}USDT — TP3*\n\n"
+            "🏆 *TP3 ДОСТИГНУТ*\n\n"
+
+            "🔥 *BINANCE ФЬЮЧЕРСЫ*\n"
+
+            f"*{setup.symbol} · "
+            f"{direction_ru(setup.direction)}*\n\n"
 
             f"🆔 `{setup.signal_id}`\n\n"
 
-            f"TP3 достигнут:\n"
-            f"`{fmt_price(price)}`\n\n"
+            f"Цена: `{fmt_price(price)}`\n\n"
 
-            f"Сделка полностью завершена. "
-            f"Результат зафиксирован."
+            "Все 100% позиции по плану закрыты.\n"
+            "🔥 Сетап завершён."
         )
 
-    bot.send_message(
-        CHANNEL_ID,
-        text,
-        parse_mode="Markdown"
-    )
+    try:
+
+        bot.send_message(
+            CHANNEL_ID,
+            text,
+            parse_mode="Markdown"
+        )
+
+    except Exception:
+
+        log.exception(
+            "Ошибка TP message."
+        )
 
 
 def send_stop_message(
@@ -2502,91 +3277,104 @@ def send_stop_message(
 
     setup = active.setup
 
-    # Упрощённый расчёт R.
-    if setup.direction == "LONG":
+    entry = (
+        active.actual_entry
+        or setup.planned_entry
+    )
 
-        risk = (
-            setup.entry_high
-            - setup.sl
-        )
+    risk = abs(
+        entry - setup.sl
+    )
 
-        result = (
-            price
-            - setup.entry_high
-        )
+    if risk <= 0:
+        risk = 1.0
 
-    else:
+    # Если TP1 был достигнут, часть позиции уже закрыта.
+    # Стоп после TP1 находится на BE, поэтому результат
+    # рассчитывается по уже реализованным частям.
 
-        risk = (
-            setup.sl
-            - setup.entry_low
-        )
+    if not active.tp1_hit:
 
-        result = (
-            setup.entry_low
-            - price
-        )
+        remaining_r = -1.0
 
-    if risk > 0:
+    elif not active.tp2_hit:
 
-        result_r = (
-            result / risk
-        )
+        # TP1: 30% * +1R = +0.30R
+        # Остальные 70% закрылись на BE.
+        remaining_r = 0.30
 
     else:
 
-        result_r = -1.0
+        # TP1 + TP2:
+        # 0.30*1 + 0.30*2 = 0.90R
+        # Остальные 40% закрылись на BE.
+        remaining_r = 0.90
+
+    result_r = remaining_r
 
     text = (
 
-        f"🛑 *{setup.coin}USDT — СТОП*\n\n"
+        "🛑 *СТОП / ЗАВЕРШЕНИЕ*\n\n"
+
+        "🔥 *BINANCE ФЬЮЧЕРСЫ*\n"
+
+        f"*{setup.symbol} · "
+        f"{direction_ru(setup.direction)}*\n\n"
 
         f"🆔 `{setup.signal_id}`\n\n"
 
-        f"Цена выхода:\n"
+        f"Цена выхода: "
         f"`{fmt_price(price)}`\n\n"
 
-        f"Результат:\n"
+        f"Результат: "
         f"`{result_r:+.2f}R`\n\n"
 
-        f"Сделка завершена.\n"
-        f"*Убыток не увеличиваем.*"
+        "Сделка завершена.\n"
+        "🧠 Риск не увеличиваем.\n"
+        "🔥 Следующий сетап — только по плану."
     )
 
-    bot.send_message(
-        CHANNEL_ID,
-        text,
-        parse_mode="Markdown"
-    )
+    try:
 
-    db.execute(
-        """
-        UPDATE signals
-        SET
-            status = 'SL',
-            closed_at = ?,
-            exit_price = ?,
-            result_r = ?
-        WHERE signal_id = ?
-        """,
-        (
-            now_ts(),
-            price,
-            result_r,
-            setup.signal_id
+        bot.send_message(
+            CHANNEL_ID,
+            text,
+            parse_mode="Markdown"
         )
+
+    except Exception:
+
+        log.exception(
+            "Ошибка STOP message."
+        )
+
+    update_signal(
+
+        setup.signal_id,
+
+        status="SL",
+
+        closed_at=now_ts(),
+
+        exit_price=price,
+
+        result_r=result_r,
+
+        realized_r=result_r
     )
 
-    db.commit()
 
+# ============================================================
+# ACTIVE SIGNAL MANAGEMENT
+# ============================================================
 
 def manage_active_signal(
-    inst_id: str,
+    symbol: str,
     price: float
 ):
 
     active = active_signals.get(
-        inst_id
+        symbol
     )
 
     if not active:
@@ -2594,74 +3382,70 @@ def manage_active_signal(
 
     setup = active.setup
 
-    # После рестарта current_price может быть 0.
-    setup.current_price = price
-
     # ========================================================
     # READY
     # ========================================================
 
     if not active.activated:
 
-        if setup.direction == "LONG":
+        # Если READY истёк
+        if now_ts() >= active.expires_at:
 
-            if price >= setup.level:
+            signal_id = (
+                setup.signal_id
+            )
 
-                active.activated = True
+            update_signal(
+                signal_id,
+                status="EXPIRED",
+                closed_at=now_ts()
+            )
 
-                update_status(
-                    setup.signal_id,
-                    "ACTIVE"
-                )
+            try:
 
-                db.execute(
-                    """
-                    UPDATE signals
-                    SET activated_at = ?
-                    WHERE signal_id = ?
-                    """,
+                bot.send_message(
+                    CHANNEL_ID,
                     (
-                        now_ts(),
-                        setup.signal_id
-                    )
+                        "🔴 *СЕТАП ОТМЕНЁН*\n\n"
+
+                        "🔥 *BINANCE ФЬЮЧЕРСЫ*\n"
+
+                        f"*{symbol} · "
+                        f"{direction_ru(setup.direction)}*\n\n"
+
+                        f"🆔 `{signal_id}`\n\n"
+
+                        "Цена не дала своевременной "
+                        "активации.\n\n"
+
+                        "🎯 Рынок не догоняем."
+                    ),
+                    parse_mode="Markdown"
                 )
 
-                db.commit()
+            except Exception:
 
-                send_entry_message(
-                    active,
-                    price
+                log.exception(
+                    "Ошибка EXPIRED."
                 )
 
-        else:
+            active_signals.pop(
+                symbol,
+                None
+            )
 
-            if price <= setup.level:
+            return
 
-                active.activated = True
+        # Вход только внутри зоны.
+        if price_in_entry_zone(
+            setup,
+            price
+        ):
 
-                update_status(
-                    setup.signal_id,
-                    "ACTIVE"
-                )
-
-                db.execute(
-                    """
-                    UPDATE signals
-                    SET activated_at = ?
-                    WHERE signal_id = ?
-                    """,
-                    (
-                        now_ts(),
-                        setup.signal_id
-                    )
-                )
-
-                db.commit()
-
-                send_entry_message(
-                    active,
-                    price
-                )
+            activate_signal(
+                active,
+                price
+            )
 
         return
 
@@ -2669,37 +3453,34 @@ def manage_active_signal(
     # ACTIVE -> STOP
     # ========================================================
 
-    if setup.direction == "LONG":
+    # После TP1/TP2 стоп становится безубытком.
+    stop = setup.sl
 
-        if price <= setup.sl:
+    if active.tp1_hit:
 
-            send_stop_message(
-                active,
-                price
-            )
+        stop = (
+            active.actual_entry
+            or setup.planned_entry
+        )
 
-            active_signals.pop(
-                inst_id,
-                None
-            )
+    setup.sl = stop
 
-            return
+    if stop_price_hit(
+        setup,
+        price
+    ):
 
-    else:
+        send_stop_message(
+            active,
+            price
+        )
 
-        if price >= setup.sl:
+        active_signals.pop(
+            symbol,
+            None
+        )
 
-            send_stop_message(
-                active,
-                price
-            )
-
-            active_signals.pop(
-                inst_id,
-                None
-            )
-
-            return
+        return
 
     # ========================================================
     # TP1
@@ -2707,15 +3488,27 @@ def manage_active_signal(
 
     if not active.tp1_hit:
 
-        hit = (
-            price >= setup.tp1
-            if setup.direction == "LONG"
-            else price <= setup.tp1
-        )
-
-        if hit:
+        if target_hit(
+            setup,
+            price,
+            setup.tp1
+        ):
 
             active.tp1_hit = True
+
+            # +0.30R реализовано
+            active.realized_r = 0.30
+
+            update_signal(
+
+                setup.signal_id,
+
+                status="TP1",
+
+                tp1_hit_at=now_ts(),
+
+                realized_r=0.30
+            )
 
             send_tp_message(
                 active,
@@ -2723,32 +3516,7 @@ def manage_active_signal(
                 price
             )
 
-            db.execute(
-                """
-                UPDATE signals
-                SET tp1_hit_at = ?
-                WHERE signal_id = ?
-                """,
-                (
-                    now_ts(),
-                    setup.signal_id
-                )
-            )
-
-            db.commit()
-
-            # Стоп переводим в безубыток.
-            if setup.direction == "LONG":
-
-                setup.sl = (
-                    setup.entry_high
-                )
-
-            else:
-
-                setup.sl = (
-                    setup.entry_low
-                )
+            return
 
     # ========================================================
     # TP2
@@ -2759,15 +3527,27 @@ def manage_active_signal(
         and not active.tp2_hit
     ):
 
-        hit = (
-            price >= setup.tp2
-            if setup.direction == "LONG"
-            else price <= setup.tp2
-        )
-
-        if hit:
+        if target_hit(
+            setup,
+            price,
+            setup.tp2
+        ):
 
             active.tp2_hit = True
+
+            # 0.30*1R + 0.30*2R = 0.90R
+            active.realized_r = 0.90
+
+            update_signal(
+
+                setup.signal_id,
+
+                status="TP2",
+
+                tp2_hit_at=now_ts(),
+
+                realized_r=0.90
+            )
 
             send_tp_message(
                 active,
@@ -2775,19 +3555,7 @@ def manage_active_signal(
                 price
             )
 
-            db.execute(
-                """
-                UPDATE signals
-                SET tp2_hit_at = ?
-                WHERE signal_id = ?
-                """,
-                (
-                    now_ts(),
-                    setup.signal_id
-                )
-            )
-
-            db.commit()
+            return
 
     # ========================================================
     # TP3
@@ -2798,15 +3566,33 @@ def manage_active_signal(
         and not active.tp3_hit
     ):
 
-        hit = (
-            price >= setup.tp3
-            if setup.direction == "LONG"
-            else price <= setup.tp3
-        )
-
-        if hit:
+        if target_hit(
+            setup,
+            price,
+            setup.tp3
+        ):
 
             active.tp3_hit = True
+
+            # 0.30*1 + 0.30*2 + 0.40*3 = 2.10R
+            active.realized_r = 2.10
+
+            update_signal(
+
+                setup.signal_id,
+
+                status="TP3",
+
+                tp3_hit_at=now_ts(),
+
+                closed_at=now_ts(),
+
+                exit_price=price,
+
+                result_r=2.10,
+
+                realized_r=2.10
+            )
 
             send_tp_message(
                 active,
@@ -2814,93 +3600,17 @@ def manage_active_signal(
                 price
             )
 
-            db.execute(
-                """
-                UPDATE signals
-                SET
-                    status = 'TP3',
-                    tp3_hit_at = ?,
-                    closed_at = ?,
-                    exit_price = ?,
-                    result_r = 3.0
-                WHERE signal_id = ?
-                """,
-                (
-                    now_ts(),
-                    now_ts(),
-                    price,
-                    setup.signal_id
-                )
-            )
-
-            db.commit()
-
             active_signals.pop(
-                inst_id,
+                symbol,
                 None
             )
-
-
-# ============================================================
-# EXPIRE READY
-# ============================================================
-
-def expire_ready():
-
-    current = now_ts()
-
-    for inst_id, active in list(
-        active_signals.items()
-    ):
-
-        if active.activated:
-            continue
-
-        if current < active.expires_at:
-            continue
-
-        signal_id = (
-            active.setup.signal_id
-        )
-
-        update_status(
-            signal_id,
-            "EXPIRED"
-        )
-
-        try:
-
-            bot.send_message(
-                CHANNEL_ID,
-                (
-                    f"🔴 *СЕТАП ОТМЕНЁН*\n\n"
-                    f"{active.setup.coin}USDT — "
-                    f"{direction_ru(active.setup.direction)}\n\n"
-                    f"🆔 `{signal_id}`\n\n"
-                    f"Цена не дала своевременного "
-                    f"входа.\n\n"
-                    f"*Рынок не догоняем.*"
-                ),
-                parse_mode="Markdown"
-            )
-
-        except Exception:
-
-            log.exception(
-                "Ошибка сообщения EXPIRATION"
-            )
-
-        active_signals.pop(
-            inst_id,
-            None
-        )
 
 
 # ============================================================
 # MORNING MESSAGE
 # ============================================================
 
-def morning_message():
+def send_morning_message():
 
     global last_morning_date
 
@@ -2910,9 +3620,12 @@ def morning_message():
     current = local_now()
 
     if (
-        current.hour != MORNING_HOUR
-        or current.minute != MORNING_MINUTE
+        current.hour
+        != MORNING_HOUR
+        or current.minute
+        != MORNING_MINUTE
     ):
+
         return
 
     today = current.date()
@@ -2922,20 +3635,20 @@ def morning_message():
 
     text = (
 
-        "🌅 *ДОБРОЕ УТРО, РЕБЯТА!*\n\n"
+        "🌅 *ДОБРОЕ УТРО*\n\n"
 
-        "QUANTUM SCALPER начинает новый "
-        "торговый день.\n\n"
+        "🔥 *BINANCE ФЬЮЧЕРСЫ*\n\n"
+
+        "Новый торговый день начинается.\n\n"
 
         "🎯 Ждём только подтверждённые сетапы.\n"
-        "🚫 Не догоняем рынок.\n"
-        "🛑 Не увеличиваем риск после убытка.\n"
-        "💰 Не используем весь депозит в одной сделке.\n"
-        "⏳ Если хорошего входа нет — ждём.\n\n"
+        "🛑 Риск держим под контролем.\n"
+        "⚡ Не догоняем движение.\n"
+        "⏳ Слабые входы пропускаем.\n\n"
 
         "*Качество важнее количества.*\n\n"
 
-        "Удачного торгового дня! 🚀"
+        "Холодная голова. Чёткий план. 🔥"
     )
 
     try:
@@ -2948,44 +3661,255 @@ def morning_message():
 
         last_morning_date = today
 
+        save_state(
+            "last_morning_date",
+            str(today)
+        )
+
     except Exception:
 
         log.exception(
-            "Ошибка утреннего сообщения"
+            "Ошибка утреннего сообщения."
         )
 
 
 # ============================================================
-# STARTUP
+# STATISTICS
 # ============================================================
 
-def startup():
+def statistics_between(
+    start_ts: float,
+    end_ts: float
+) -> dict:
+
+    rows = db_execute(
+        """
+        SELECT
+            status,
+            result_r,
+            realized_r,
+            actual_entry,
+            exit_price
+        FROM signals
+        WHERE created_at >= ?
+        AND created_at < ?
+        """,
+        (
+            start_ts,
+            end_ts
+        )
+    ).fetchall()
+
+    total = len(rows)
+
+    activated = 0
+
+    expired = 0
+
+    tp1 = 0
+    tp2 = 0
+    tp3 = 0
+    stop = 0
+
+    total_r = 0.0
+
+    wins = 0
+    losses = 0
+
+    for row in rows:
+
+        (
+            status,
+            result_r,
+            realized_r,
+            actual_entry,
+            exit_price
+        ) = row
+
+        if status in (
+            "ACTIVE",
+            "TP1",
+            "TP2",
+            "TP3",
+            "SL"
+        ):
+
+            activated += 1
+
+        if status == "EXPIRED":
+            expired += 1
+
+        if status == "TP1":
+            tp1 += 1
+
+        elif status == "TP2":
+            tp2 += 1
+
+        elif status == "TP3":
+            tp3 += 1
+
+        elif status == "SL":
+            stop += 1
+
+        # Только закрытые результаты.
+        if status in (
+            "SL",
+            "TP3"
+        ):
+
+            value = (
+                result_r
+                if result_r is not None
+                else realized_r
+            )
+
+            if value is not None:
+
+                total_r += float(
+                    value
+                )
+
+                if value > 0:
+                    wins += 1
+
+                elif value < 0:
+                    losses += 1
+
+    completed = (
+        wins
+        + losses
+    )
+
+    win_rate = (
+        wins / completed * 100
+        if completed > 0
+        else 0.0
+    )
+
+    return {
+
+        "total": total,
+
+        "activated": activated,
+
+        "expired": expired,
+
+        "tp1": tp1,
+
+        "tp2": tp2,
+
+        "tp3": tp3,
+
+        "stop": stop,
+
+        "wins": wins,
+
+        "losses": losses,
+
+        "completed": completed,
+
+        "win_rate": win_rate,
+
+        "total_r": total_r
+    }
+
+
+def start_of_day(
+    dt: datetime
+) -> float:
+
+    beginning = datetime(
+        dt.year,
+        dt.month,
+        dt.day,
+        tzinfo=dt.tzinfo
+    )
+
+    return beginning.timestamp()
+
+
+# ============================================================
+# DAILY REPORT
+# ============================================================
+
+def send_daily_report():
+
+    global last_daily_report_date
+
+    if not DAILY_REPORT_ENABLED:
+        return
+
+    current = local_now()
+
+    if (
+        current.hour
+        != DAILY_REPORT_HOUR
+        or current.minute
+        != DAILY_REPORT_MINUTE
+    ):
+
+        return
+
+    today = current.date()
+
+    if last_daily_report_date == today:
+        return
+
+    start = start_of_day(
+        current
+    )
+
+    end = (
+        start
+        + 86400
+    )
+
+    stats = statistics_between(
+        start,
+        end
+    )
 
     text = (
 
-        "🚀 *QUANTUM SCALPER V2 ONLINE*\n\n"
+        "🌙 *ИТОГИ ТОРГОВОГО ДНЯ*\n\n"
 
-        "OKX: 🟢\n"
-        "Telegram: 🟢\n"
-        "Сканер: 🟢\n"
-        "Режим: *АНАЛИЗ*\n\n"
+        "🔥 *BINANCE ФЬЮЧЕРСЫ*\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
 
-        "🧠 Модели:\n"
-        "• Пробой уровня\n"
-        "• Сжатие → пробой\n"
-        "• Импульсный пробой\n\n"
+        f"Сигналов: `{stats['total']}`\n"
 
-        f"⭐ Минимальная оценка: "
-        f"`{MIN_SCORE}/100`\n"
+        f"Активировано: "
+        f"`{stats['activated']}`\n"
 
-        f"⏱ Время сетапа: "
-        f"`{READY_TTL_MINUTES} мин`\n"
+        f"Не активировано: "
+        f"`{stats['expired']}`\n\n"
 
-        f"🔒 Пауза пары: "
-        f"`{COOLDOWN_MINUTES} мин`\n\n"
+        f"🎯 TP1: `{stats['tp1']}`\n"
+        f"🎯 TP2: `{stats['tp2']}`\n"
+        f"🏆 TP3: `{stats['tp3']}`\n"
+        f"🛑 STOP: `{stats['stop']}`\n\n"
 
-        "*Бот не торгует. "
-        "Он только анализирует рынок.*"
+        f"📊 Закрытых: "
+        f"`{stats['completed']}`\n"
+
+        f"✅ Положительных: "
+        f"`{stats['wins']}`\n"
+
+        f"❌ Отрицательных: "
+        f"`{stats['losses']}`\n\n"
+
+        f"🎯 Win Rate: "
+        f"`{stats['win_rate']:.1f}%`\n"
+
+        f"⚖️ Результат: "
+        f"`{stats['total_r']:+.2f}R`\n\n"
+
+        "ℹ️ Статистика рассчитана только "
+        "по фактически зафиксированным "
+        "результатам сигналов.\n\n"
+
+        "*Без выдуманной прибыли. "
+        "Только данные системы.*"
     )
 
     try:
@@ -2996,11 +3920,232 @@ def startup():
             parse_mode="Markdown"
         )
 
+        last_daily_report_date = today
+
+        save_state(
+            "last_daily_report_date",
+            str(today)
+        )
+
     except Exception:
 
         log.exception(
-            "Startup Telegram error"
+            "Ошибка дневной статистики."
         )
+
+
+# ============================================================
+# WEEKLY REPORT
+# ============================================================
+
+def send_weekly_report():
+
+    global last_weekly_report_key
+
+    if not WEEKLY_REPORT_ENABLED:
+        return
+
+    current = local_now()
+
+    if current.weekday() != WEEKLY_REPORT_DAY:
+        return
+
+    if (
+        current.hour
+        != WEEKLY_REPORT_HOUR
+        or current.minute
+        != WEEKLY_REPORT_MINUTE
+    ):
+
+        return
+
+    key = week_key()
+
+    if last_weekly_report_key == key:
+        return
+
+    monday = (
+        current
+        - timedelta(
+            days=current.weekday()
+        )
+    )
+
+    monday = datetime(
+        monday.year,
+        monday.month,
+        monday.day,
+        tzinfo=current.tzinfo
+    )
+
+    start = monday.timestamp()
+
+    end = (
+        start
+        + 7 * 86400
+    )
+
+    stats = statistics_between(
+        start,
+        end
+    )
+
+    text = (
+
+        "📅 *ИТОГИ НЕДЕЛИ*\n\n"
+
+        "🔥 *BINANCE ФЬЮЧЕРСЫ*\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"Сигналов: `{stats['total']}`\n"
+
+        f"Активировано: "
+        f"`{stats['activated']}`\n"
+
+        f"Не активировано: "
+        f"`{stats['expired']}`\n\n"
+
+        f"🎯 TP1: `{stats['tp1']}`\n"
+        f"🎯 TP2: `{stats['tp2']}`\n"
+        f"🏆 TP3: `{stats['tp3']}`\n"
+        f"🛑 STOP: `{stats['stop']}`\n\n"
+
+        f"📊 Закрытых: "
+        f"`{stats['completed']}`\n"
+
+        f"✅ Положительных: "
+        f"`{stats['wins']}`\n"
+
+        f"❌ Отрицательных: "
+        f"`{stats['losses']}`\n\n"
+
+        f"🎯 Win Rate: "
+        f"`{stats['win_rate']:.1f}%`\n"
+
+        f"⚖️ Результат недели: "
+        f"`{stats['total_r']:+.2f}R`\n\n"
+
+        "ℹ️ R рассчитывается по системе "
+        "частичного выхода:\n"
+        "30% / 30% / 40%.\n\n"
+
+        "*Статистика основана только "
+        "на реально зафиксированных "
+        "результатах сигналов.*"
+    )
+
+    try:
+
+        bot.send_message(
+            CHANNEL_ID,
+            text,
+            parse_mode="Markdown"
+        )
+
+        last_weekly_report_key = key
+
+        save_state(
+            "last_weekly_report_key",
+            key
+        )
+
+    except Exception:
+
+        log.exception(
+            "Ошибка недельной статистики."
+        )
+
+
+# ============================================================
+# STATE
+# ============================================================
+
+def save_state(
+    key: str,
+    value: str
+):
+
+    db_execute(
+        """
+        INSERT INTO bot_state (
+            key,
+            value
+        )
+        VALUES (?, ?)
+
+        ON CONFLICT(key)
+        DO UPDATE SET value = excluded.value
+        """,
+        (
+            key,
+            value
+        ),
+        commit=True
+    )
+
+
+def load_state(
+    key: str
+) -> Optional[str]:
+
+    row = db_execute(
+        """
+        SELECT value
+        FROM bot_state
+        WHERE key = ?
+        """,
+        (key,)
+    ).fetchone()
+
+    if not row:
+        return None
+
+    return row[0]
+
+
+def restore_report_state():
+
+    global last_morning_date
+    global last_daily_report_date
+    global last_weekly_report_key
+
+    morning = load_state(
+        "last_morning_date"
+    )
+
+    if morning:
+
+        try:
+
+            last_morning_date = (
+                datetime
+                .fromisoformat(morning)
+                .date()
+            )
+
+        except Exception:
+            pass
+
+    daily = load_state(
+        "last_daily_report_date"
+    )
+
+    if daily:
+
+        try:
+
+            last_daily_report_date = (
+                datetime
+                .fromisoformat(daily)
+                .date()
+            )
+
+        except Exception:
+            pass
+
+    last_weekly_report_key = load_state(
+        "last_weekly_report_key"
+    )
 
 
 # ============================================================
@@ -3009,11 +4154,7 @@ def startup():
 
 def scan_market():
 
-    global last_scan_ts
     global scan_count
-    global signals_today
-
-    last_scan_ts = now_ts()
 
     scan_count += 1
 
@@ -3022,92 +4163,141 @@ def scan_market():
         scan_count
     )
 
+    # --------------------------------------------------------
+    # Получаем 24H тикеры одним запросом.
+    # --------------------------------------------------------
+
     tickers = get_tickers()
 
-    liquid = [
+    # --------------------------------------------------------
+    # Получаем список реально торгующихся
+    # USDT perpetual.
+    # --------------------------------------------------------
 
-        (inst_id, data)
+    exchange_symbols = (
+        get_exchange_symbols()
+    )
 
-        for inst_id, data
+    # --------------------------------------------------------
+    # Все монеты, удовлетворяющие $100M.
+    # Никакого MAX_SYMBOLS.
+    # --------------------------------------------------------
+
+    candidates = [
+
+        (
+            symbol,
+            ticker
+        )
+
+        for symbol, ticker
         in tickers.items()
 
         if (
-            data["volume_24h"]
+            symbol
+            in exchange_symbols
+            and ticker[
+                "volume_24h"
+            ]
             >= MIN_24H_VOLUME_USD
         )
     ]
 
-    liquid.sort(
+    candidates.sort(
         key=lambda item:
             item[1]["volume_24h"],
         reverse=True
     )
 
-    selected = liquid[
-        :MAX_SYMBOLS
-    ]
-
     log.info(
         "Тикеры=%s | "
-        "Ликвидных=%s | "
-        "Анализ=%s",
+        "USDT perpetual=%s | "
+        "Объём >= $100M=%s",
         len(tickers),
-        len(liquid),
-        len(selected)
+        len(exchange_symbols),
+        len(candidates)
     )
 
-    for inst_id, ticker in selected:
+    if not candidates:
+        return
+
+    # Funding одним запросом для всех.
+    funding_map = get_funding_map(
+        {
+            symbol
+            for symbol, _
+            in candidates
+        }
+    )
+
+    analyzed = 0
+    signals_created = 0
+
+    for symbol, ticker in candidates:
 
         try:
 
             # ------------------------------------------------
-            # Сначала сопровождаем уже существующий сигнал.
+            # Сначала сопровождаем существующий сигнал.
             # ------------------------------------------------
 
             manage_active_signal(
-                inst_id,
+                symbol,
                 ticker["last"]
             )
 
             # ------------------------------------------------
-            # Если уже есть сигнал — новый не создаём.
+            # Новый сигнал по той же паре не создаём.
             # ------------------------------------------------
 
-            if inst_id in active_signals:
+            if symbol in active_signals:
                 continue
 
             if not can_create_signal(
-                inst_id
+                symbol
             ):
                 continue
 
             # ------------------------------------------------
-            # Получаем свечи.
+            # Свечи.
             # ------------------------------------------------
 
             candles_1h = get_candles(
-                inst_id,
-                "1H",
+                symbol,
+                "1h",
                 100
             )
 
             candles_15m = get_candles(
-                inst_id,
+                symbol,
                 "15m",
                 100
             )
 
             candles_5m = get_candles(
-                inst_id,
+                symbol,
                 "5m",
                 100
             )
 
+            analyzed += 1
+
+            funding = funding_map.get(
+                symbol,
+                0.0
+            )
+
             setup = analyze_symbol(
-                inst_id,
+                symbol,
+
                 ticker,
+
+                funding,
+
                 candles_1h,
+
                 candles_15m,
+
                 candles_5m
             )
 
@@ -3116,15 +4306,18 @@ def scan_market():
 
             log.info(
                 "КАНДИДАТ | %s | %s | "
-                "%s | score=%s",
-                setup.coin,
+                "%s | score=%s | volume=%s",
+                symbol,
                 setup.direction,
                 setup.strategy,
-                setup.score
+                setup.score,
+                fmt_usd(
+                    setup.volume_24h
+                )
             )
 
             # ------------------------------------------------
-            # Публикация.
+            # Публикуем.
             # ------------------------------------------------
 
             photo_id, text_id = (
@@ -3136,8 +4329,9 @@ def scan_market():
             if not text_id:
 
                 log.warning(
-                    "Сигнал не сохранён: "
-                    "Telegram не ответил."
+                    "Сигнал %s не сохранён: "
+                    "Telegram публикация не удалась.",
+                    setup.signal_id
                 )
 
                 continue
@@ -3161,11 +4355,10 @@ def scan_market():
             )
 
             active_signals[
-                inst_id
+                symbol
             ] = active
 
             save_signal(
-                setup,
                 active
             )
 
@@ -3173,7 +4366,7 @@ def scan_market():
                 created
             )
 
-            signals_today += 1
+            signals_created += 1
 
             log.info(
                 "READY СОЗДАН | %s | %s",
@@ -3181,115 +4374,69 @@ def scan_market():
                 setup.score
             )
 
-            time.sleep(1)
+            # Небольшая пауза.
+            # Это снижает вероятность лишнего
+            # давления на API/Telegram.
+            time.sleep(0.5)
 
         except Exception as exc:
 
             log.exception(
-                "Ошибка пары %s: %s",
-                inst_id,
+                "Ошибка анализа %s: %s",
+                symbol,
                 exc
             )
 
-            # Одна плохая монета
-            # не должна ломать весь сканер.
-
             continue
 
-
-# ============================================================
-# DAILY COUNTER
-# ============================================================
-
-def reset_daily_counter():
-
-    global signals_today
-
-    today = str(
-        local_now().date()
+    log.info(
+        "СКАН #%s ЗАВЕРШЁН | "
+        "анализ=%s | новых сигналов=%s",
+        scan_count,
+        analyzed,
+        signals_created
     )
 
-    row = db.execute(
-        """
-        SELECT value
-        FROM bot_state
-        WHERE key = 'counter_date'
-        """
-    ).fetchone()
-
-    if not row:
-
-        db.execute(
-            """
-            INSERT INTO bot_state
-            (key, value)
-            VALUES (?, ?)
-            """,
-            (
-                "counter_date",
-                today
-            )
-        )
-
-        db.commit()
-
-        signals_today = 0
-
-        return
-
-    if row[0] != today:
-
-        db.execute(
-            """
-            UPDATE bot_state
-            SET value = ?
-            WHERE key = ?
-            """,
-            (
-                today,
-                "counter_date"
-            )
-        )
-
-        db.commit()
-
-        signals_today = 0
-
 
 # ============================================================
-# STATUS
+# BINANCE CONNECTIVITY TEST
 # ============================================================
 
-def send_status():
+def test_binance():
 
     try:
 
-        bot.send_message(
-            CHANNEL_ID,
-            (
-                "🟢 *QUANTUM STATUS*\n\n"
-
-                "OKX: 🟢 ONLINE\n"
-                "Telegram: 🟢 ONLINE\n"
-                "Сканер: 🟢 RUNNING\n\n"
-
-                f"Активных сетапов: "
-                f"`{len(active_signals)}`\n"
-
-                f"Сигналов сегодня: "
-                f"`{signals_today}`\n"
-
-                f"Сканов: "
-                f"`{scan_count}`"
-            ),
-            parse_mode="Markdown"
+        payload = binance_get(
+            "/fapi/v1/time"
         )
+
+        server_time = payload.get(
+            "serverTime"
+        )
+
+        if server_time:
+
+            log.info(
+                "BINANCE FUTURES ONLINE | "
+                "server=%s",
+                server_time
+            )
+
+        else:
+
+            log.info(
+                "BINANCE FUTURES ONLINE"
+            )
+
+        return True
 
     except Exception:
 
         log.exception(
-            "Ошибка STATUS"
+            "BINANCE FUTURES недоступен."
         )
+
+        return False
 
 
 # ============================================================
@@ -3303,17 +4450,16 @@ def main():
     )
 
     log.info(
-        "QUANTUM SCALPER V2 START"
+        "QUANTUM SCALPER V3 START"
     )
 
     log.info(
-        "Timezone: %s",
-        TIMEZONE
+        "Market: BINANCE USDⓈ-M FUTURES"
     )
 
     log.info(
-        "Symbols: %s",
-        MAX_SYMBOLS
+        "Min 24H volume: $%s",
+        f"{MIN_24H_VOLUME_USD:,.0f}"
     )
 
     log.info(
@@ -3322,8 +4468,8 @@ def main():
     )
 
     log.info(
-        "Min volume: $%s",
-        f"{MIN_24H_VOLUME_USD:,.0f}"
+        "Timezone: %s",
+        TIMEZONE
     )
 
     log.info(
@@ -3331,66 +4477,80 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Восстановление состояния.
+    # Восстановление.
     # --------------------------------------------------------
+
+    restore_report_state()
 
     restore_active_signals()
 
     # --------------------------------------------------------
-    # Telegram.
+    # Проверка Binance.
     # --------------------------------------------------------
 
-    startup()
+    if not test_binance():
 
-    # --------------------------------------------------------
-    # OKX test.
-    # --------------------------------------------------------
-
-    try:
-
-        tickers = get_tickers()
-
-        log.info(
-            "OKX ONLINE | тикеров: %s",
-            len(tickers)
-        )
-
-    except Exception:
-
-        log.exception(
-            "OKX не отвечает при запуске"
+        log.warning(
+            "Binance не отвечает. "
+            "Основной цикл продолжит попытки."
         )
 
     # --------------------------------------------------------
-    # MAIN LOOP.
+    # Основной цикл.
     # --------------------------------------------------------
 
     while True:
 
+        cycle_started = now_ts()
+
         try:
 
-            reset_daily_counter()
+            # -----------------------------------------------
+            # Служебные сообщения.
+            # -----------------------------------------------
 
-            morning_message()
+            send_morning_message()
 
-            expire_ready()
+            send_daily_report()
+
+            send_weekly_report()
+
+            # -----------------------------------------------
+            # Убираем старые записи hourly memory.
+            # -----------------------------------------------
+
+            clean_hour_history()
+
+            # -----------------------------------------------
+            # Рынок.
+            # -----------------------------------------------
 
             scan_market()
 
-            log.info(
-                "Скан завершён. "
-                "Следующий через %s сек.",
+            elapsed = (
+                now_ts()
+                - cycle_started
+            )
+
+            sleep_for = max(
+                5,
                 SCAN_INTERVAL_SECONDS
+                - int(elapsed)
+            )
+
+            log.info(
+                "Следующий скан через %s сек.",
+                sleep_for
             )
 
             time.sleep(
-                SCAN_INTERVAL_SECONDS
+                sleep_for
             )
 
         except KeyboardInterrupt:
 
             log.info(
-                "Остановка."
+                "QUANTUM SCALPER остановлен."
             )
 
             break
@@ -3398,21 +4558,20 @@ def main():
         except Exception as exc:
 
             log.exception(
-                "КРИТИЧЕСКАЯ ОШИБКА: %s",
+                "КРИТИЧЕСКАЯ ОШИБКА ЦИКЛА: %s",
                 exc
             )
 
             log.warning(
-                "Перезапуск цикла через 15 секунд."
+                "Продолжение работы через 15 секунд."
             )
 
             time.sleep(15)
 
 
 # ============================================================
-# ENTRY
+# ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
-
     main()

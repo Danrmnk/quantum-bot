@@ -669,7 +669,36 @@ def okx_get(
 
             response.raise_for_status()
 
-            payload = response.json()
+            payload = response.json()             if not isinstance(payload, dict):
+                raise ValueError("OKX returned invalid JSON")
+
+            if payload.get("code") != "0":
+                raise RuntimeError(
+                    f"OKX API error: {payload.get('code')} "
+                    f"{payload.get('msg', '')}"
+                )
+
+            return payload.get("data", [])
+
+        except Exception as exc:
+            last_error = exc
+
+            log.warning(
+                "OKX request failed | attempt=%s/%s | error=%s",
+                attempt,
+                retries,
+                exc
+            )
+
+            if attempt < retries:
+                time.sleep(1)
+
+    raise RuntimeError(
+        f"OKX request failed after {retries} attempts: {last_error}"
+    )
+
+
+
 def get_tickers() -> Dict[str, dict]:
     """Получение USDT-SWAP тикеров OKX с диагностикой."""
 

@@ -17,15 +17,20 @@ from matplotlib.patches import Rectangle
 
 
 # ============================================================
-# QUANTUM SCALPER V3
+# QUANTUM SCALPER V4
+#
+# PRE-BREAKOUT PROFESSIONAL SCANNER
 #
 # OKX PUBLIC MARKET DATA
-# -> LIQUIDITY FILTER
+# -> LIQUIDITY
 # -> 1H STRUCTURE
-# -> 15M LEVEL / COMPRESSION
-# -> 5M TRIGGER
-# -> TELEGRAM READY
-# -> ACTIVE
+# -> STRONG HORIZONTAL LEVEL
+# -> REAL TRENDLINE / COMPRESSION
+# -> PRE-BREAKOUT PRESSURE
+# -> 5M CONFIRMATION
+# -> VOLUME
+# -> READY BEFORE BREAKOUT
+# -> ENTRY ACTIVE
 #
 # НЕ ТОРГУЕТ.
 # Только анализирует рынок и публикует сигналы.
@@ -56,11 +61,11 @@ TIMEZONE = os.getenv(
     "Europe/Kyiv"
 )
 
-# ------------------------------------------------------------
-# LIQUIDITY
-# ------------------------------------------------------------
 
-# Ищем только пары с >= $60M оборота за 24 часа.
+# ============================================================
+# LIQUIDITY
+# ============================================================
+
 MIN_24H_VOLUME_USD = float(
     os.getenv(
         "MIN_24H_VOLUME_USD",
@@ -68,22 +73,24 @@ MIN_24H_VOLUME_USD = float(
     )
 )
 
-# Максимум самых ликвидных монет для глубокого анализа.
+# Было 35.
+# Расширяем поиск хороших сетапов по рынку.
 MAX_SYMBOLS = int(
     os.getenv(
         "MAX_SYMBOLS",
-        "35"
+        "80"
     )
 )
 
-# ------------------------------------------------------------
+
+# ============================================================
 # SIGNAL
-# ------------------------------------------------------------
+# ============================================================
 
 MIN_SCORE = int(
     os.getenv(
         "MIN_SCORE",
-        "80"
+        "82"
     )
 )
 
@@ -101,6 +108,15 @@ READY_TTL_MINUTES = int(
     )
 )
 
+# Максимальное расстояние от уровня для раннего READY.
+MAX_PREBREAK_DISTANCE_PCT = float(
+    os.getenv(
+        "MAX_PREBREAK_DISTANCE_PCT",
+        "0.60"
+    )
+)
+
+# Максимальное удаление цены после пробоя.
 MAX_CHASE_PCT = float(
     os.getenv(
         "MAX_CHASE_PCT",
@@ -129,9 +145,10 @@ HTTP_TIMEOUT = int(
     )
 )
 
-# ------------------------------------------------------------
+
+# ============================================================
 # MORNING
-# ------------------------------------------------------------
+# ============================================================
 
 MORNING_HOUR = int(
     os.getenv(
@@ -152,9 +169,10 @@ MORNING_ENABLED = os.getenv(
     "true"
 ).lower() == "true"
 
-# ------------------------------------------------------------
+
+# ============================================================
 # DATABASE
-# ------------------------------------------------------------
+# ============================================================
 
 DB_PATH = os.getenv(
     "DB_PATH",
@@ -208,7 +226,7 @@ bot = telebot.TeleBot(
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "QuantumScalper/3.0",
+    "User-Agent": "QuantumScalper/4.0",
     "Accept": "application/json",
 })
 
@@ -351,31 +369,18 @@ def local_now() -> datetime:
 def fmt_price(price: float) -> str:
 
     if price >= 1000:
-        return f"{price:,.2f}".replace(
-            ",",
-            " "
-        )
+        return f"{price:,.2f}".replace(",", " ")
 
     if price >= 100:
-        return f"{price:,.2f}".replace(
-            ",",
-            " "
-        )
+        return f"{price:,.2f}".replace(",", " ")
 
     if price >= 1:
-        return f"{price:,.4f}".replace(
-            ",",
-            " "
-        )
+        return f"{price:,.4f}".replace(",", " ")
 
     if price >= 0.01:
-        return f"{price:.6f}".rstrip(
-            "0"
-        ).rstrip(".")
+        return f"{price:.6f}".rstrip("0").rstrip(".")
 
-    return f"{price:.10f}".rstrip(
-        "0"
-    ).rstrip(".")
+    return f"{price:.10f}".rstrip("0").rstrip(".")
 
 
 def clamp(
@@ -386,10 +391,7 @@ def clamp(
 
     return max(
         low,
-        min(
-            high,
-            value
-        )
+        min(high, value)
     )
 
 
@@ -434,22 +436,6 @@ def grade_volume(
     return "NORMAL"
 
 
-def grade_liquidity(
-    volume: float
-) -> str:
-
-    if volume >= 1_000_000_000:
-        return "HIGH"
-
-    if volume >= 250_000_000:
-        return "GOOD"
-
-    if volume >= 60_000_000:
-        return "MEDIUM"
-
-    return "LOW"
-
-
 def score_label(
     score: int
 ) -> str:
@@ -476,11 +462,7 @@ def okx_get(
     retries: int = 3
 ) -> dict:
 
-    url = (
-        OKX_BASE_URL
-        + path
-    )
-
+    url = OKX_BASE_URL + path
     last_error = None
 
     for attempt in range(
@@ -516,15 +498,11 @@ def okx_get(
             )
 
             if code != "0":
-
                 raise RuntimeError(
                     "OKX code=%s msg=%s"
                     % (
                         code,
-                        payload.get(
-                            "msg",
-                            ""
-                        )
+                        payload.get("msg", "")
                     )
                 )
 
@@ -553,8 +531,7 @@ def okx_get(
 
     raise RuntimeError(
         "OKX request failed after "
-        f"{retries} attempts: "
-        f"{last_error}"
+        f"{retries} attempts: {last_error}"
     )
 
 
@@ -612,18 +589,6 @@ def get_instruments() -> List[str]:
 # ============================================================
 
 def get_tickers() -> Dict[str, dict]:
-    """
-    OKX SWAP ticker.
-
-    ВАЖНО:
-    Для SWAP используем volCcy24h.
-    Это объём базовой валюты.
-
-    Для получения приблизительного USDT оборота:
-        volCcy24h * last
-
-    Старый ошибочный volCcyQuote24h здесь НЕ используется.
-    """
 
     payload = okx_get(
         "/api/v5/market/tickers",
@@ -670,41 +635,33 @@ def get_tickers() -> Dict[str, dict]:
                 ) or 0
             )
 
-            # Для USDT-SWAP:
-            # базовый объём * цена ≈ USDT оборот.
             volume_usd = (
                 vol_ccy_24h
                 * last
             )
 
-            high24h = float(
-                item.get(
-                    "high24h",
-                    0
-                ) or 0
-            )
-
-            low24h = float(
-                item.get(
-                    "low24h",
-                    0
-                ) or 0
-            )
-
-            ts = int(
-                item.get(
-                    "ts",
-                    0
-                ) or 0
-            )
-
             result[inst_id] = {
                 "last": last,
-                "high24h": high24h,
-                "low24h": low24h,
+                "high24h": float(
+                    item.get(
+                        "high24h",
+                        0
+                    ) or 0
+                ),
+                "low24h": float(
+                    item.get(
+                        "low24h",
+                        0
+                    ) or 0
+                ),
                 "vol_ccy_24h": vol_ccy_24h,
                 "vol24h_usd": volume_usd,
-                "ts": ts,
+                "ts": int(
+                    item.get(
+                        "ts",
+                        0
+                    ) or 0
+                ),
             }
 
         except (
@@ -732,10 +689,7 @@ def get_candles(
             "instId": inst_id,
             "bar": bar,
             "limit": str(
-                min(
-                    limit,
-                    300
-                )
+                min(limit, 300)
             )
         }
     )
@@ -753,32 +707,14 @@ def get_candles(
 
             candles.append(
                 Candle(
-                    ts=int(
-                        row[0]
-                    ),
-                    open=float(
-                        row[1]
-                    ),
-                    high=float(
-                        row[2]
-                    ),
-                    low=float(
-                        row[3]
-                    ),
-                    close=float(
-                        row[4]
-                    ),
-                    volume=float(
-                        row[5] or 0
-                    ),
-                    quote_volume=float(
-                        row[7] or 0
-                    ),
-                    confirmed=(
-                        str(
-                            row[8]
-                        ) == "1"
-                    )
+                    ts=int(row[0]),
+                    open=float(row[1]),
+                    high=float(row[2]),
+                    low=float(row[3]),
+                    close=float(row[4]),
+                    volume=float(row[5] or 0),
+                    quote_volume=float(row[7] or 0),
+                    confirmed=str(row[8]) == "1"
                 )
             )
 
@@ -828,10 +764,7 @@ def get_open_interest(
             None,
             ""
         ):
-
-            return float(
-                oi_usd
-            )
+            return float(oi_usd)
 
         oi = item.get(
             "oi"
@@ -841,10 +774,7 @@ def get_open_interest(
             None,
             ""
         ):
-
-            return float(
-                oi
-            )
+            return float(oi)
 
     except Exception as exc:
 
@@ -866,10 +796,7 @@ def ema(
     period: int
 ) -> List[float]:
 
-    if not values:
-        return []
-
-    if period <= 0:
+    if not values or period <= 0:
         return []
 
     k = 2.0 / (
@@ -897,9 +824,7 @@ def atr(
     period: int = 14
 ) -> float:
 
-    if len(candles) < (
-        period + 1
-    ):
+    if len(candles) < period + 1:
         return 0.0
 
     trs = []
@@ -912,32 +837,25 @@ def atr(
         current = candles[i]
         previous = candles[i - 1]
 
-        tr = max(
-            current.high
-            - current.low,
-
-            abs(
-                current.high
-                - previous.close
-            ),
-
-            abs(
-                current.low
-                - previous.close
-            )
-        )
-
         trs.append(
-            tr
+            max(
+                current.high - current.low,
+                abs(
+                    current.high
+                    - previous.close
+                ),
+                abs(
+                    current.low
+                    - previous.close
+                )
+            )
         )
 
     if len(trs) < period:
         return 0.0
 
     return (
-        sum(
-            trs[-period:]
-        )
+        sum(trs[-period:])
         / period
     )
 
@@ -947,22 +865,17 @@ def volume_ratio(
     lookback: int = 20
 ) -> float:
 
-    if len(candles) < (
-        lookback + 1
-    ):
+    if len(candles) < lookback + 1:
         return 0.0
 
-    current = (
-        candles[-1]
-        .quote_volume
-    )
+    current = candles[-1].quote_volume
 
     history = [
-        candle.quote_volume
-        for candle in candles[
+        c.quote_volume
+        for c in candles[
             -lookback - 1:-1
         ]
-        if candle.quote_volume > 0
+        if c.quote_volume > 0
     ]
 
     if not history:
@@ -976,10 +889,7 @@ def volume_ratio(
     if average <= 0:
         return 0.0
 
-    return (
-        current
-        / average
-    )
+    return current / average
 
 
 # ============================================================
@@ -1014,23 +924,19 @@ def structure_1h(
     second_half = recent[6:]
 
     first_high = max(
-        c.high
-        for c in first_half
+        c.high for c in first_half
     )
 
     second_high = max(
-        c.high
-        for c in second_half
+        c.high for c in second_half
     )
 
     first_low = min(
-        c.low
-        for c in first_half
+        c.low for c in first_half
     )
 
     second_low = min(
-        c.low
-        for c in second_half
+        c.low for c in second_half
     )
 
     if (
@@ -1062,9 +968,7 @@ def pivot_highs(
 
     result = []
 
-    if len(candles) <= (
-        left + right
-    ):
+    if len(candles) <= left + right:
         return result
 
     for i in range(
@@ -1074,26 +978,16 @@ def pivot_highs(
 
         value = candles[i].high
 
-        valid = True
-
-        for j in range(
-            i - left,
-            i + right + 1
+        if all(
+            candles[j].high <= value
+            for j in range(
+                i - left,
+                i + right + 1
+            )
+            if j != i
         ):
-
-            if j == i:
-                continue
-
-            if candles[j].high > value:
-                valid = False
-                break
-
-        if valid:
             result.append(
-                (
-                    i,
-                    value
-                )
+                (i, value)
             )
 
     return result
@@ -1107,9 +1001,7 @@ def pivot_lows(
 
     result = []
 
-    if len(candles) <= (
-        left + right
-    ):
+    if len(candles) <= left + right:
         return result
 
     for i in range(
@@ -1119,34 +1011,73 @@ def pivot_lows(
 
         value = candles[i].low
 
-        valid = True
-
-        for j in range(
-            i - left,
-            i + right + 1
+        if all(
+            candles[j].low >= value
+            for j in range(
+                i - left,
+                i + right + 1
+            )
+            if j != i
         ):
-
-            if j == i:
-                continue
-
-            if candles[j].low < value:
-                valid = False
-                break
-
-        if valid:
             result.append(
-                (
-                    i,
-                    value
-                )
+                (i, value)
             )
 
     return result
 
 
 # ============================================================
-# LEVEL FINDER
+# STRONG HORIZONTAL LEVEL
 # ============================================================
+
+def level_strength(
+    candles: List[Candle],
+    level: float,
+    direction: str
+) -> Tuple[int, int]:
+
+    if level <= 0:
+        return 0, 0
+
+    tolerance = 0.0025
+    reactions = 0
+
+    for candle in candles[:-2]:
+
+        if direction == "LONG":
+
+            distance = abs(
+                candle.high - level
+            ) / level
+
+            if distance <= tolerance:
+                reactions += 1
+
+        else:
+
+            distance = abs(
+                candle.low - level
+            ) / level
+
+            if distance <= tolerance:
+                reactions += 1
+
+    score = 0
+
+    if reactions >= 2:
+        score += 6
+
+    if reactions >= 3:
+        score += 5
+
+    if reactions >= 4:
+        score += 4
+
+    if reactions >= 5:
+        score += 3
+
+    return score, reactions
+
 
 def nearest_level(
     candles_15m: List[Candle],
@@ -1155,112 +1086,353 @@ def nearest_level(
     direction: str
 ) -> Tuple[
     Optional[float],
-    str
+    str,
+    int,
+    int
 ]:
 
     candidates = []
 
     # --------------------------------------------------------
-    # 1D APPROXIMATION
+    # 1H / APPROX 1D LEVELS
     # --------------------------------------------------------
 
-    if len(candles_1h) >= 30:
+    if len(candles_1h) >= 40:
 
-        day = candles_1h[
-            -25:-1
-        ]
+        window = candles_1h[-35:-1]
 
-        if day:
+        if direction == "LONG":
 
-            day_high = max(
-                c.high
-                for c in day
+            pivots = pivot_highs(
+                window,
+                2,
+                2
             )
 
-            day_low = min(
-                c.low
-                for c in day
+            for _, level in pivots:
+
+                if level <= current:
+                    continue
+
+                distance = pct(
+                    level,
+                    current
+                )
+
+                if (
+                    0.03
+                    <= distance
+                    <= MAX_PREBREAK_DISTANCE_PCT
+                ):
+
+                    strength, reactions = (
+                        level_strength(
+                            window,
+                            level,
+                            direction
+                        )
+                    )
+
+                    candidates.append(
+                        (
+                            level,
+                            "1H",
+                            strength + 8,
+                            reactions
+                        )
+                    )
+
+        else:
+
+            pivots = pivot_lows(
+                window,
+                2,
+                2
             )
 
-            if (
-                direction == "LONG"
-                and day_high > current
-            ):
-                candidates.append(
-                    (
-                        day_high,
-                        "1D"
+            for _, level in pivots:
+
+                if level >= current:
+                    continue
+
+                distance = abs(
+                    pct(
+                        level,
+                        current
                     )
                 )
 
-            if (
-                direction == "SHORT"
-                and day_low < current
-            ):
-                candidates.append(
-                    (
-                        day_low,
-                        "1D"
+                if (
+                    0.03
+                    <= distance
+                    <= MAX_PREBREAK_DISTANCE_PCT
+                ):
+
+                    strength, reactions = (
+                        level_strength(
+                            window,
+                            level,
+                            direction
+                        )
                     )
-                )
+
+                    candidates.append(
+                        (
+                            level,
+                            "1H",
+                            strength + 8,
+                            reactions
+                        )
+                    )
 
     # --------------------------------------------------------
-    # 15M PIVOTS
+    # 15M LEVELS
     # --------------------------------------------------------
 
     highs = pivot_highs(
-        candles_15m
+        candles_15m,
+        2,
+        2
     )
 
     lows = pivot_lows(
-        candles_15m
+        candles_15m,
+        2,
+        2
     )
 
     if direction == "LONG":
 
-        for _, level in highs[-15:]:
+        for _, level in highs[-30:]:
 
-            if level > current:
+            if level <= current:
+                continue
+
+            distance = pct(
+                level,
+                current
+            )
+
+            if (
+                0.03
+                <= distance
+                <= MAX_PREBREAK_DISTANCE_PCT
+            ):
+
+                strength, reactions = (
+                    level_strength(
+                        candles_15m,
+                        level,
+                        direction
+                    )
+                )
+
                 candidates.append(
                     (
                         level,
-                        "15M"
+                        "15M",
+                        strength,
+                        reactions
                     )
                 )
 
     else:
 
-        for _, level in lows[-15:]:
+        for _, level in lows[-30:]:
 
-            if level < current:
+            if level >= current:
+                continue
+
+            distance = abs(
+                pct(
+                    level,
+                    current
+                )
+            )
+
+            if (
+                0.03
+                <= distance
+                <= MAX_PREBREAK_DISTANCE_PCT
+            ):
+
+                strength, reactions = (
+                    level_strength(
+                        candles_15m,
+                        level,
+                        direction
+                    )
+                )
+
                 candidates.append(
                     (
                         level,
-                        "15M"
+                        "15M",
+                        strength,
+                        reactions
                     )
                 )
 
     if not candidates:
-        return None, ""
+        return None, "", 0, 0
+
+    # Сначала качество уровня,
+    # затем близость.
+    candidates.sort(
+        key=lambda x: (
+            x[2],
+            -abs(
+                pct(
+                    x[0],
+                    current
+                )
+            )
+        ),
+        reverse=True
+    )
+
+    best = candidates[0]
+
+    return (
+        best[0],
+        best[1],
+        best[2],
+        best[3]
+    )
+
+
+# ============================================================
+# APPROACH QUALITY
+# ============================================================
+
+def approach_quality(
+    candles: List[Candle],
+    level: float,
+    direction: str
+) -> Tuple[int, bool, str]:
+
+    if len(candles) < 12:
+        return 0, False, ""
+
+    recent = candles[-12:]
+
+    score = 0
 
     if direction == "LONG":
 
-        candidates.sort(
-            key=lambda x: x[0]
+        highs = [
+            c.high
+            for c in recent
+        ]
+
+        lows = [
+            c.low
+            for c in recent
+        ]
+
+        distance_start = abs(
+            level - recent[0].close
+        )
+
+        distance_end = abs(
+            level - recent[-1].close
+        )
+
+        if distance_end < distance_start:
+            score += 8
+
+        if all(
+            lows[i] <= lows[i + 1]
+            for i in range(
+                len(lows) - 3,
+                len(lows) - 1
+            )
+        ):
+            pass
+
+        rising_lows = (
+            lows[-1] > lows[-4]
+        )
+
+        if rising_lows:
+            score += 7
+
+        below_level = sum(
+            1
+            for c in recent
+            if c.close < level
+        )
+
+        if below_level >= 7:
+            score += 5
+
+        valid = (
+            score >= 12
+            and recent[-1].close
+            < level * 1.0025
+        )
+
+        reason = (
+            "Цена постепенно приближается "
+            "к сопротивлению, давление покупателей "
+            "усиливается перед уровнем."
         )
 
     else:
 
-        candidates.sort(
-            key=lambda x: x[0],
-            reverse=True
+        highs = [
+            c.high
+            for c in recent
+        ]
+
+        distance_start = abs(
+            level - recent[0].close
         )
 
-    return candidates[0]
+        distance_end = abs(
+            level - recent[-1].close
+        )
+
+        if distance_end < distance_start:
+            score += 8
+
+        falling_highs = (
+            highs[-1] < highs[-4]
+        )
+
+        if falling_highs:
+            score += 7
+
+        above_level = sum(
+            1
+            for c in recent
+            if c.close > level
+        )
+
+        if above_level >= 7:
+            score += 5
+
+        valid = (
+            score >= 12
+            and recent[-1].close
+            > level * 0.9975
+        )
+
+        reason = (
+            "Цена постепенно приближается "
+            "к поддержке, давление продавцов "
+            "усиливается перед уровнем."
+        )
+
+    return (
+        score,
+        valid,
+        reason
+    )
 
 
 # ============================================================
-# COMPRESSION
+# PRE-BREAKOUT COMPRESSION
 # ============================================================
 
 def compression_score(
@@ -1268,13 +1440,14 @@ def compression_score(
     direction: str
 ) -> Tuple[
     int,
-    bool
+    bool,
+    str
 ]:
 
-    if len(candles) < 25:
-        return 0, False
+    if len(candles) < 30:
+        return 0, False, ""
 
-    recent = candles[-20:]
+    recent = candles[-24:]
 
     ranges = [
         c.high - c.low
@@ -1282,188 +1455,117 @@ def compression_score(
         if c.high > c.low
     ]
 
-    if len(ranges) < 15:
-        return 0, False
+    if len(ranges) < 18:
+        return 0, False, ""
 
-    first_slice = ranges[:8]
-    last_slice = ranges[-8:]
-
-    first_avg = (
-        sum(first_slice)
-        / len(first_slice)
+    first = (
+        sum(ranges[:8])
+        / 8
     )
 
-    last_avg = (
-        sum(last_slice)
-        / len(last_slice)
+    last = (
+        sum(ranges[-8:])
+        / 8
     )
 
-    if first_avg <= 0:
-        return 0, False
+    if first <= 0:
+        return 0, False, ""
 
     compression = (
-        1.0
-        - (
-            last_avg
-            / first_avg
-        )
-    )
-
-    highs = pivot_highs(
-        recent
-    )
-
-    lows = pivot_lows(
-        recent
+        1
+        - last / first
     )
 
     score = 0
-    valid = False
 
-    if direction == "LONG":
+    if compression >= 0.10:
+        score += 6
 
-        if len(lows) >= 2:
-
-            last_two = [
-                value
-                for _, value
-                in lows[-3:]
-            ]
-
-            if all(
-                last_two[i]
-                <= last_two[i + 1]
-                for i in range(
-                    len(last_two) - 1
-                )
-            ):
-
-                score += 10
-                valid = True
-
-    else:
-
-        if len(highs) >= 2:
-
-            last_two = [
-                value
-                for _, value
-                in highs[-3:]
-            ]
-
-            if all(
-                last_two[i]
-                >= last_two[i + 1]
-                for i in range(
-                    len(last_two) - 1
-                )
-            ):
-
-                score += 10
-                valid = True
-
-    if compression >= 0.15:
-        score += 10
+    if compression >= 0.18:
+        score += 6
 
     if compression >= 0.25:
-        score += 5
+        score += 4
 
-    return min(
-        score,
-        25
-    ), valid
+    highs = pivot_highs(
+        recent,
+        2,
+        2
+    )
 
-
-# ============================================================
-# STRATEGY 1
-# HORIZONTAL LEVEL BREAKOUT
-# ============================================================
-
-def detect_horizontal_breakout(
-    direction: str,
-    current: float,
-    level: float,
-    previous: Candle,
-    current_candle: Candle
-) -> Tuple[
-    bool,
-    int,
-    str
-]:
-
-    if level <= 0:
-        return False, 0, ""
+    lows = pivot_lows(
+        recent,
+        2,
+        2
+    )
 
     if direction == "LONG":
 
-        near = (
-            current >= level * 0.9975
-            and current <= level * 1.0025
-        )
+        if len(lows) >= 3:
 
-        breakout = (
-            current_candle.close > level
-            and previous.close <= level
-        )
+            values = [
+                x[1]
+                for x in lows[-3:]
+            ]
 
-        if breakout:
+            if (
+                values[0]
+                < values[1]
+                < values[2]
+            ):
+                score += 10
 
-            return (
-                True,
-                20,
-                "Цена подошла к ключевому сопротивлению, "
-                "а подтверждённая 5M свеча закрылась выше уровня."
-            )
+                reason = (
+                    "Перед сопротивлением формируется "
+                    "сжатие с повышающимися минимумами."
+                )
 
-        if near:
-
-            return (
-                True,
-                10,
-                "Цена находится непосредственно у ключевого "
-                "сопротивления. Ждём подтверждённый выход вверх."
-            )
+                return (
+                    score,
+                    score >= 15,
+                    reason
+                )
 
     else:
 
-        near = (
-            current >= level * 0.9975
-            and current <= level * 1.0025
-        )
+        if len(highs) >= 3:
 
-        breakout = (
-            current_candle.close < level
-            and previous.close >= level
-        )
+            values = [
+                x[1]
+                for x in highs[-3:]
+            ]
 
-        if breakout:
+            if (
+                values[0]
+                > values[1]
+                > values[2]
+            ):
+                score += 10
 
-            return (
-                True,
-                20,
-                "Цена подошла к ключевой поддержке, "
-                "а подтверждённая 5M свеча закрылась ниже уровня."
-            )
+                reason = (
+                    "Перед поддержкой формируется "
+                    "сжатие с понижающимися максимумами."
+                )
 
-        if near:
+                return (
+                    score,
+                    score >= 15,
+                    reason
+                )
 
-            return (
-                True,
-                10,
-                "Цена находится непосредственно у ключевой "
-                "поддержки. Ждём подтверждённый выход вниз."
-            )
-
-    return False, 0, ""
+    return (
+        score,
+        False,
+        ""
+    )
 
 
 # ============================================================
-# STRATEGY 2
-# TRENDLINE COMPRESSION BREAKOUT
+# REAL TRENDLINE PRESSURE
 # ============================================================
 
-def detect_compression(
-    candles_15m: List[Candle],
+def detect_trendline_pressure(
+    candles: List[Candle],
     direction: str
 ) -> Tuple[
     bool,
@@ -1471,47 +1573,200 @@ def detect_compression(
     str
 ]:
 
-    points, valid = compression_score(
-        candles_15m,
-        direction
-    )
-
-    if not valid:
+    if len(candles) < 35:
         return False, 0, ""
 
-    if points < 15:
-        return False, 0, ""
+    recent = candles[-35:]
 
     if direction == "LONG":
 
+        lows = pivot_lows(
+            recent,
+            2,
+            2
+        )
+
+        if len(lows) < 3:
+            return False, 0, ""
+
+        points = lows[-3:]
+
+        values = [
+            value
+            for _, value in points
+        ]
+
+        if not (
+            values[0]
+            < values[1]
+            < values[2]
+        ):
+            return False, 0, ""
+
+        # Проверяем, что наклон не случайный.
+        slope1 = (
+            values[1]
+            - values[0]
+        )
+
+        slope2 = (
+            values[2]
+            - values[1]
+        )
+
+        if slope1 <= 0 or slope2 <= 0:
+            return False, 0, ""
+
+        return (
+            True,
+            15,
+            "На 15M формируется реальная восходящая "
+            "наклонная поддержка с последовательным "
+            "повышением минимумов."
+        )
+
+    highs = pivot_highs(
+        recent,
+        2,
+        2
+    )
+
+    if len(highs) < 3:
+        return False, 0, ""
+
+    points = highs[-3:]
+
+    values = [
+        value
+        for _, value in points
+    ]
+
+    if not (
+        values[0]
+        > values[1]
+        > values[2]
+    ):
+        return False, 0, ""
+
+    slope1 = (
+        values[1]
+        - values[0]
+    )
+
+    slope2 = (
+        values[2]
+        - values[1]
+    )
+
+    if slope1 >= 0 or slope2 >= 0:
+        return False, 0, ""
+
+    return (
+        True,
+        15,
+        "На 15M формируется реальная нисходящая "
+        "наклонная структура с последовательным "
+        "понижением максимумов."
+    )
+
+
+# ============================================================
+# 5M PRE-BREAKOUT CANDLE PRESSURE
+# ============================================================
+
+def prebreakout_candle_quality(
+    candles: List[Candle],
+    level: float,
+    direction: str
+) -> Tuple[
+    int,
+    bool,
+    str
+]:
+
+    if len(candles) < 5:
+        return 0, False, ""
+
+    recent = candles[-5:]
+
+    score = 0
+
+    if direction == "LONG":
+
+        pressure = sum(
+            1
+            for c in recent
+            if c.close > c.open
+        )
+
+        if pressure >= 3:
+            score += 5
+
+        if recent[-1].close > recent[-2].close:
+            score += 4
+
+        if recent[-1].low > recent[-4].low:
+            score += 5
+
+        distance = (
+            level - recent[-1].close
+        ) / level * 100
+
+        if 0 <= distance <= 0.35:
+            score += 5
+
+        valid = score >= 12
+
         reason = (
-            "На 15M сформировалось сжатие "
-            "с повышающимися минимумами "
-            "перед сопротивлением."
+            "5M показывает последовательное давление "
+            "покупателей непосредственно перед уровнем."
         )
 
     else:
 
+        pressure = sum(
+            1
+            for c in recent
+            if c.close < c.open
+        )
+
+        if pressure >= 3:
+            score += 5
+
+        if recent[-1].close < recent[-2].close:
+            score += 4
+
+        if recent[-1].high < recent[-4].high:
+            score += 5
+
+        distance = (
+            recent[-1].close - level
+        ) / level * 100
+
+        if 0 <= distance <= 0.35:
+            score += 5
+
+        valid = score >= 12
+
         reason = (
-            "На 15M сформировалось сжатие "
-            "с понижающимися максимумами "
-            "перед поддержкой."
+            "5M показывает последовательное давление "
+            "продавцов непосредственно перед уровнем."
         )
 
     return (
-        True,
-        points,
+        score,
+        valid,
         reason
     )
 
 
 # ============================================================
-# STRATEGY 3
-# MOMENTUM BREAKOUT
+# REAL BREAKOUT
 # ============================================================
 
-def detect_momentum(
-    candles_5m: List[Candle],
+def detect_real_breakout(
+    candles: List[Candle],
+    level: float,
     direction: str
 ) -> Tuple[
     bool,
@@ -1519,12 +1774,118 @@ def detect_momentum(
     str
 ]:
 
-    if len(candles_5m) < 30:
+    if len(candles) < 3:
+        return False, 0, ""
+
+    current = candles[-1]
+    previous = candles[-2]
+
+    body = abs(
+        current.close
+        - current.open
+    )
+
+    candle_range = (
+        current.high
+        - current.low
+    )
+
+    if candle_range <= 0:
+        return False, 0, ""
+
+    body_ratio = (
+        body
+        / candle_range
+    )
+
+    if direction == "LONG":
+
+        crossed = (
+            previous.close <= level
+            and current.close > level
+        )
+
+        if not crossed:
+            return False, 0, ""
+
+        close_distance = (
+            current.close - level
+        ) / level * 100
+
+        upper_wick = (
+            current.high
+            - current.close
+        )
+
+        if body_ratio < 0.45:
+            return False, 0, ""
+
+        if upper_wick > body * 1.5:
+            return False, 0, ""
+
+        if close_distance > MAX_CHASE_PCT:
+            return False, 0, ""
+
+        return (
+            True,
+            20,
+            "Подтверждённый 5M пробой сопротивления "
+            "с качественным закрытием свечи."
+        )
+
+    crossed = (
+        previous.close >= level
+        and current.close < level
+    )
+
+    if not crossed:
+        return False, 0, ""
+
+    close_distance = (
+        level - current.close
+    ) / level * 100
+
+    lower_wick = (
+        current.close
+        - current.low
+    )
+
+    if body_ratio < 0.45:
+        return False, 0, ""
+
+    if lower_wick > body * 1.5:
+        return False, 0, ""
+
+    if close_distance > MAX_CHASE_PCT:
+        return False, 0, ""
+
+    return (
+        True,
+        20,
+        "Подтверждённый 5M пробой поддержки "
+        "с качественным закрытием свечи."
+    )
+
+
+# ============================================================
+# MOMENTUM CONFIRMATION
+# ============================================================
+
+def detect_momentum(
+    candles: List[Candle],
+    direction: str
+) -> Tuple[
+    bool,
+    int,
+    str
+]:
+
+    if len(candles) < 30:
         return False, 0, ""
 
     closes = [
         c.close
-        for c in candles_5m
+        for c in candles
     ]
 
     ema9 = ema(
@@ -1537,22 +1898,15 @@ def detect_momentum(
         21
     )[-1]
 
-    current = candles_5m[-1]
+    current = candles[-1]
 
-    previous_window = candles_5m[
-        -13:-1
-    ]
-
-    if len(
-        previous_window
-    ) < 5:
-        return False, 0, ""
+    window = candles[-13:-1]
 
     if direction == "LONG":
 
         previous_high = max(
             c.high
-            for c in previous_window
+            for c in window
         )
 
         valid = (
@@ -1564,7 +1918,7 @@ def detect_momentum(
 
         previous_low = min(
             c.low
-            for c in previous_window
+            for c in window
         )
 
         valid = (
@@ -1577,9 +1931,9 @@ def detect_momentum(
 
     return (
         True,
-        15,
-        "5M показывает импульсный выход "
-        "из локального диапазона с подтверждением EMA."
+        8,
+        "5M momentum подтверждает направление "
+        "движения."
     )
 
 
@@ -1632,7 +1986,16 @@ def analyze_symbol(
 
     direction = trend
 
-    level, level_tf = nearest_level(
+    # --------------------------------------------------------
+    # STRONG LEVEL
+    # --------------------------------------------------------
+
+    (
+        level,
+        level_tf,
+        level_points,
+        reactions
+    ) = nearest_level(
         candles_15m,
         candles_1h,
         current,
@@ -1649,8 +2012,22 @@ def analyze_symbol(
         )
     )
 
-    if distance > 0.40:
+    if distance > MAX_PREBREAK_DISTANCE_PCT:
         return None
+
+    # Слишком далёкий уровень нам не нужен.
+    # Слишком близкий тоже может означать уже начавшийся пробой.
+    if distance < 0.03:
+        return None
+
+    # Сильный уровень должен иметь хотя бы минимальное
+    # количество подтверждений.
+    if reactions < 2:
+        return None
+
+    # --------------------------------------------------------
+    # ATR
+    # --------------------------------------------------------
 
     atr_value = atr(
         confirmed_5m,
@@ -1672,71 +2049,64 @@ def analyze_symbol(
     if atr_pct > 2.5:
         return None
 
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
+
     v_ratio = volume_ratio(
         confirmed_5m,
         20
     )
 
-    score = 0
-
     # --------------------------------------------------------
-    # 1H STRUCTURE
+    # PRE-BREAKOUT STRUCTURE
     # --------------------------------------------------------
 
-    score += 15
-
-    # --------------------------------------------------------
-    # LEVEL
-    # --------------------------------------------------------
-
-    if level_tf == "1D":
-        score += 20
-    else:
-        score += 12
-
-    # --------------------------------------------------------
-    # STRATEGIES
-    # --------------------------------------------------------
-
-    current_candle = confirmed_5m[-1]
-    previous = confirmed_5m[-2]
-
-    strategies = []
-
-    horizontal_ok, horizontal_points, horizontal_reason = (
-        detect_horizontal_breakout(
-            direction,
-            current,
+    approach_points, approach_ok, approach_reason = (
+        approach_quality(
+            candles_15m,
             level,
-            previous,
-            current_candle
+            direction
         )
     )
 
-    if horizontal_ok:
-        strategies.append(
-            (
-                "Horizontal Level Breakout",
-                horizontal_points,
-                horizontal_reason
-            )
-        )
-
     compression_ok, compression_points, compression_reason = (
-        detect_compression(
+        compression_score(
             candles_15m,
             direction
         )
     )
 
-    if compression_ok:
-        strategies.append(
-            (
-                "Trendline Compression Breakout",
-                compression_points,
-                compression_reason
-            )
+    trendline_ok, trendline_points, trendline_reason = (
+        detect_trendline_pressure(
+            candles_15m,
+            direction
         )
+    )
+
+    candle_points, candle_ok, candle_reason = (
+        prebreakout_candle_quality(
+            confirmed_5m,
+            level,
+            direction
+        )
+    )
+
+    # --------------------------------------------------------
+    # ACTUAL BREAKOUT CHECK
+    # --------------------------------------------------------
+
+    breakout_ok, breakout_points, breakout_reason = (
+        detect_real_breakout(
+            confirmed_5m,
+            level,
+            direction
+        )
+    )
+
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
 
     momentum_ok, momentum_points, momentum_reason = (
         detect_momentum(
@@ -1745,50 +2115,156 @@ def analyze_symbol(
         )
     )
 
-    if momentum_ok:
-        strategies.append(
+    # --------------------------------------------------------
+    # STRATEGY SELECTION
+    #
+    # IMPORTANT:
+    # READY может быть ДО пробоя.
+    # Но обязательно должна существовать
+    # качественная pre-breakout структура.
+    # --------------------------------------------------------
+
+    strategy_candidates = []
+
+    if (
+        approach_ok
+        and compression_ok
+    ):
+
+        strategy_candidates.append(
             (
-                "Momentum Breakout",
-                momentum_points,
-                momentum_reason
+                "Horizontal Level Breakout",
+                approach_points
+                + compression_points,
+                (
+                    f"{approach_reason} "
+                    f"{compression_reason}"
+                )
             )
         )
 
-    if not strategies:
+    if (
+        approach_ok
+        and trendline_ok
+    ):
+
+        strategy_candidates.append(
+            (
+                "Trendline Compression Breakout",
+                approach_points
+                + trendline_points,
+                (
+                    f"{approach_reason} "
+                    f"{trendline_reason}"
+                )
+            )
+        )
+
+    # После фактического пробоя разрешаем
+    # отдельный сильный вариант.
+    if breakout_ok:
+
+        strategy_candidates.append(
+            (
+                "Horizontal Level Breakout",
+                breakout_points,
+                breakout_reason
+            )
+        )
+
+    if not strategy_candidates:
         return None
 
-    # Берём наиболее сильную стратегию.
-    strategies.sort(
-        key=lambda item: item[1],
+    strategy_candidates.sort(
+        key=lambda x: x[1],
         reverse=True
     )
 
     strategy, strategy_points, reason = (
-        strategies[0]
+        strategy_candidates[0]
     )
 
-    score += strategy_points
+    # --------------------------------------------------------
+    # SCORE
+    # --------------------------------------------------------
 
-    # Если одновременно подтверждаются несколько
-    # стратегий — даём небольшой бонус.
-    if len(strategies) >= 2:
+    score = 0
+
+    # 1H structure
+    score += 15
+
+    # Strong level
+    score += min(
+        level_points,
+        20
+    )
+
+    # Pre-breakout approach
+    if approach_ok:
+        score += approach_points
+
+    # Compression
+    if compression_ok:
+        score += compression_points
+
+    # Trendline
+    if trendline_ok:
+        score += min(
+            trendline_points,
+            15
+        )
+
+    # Candle pressure
+    if candle_ok:
+        score += candle_points
+
+    # Actual breakout
+    if breakout_ok:
+        score += breakout_points
+
+    # Momentum is confirmation only.
+    if momentum_ok:
+        score += momentum_points
+
+    # Multiple confirmations.
+    confirmations = sum(
+        [
+            approach_ok,
+            compression_ok,
+            trendline_ok,
+            candle_ok,
+            breakout_ok,
+            momentum_ok
+        ]
+    )
+
+    if confirmations >= 3:
         score += 5
 
-    if len(strategies) >= 3:
+    if confirmations >= 4:
         score += 5
 
     # --------------------------------------------------------
-    # VOLUME CONFIRMATION
+    # VOLUME
     # --------------------------------------------------------
+
+    if v_ratio >= 1.15:
+        score += 5
 
     if v_ratio >= 1.25:
-        score += 10
+        score += 5
 
     if v_ratio >= 1.50:
-        score += 3
+        score += 4
 
     if v_ratio >= 2.00:
         score += 4
+
+    # Для чистого pre-breakout допускаем нормальный объём,
+    # потому что максимальный объём может появиться именно
+    # на момент пробоя.
+    if not breakout_ok and v_ratio < 0.75:
+        return None
 
     # --------------------------------------------------------
     # LIQUIDITY
@@ -1802,17 +2278,14 @@ def analyze_symbol(
         return None
 
     if volume_24h >= 1_000_000_000:
-
         score += 5
         liquidity = "HIGH"
 
     elif volume_24h >= 250_000_000:
-
         score += 3
         liquidity = "GOOD"
 
     else:
-
         liquidity = "MEDIUM"
 
     # --------------------------------------------------------
@@ -1824,12 +2297,9 @@ def analyze_symbol(
     )
 
     if oi_value is not None:
-
         oi_status = "AVAILABLE"
         score += 2
-
     else:
-
         oi_status = "N/A"
 
     # --------------------------------------------------------
@@ -1854,6 +2324,9 @@ def analyze_symbol(
 
     # --------------------------------------------------------
     # ENTRY ZONE
+    #
+    # В pre-breakout режиме зона строится вокруг уровня.
+    # Это позволяет каналу получить сигнал заранее.
     # --------------------------------------------------------
 
     zone_pct = clamp(
@@ -1882,9 +2355,7 @@ def analyze_symbol(
     # STRUCTURAL STOP
     # --------------------------------------------------------
 
-    recent_15 = candles_15m[
-        -18:
-    ]
+    recent_15 = candles_15m[-18:]
 
     if len(recent_15) < 10:
         return None
@@ -1901,13 +2372,10 @@ def analyze_symbol(
             - atr_value * 0.25
         )
 
-        if sl >= current:
+        if sl >= level:
             return None
 
-        risk = (
-            current
-            - sl
-        )
+        risk = level - sl
 
     else:
 
@@ -1921,20 +2389,17 @@ def analyze_symbol(
             + atr_value * 0.25
         )
 
-        if sl <= current:
+        if sl <= level:
             return None
 
-        risk = (
-            sl
-            - current
-        )
+        risk = sl - level
 
     if risk <= 0:
         return None
 
     risk_pct = (
         risk
-        / current
+        / level
         * 100.0
     )
 
@@ -1950,15 +2415,19 @@ def analyze_symbol(
 
     if direction == "LONG":
 
-        tp1 = current + risk * 1.0
-        tp2 = current + risk * 2.0
-        tp3 = current + risk * 3.0
+        tp1 = level + risk * 1.0
+        tp2 = level + risk * 2.0
+        tp3 = level + risk * 3.0
 
     else:
 
-        tp1 = current - risk * 1.0
-        tp2 = current - risk * 2.0
-        tp3 = current - risk * 3.0
+        tp1 = level - risk * 1.0
+        tp2 = level - risk * 2.0
+        tp3 = level - risk * 3.0
+
+    # --------------------------------------------------------
+    # FINAL SCORE
+    # --------------------------------------------------------
 
     score = int(
         clamp(
@@ -1970,6 +2439,25 @@ def analyze_symbol(
 
     if score < MIN_SCORE:
         return None
+
+    # --------------------------------------------------------
+    # FINAL REASON
+    # --------------------------------------------------------
+
+    if breakout_ok:
+
+        final_reason = (
+            f"{reason} "
+            f"Пробой уже подтверждён 5M свечой."
+        )
+
+    else:
+
+        final_reason = (
+            f"{reason} "
+            f"Сетап находится непосредственно "
+            f"перед вероятным пробоем."
+        )
 
     return Setup(
         inst_id=inst_id,
@@ -1991,13 +2479,11 @@ def analyze_symbol(
         ),
         oi_status=oi_status,
         level_tf=level_tf,
-        reason=reason,
+        reason=final_reason,
         volume_24h=volume_24h,
         breakout_volume_ratio=v_ratio,
         atr_pct=atr_pct,
-        candles_5m=confirmed_5m[
-            -80:
-        ]
+        candles_5m=confirmed_5m[-80:]
     )
 
 
@@ -2022,9 +2508,7 @@ def can_send_new_signal(
         ORDER BY created_at DESC
         LIMIT 1
         """,
-        (
-            inst_id,
-        )
+        (inst_id,)
     ).fetchone()
 
     if row:
@@ -2034,16 +2518,12 @@ def can_send_new_signal(
         )
 
         if (
-            current
-            - last_time
+            current - last_time
             < COOLDOWN_MINUTES * 60
         ):
             return False
 
-    cutoff = (
-        current
-        - 3600
-    )
+    cutoff = current - 3600
 
     signals_hour[:] = [
         value
@@ -2051,9 +2531,7 @@ def can_send_new_signal(
         if value >= cutoff
     ]
 
-    if len(signals_hour) >= (
-        MAX_SIGNALS_PER_HOUR
-    ):
+    if len(signals_hour) >= MAX_SIGNALS_PER_HOUR:
         return False
 
     return True
@@ -2067,9 +2545,7 @@ def make_chart(
     setup: Setup
 ) -> str:
 
-    candles = setup.candles_5m[
-        -70:
-    ]
+    candles = setup.candles_5m[-70:]
 
     if len(candles) < 10:
         raise RuntimeError(
@@ -2078,14 +2554,8 @@ def make_chart(
 
     safe_coin = (
         setup.coin
-        .replace(
-            "/",
-            "_"
-        )
-        .replace(
-            "\\",
-            "_"
-        )
+        .replace("/", "_")
+        .replace("\\", "_")
     )
 
     path = (
@@ -2095,26 +2565,16 @@ def make_chart(
     )
 
     fig, ax = plt.subplots(
-        figsize=(
-            12,
-            7
-        ),
+        figsize=(12, 7),
         dpi=140
     )
 
-    fig.patch.set_facecolor(
-        "#0b1020"
-    )
-
-    ax.set_facecolor(
-        "#0b1020"
-    )
+    fig.patch.set_facecolor("#0b1020")
+    ax.set_facecolor("#0b1020")
 
     width = 0.65
 
-    for i, candle in enumerate(
-        candles
-    ):
+    for i, candle in enumerate(candles):
 
         color = (
             "#16c784"
@@ -2124,10 +2584,7 @@ def make_chart(
 
         ax.plot(
             [i, i],
-            [
-                candle.low,
-                candle.high
-            ],
+            [candle.low, candle.high],
             color=color,
             linewidth=1.0
         )
@@ -2143,7 +2600,6 @@ def make_chart(
         )
 
         if body_height == 0:
-
             body_height = (
                 candle.close
                 * 0.00001
@@ -2161,11 +2617,8 @@ def make_chart(
             linewidth=0.5
         )
 
-        ax.add_patch(
-            rect
-        )
+        ax.add_patch(rect)
 
-    # LEVEL
     ax.axhline(
         setup.level,
         color="#f5c542",
@@ -2174,7 +2627,6 @@ def make_chart(
         label="LEVEL"
     )
 
-    # ENTRY
     ax.axhspan(
         setup.entry_low,
         setup.entry_high,
@@ -2182,7 +2634,6 @@ def make_chart(
         alpha=0.10
     )
 
-    # SL
     ax.axhline(
         setup.sl,
         color="#ff3b30",
@@ -2191,7 +2642,6 @@ def make_chart(
         label="SL"
     )
 
-    # TP
     for tp in (
         setup.tp1,
         setup.tp2,
@@ -2276,9 +2726,7 @@ def make_chart(
     )
 
     for spine in ax.spines.values():
-        spine.set_color(
-            "#29334d"
-        )
+        spine.set_color("#29334d")
 
     ax.legend(
         facecolor="#111827",
@@ -2294,9 +2742,7 @@ def make_chart(
         bbox_inches="tight"
     )
 
-    plt.close(
-        fig
-    )
+    plt.close(fig)
 
     return path
 
@@ -2318,8 +2764,8 @@ def build_signal_text(
 
         state_line = (
             "🟡 *SETUP READY*\n"
-            "Цена находится в рабочей зоне. "
-            "Не догоняем рынок."
+            "Сильный сетап находится перед уровнем. "
+            "Готовимся к возможному пробою."
         )
 
     elif state == "ACTIVE":
@@ -2336,10 +2782,10 @@ def build_signal_text(
 
     risk = (
         abs(
-            setup.current_price
+            setup.level
             - setup.sl
         )
-        / setup.current_price
+        / setup.level
         * 100
     )
 
@@ -2449,14 +2895,12 @@ def send_photo_and_text(
             "rb"
         ) as photo:
 
-            sent_photo = (
-                bot.send_photo(
-                    CHANNEL_ID,
-                    photo,
-                    caption=caption,
-                    parse_mode="Markdown",
-                    show_caption_above_media=True
-                )
+            sent_photo = bot.send_photo(
+                CHANNEL_ID,
+                photo,
+                caption=caption,
+                parse_mode="Markdown",
+                show_caption_above_media=True
             )
 
         text = build_signal_text(
@@ -2464,12 +2908,10 @@ def send_photo_and_text(
             state
         )
 
-        sent_text = (
-            bot.send_message(
-                CHANNEL_ID,
-                text,
-                parse_mode="Markdown"
-            )
+        sent_text = bot.send_message(
+            CHANNEL_ID,
+            text,
+            parse_mode="Markdown"
         )
 
         log.info(
@@ -2499,9 +2941,7 @@ def send_photo_and_text(
         if chart_path:
 
             try:
-                os.remove(
-                    chart_path
-                )
+                os.remove(chart_path)
             except OSError:
                 pass
 
@@ -2860,7 +3300,6 @@ def reset_daily_counter():
         db.commit()
 
         signals_today = 0
-
         return
 
     if stored[0] != str(
@@ -2891,16 +3330,18 @@ def reset_daily_counter():
 def startup_message():
 
     message = (
-        "🚀 *QUANTUM SCALPER V3 ONLINE*\n\n"
+        "🚀 *QUANTUM SCALPER V4 ONLINE*\n\n"
 
         "OKX: 🟢\n"
         "Telegram: 🟢\n"
         "Scanner: 🟢\n\n"
 
-        "🧠 *STRATEGIES*\n"
-        "• Horizontal Level Breakout\n"
-        "• Trendline Compression Breakout\n"
-        "• Momentum Breakout\n\n"
+        "🧠 *SEARCH MODE*\n"
+        "• Strong Horizontal Level\n"
+        "• Pre-Breakout Pressure\n"
+        "• Trendline Compression\n"
+        "• 5M Confirmation\n"
+        "• Volume Confirmation\n\n"
 
         f"💧 Minimum 24H turnover: "
         f"`$60M`\n"
@@ -2917,6 +3358,7 @@ def startup_message():
         f"📊 Max symbols: "
         f"`{MAX_SYMBOLS}`\n\n"
 
+        "*PRE-BREAKOUT MODE ACTIVE*\n"
         "*Качество важнее количества.*"
     )
 
@@ -2950,7 +3392,6 @@ def scan_market():
     global signals_today
 
     last_scan_ts = now_ts()
-
     scan_count += 1
 
     log.info(
@@ -2974,9 +3415,7 @@ def scan_market():
 
     liquid = []
 
-    for inst_id, data in (
-        tickers.items()
-    ):
+    for inst_id, data in tickers.items():
 
         volume_usd = float(
             data.get(
@@ -2985,9 +3424,7 @@ def scan_market():
             )
         )
 
-        if volume_usd >= (
-            MIN_24H_VOLUME_USD
-        ):
+        if volume_usd >= MIN_24H_VOLUME_USD:
 
             liquid.append(
                 (
@@ -3015,15 +3452,11 @@ def scan_market():
         len(selected)
     )
 
-    # --------------------------------------------------------
-    # DIAGNOSTIC
-    # --------------------------------------------------------
-
     if selected:
 
         top_names = []
 
-        for inst_id, data in selected[:5]:
+        for inst_id, data in selected[:10]:
 
             top_names.append(
                 (
@@ -3037,40 +3470,6 @@ def scan_market():
             " | ".join(top_names)
         )
 
-    else:
-
-        # Это очень важно.
-        # Если вдруг снова 0 — сразу увидим реальную
-        # причину в логах.
-        top_any = sorted(
-            tickers.items(),
-            key=lambda item: item[1].get(
-                "vol24h_usd",
-                0
-            ),
-            reverse=True
-        )[:5]
-
-        if top_any:
-
-            diagnostic = []
-
-            for inst_id, data in top_any:
-
-                diagnostic.append(
-                    (
-                        f"{get_coin(inst_id)}:"
-                        f"${data.get('vol24h_usd', 0) / 1_000_000:.2f}M"
-                    )
-                )
-
-            log.warning(
-                "NO LIQUID SYMBOLS | TOP=%s",
-                " | ".join(
-                    diagnostic
-                )
-            )
-
     # --------------------------------------------------------
     # ANALYSIS
     # --------------------------------------------------------
@@ -3083,7 +3482,7 @@ def scan_market():
                 ticker["last"]
             )
 
-            # Existing READY first.
+            # Сначала проверяем старые READY.
             check_activation(
                 inst_id,
                 current_price
@@ -3133,11 +3532,19 @@ def scan_market():
             log.info(
                 "CANDIDATE | %s | %s | "
                 "%s | score=%s | "
+                "level=%s | distance=%.3f%% | "
                 "volume=$%.1fM",
                 setup.coin,
                 setup.direction,
                 setup.strategy,
                 setup.score,
+                fmt_price(setup.level),
+                abs(
+                    pct(
+                        setup.current_price,
+                        setup.level
+                    )
+                ),
                 setup.volume_24h / 1_000_000
             )
 
@@ -3190,9 +3597,10 @@ def scan_market():
 
             log.info(
                 "READY CREATED | %s | "
-                "score=%s",
+                "score=%s | strategy=%s",
                 setup.coin,
-                setup.score
+                setup.score,
+                setup.strategy
             )
 
             time.sleep(
@@ -3201,8 +3609,6 @@ def scan_market():
 
         except Exception as exc:
 
-            # Одна монета никогда не должна
-            # остановить весь сканер.
             log.exception(
                 "SYMBOL ERROR | %s | %s",
                 inst_id,
@@ -3252,7 +3658,7 @@ def main():
     )
 
     log.info(
-        "QUANTUM SCALPER V3 STARTING"
+        "QUANTUM SCALPER V4 STARTING"
     )
 
     log.info(
@@ -3283,6 +3689,11 @@ def main():
     log.info(
         "COOLDOWN=%s min",
         COOLDOWN_MINUTES
+    )
+
+    log.info(
+        "PREBREAK_DISTANCE=%s%%",
+        MAX_PREBREAK_DISTANCE_PCT
     )
 
     log.info(

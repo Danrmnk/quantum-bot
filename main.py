@@ -19,18 +19,18 @@ from matplotlib.patches import Rectangle
 # ============================================================
 # QUANTUM SCALPER V4
 #
-# PRE-BREAKOUT PROFESSIONAL SCANNER
+# ПРОФЕССИОНАЛЬНЫЙ СКАНЕР ПРЕДПРОБОЙНОЙ СИТУАЦИИ
 #
 # OKX PUBLIC MARKET DATA
-# -> LIQUIDITY
-# -> 1H STRUCTURE
-# -> STRONG HORIZONTAL LEVEL
-# -> REAL TRENDLINE / COMPRESSION
-# -> PRE-BREAKOUT PRESSURE
-# -> 5M CONFIRMATION
-# -> VOLUME
-# -> READY BEFORE BREAKOUT
-# -> ENTRY ACTIVE
+# -> ЛИКВИДНОСТЬ
+# -> СТРУКТУРА 1H
+# -> СИЛЬНЫЙ ГОРИЗОНТАЛЬНЫЙ УРОВЕНЬ
+# -> НАКЛОННАЯ СТРУКТУРА / СЖАТИЕ
+# -> ДАВЛЕНИЕ ПЕРЕД ПРОБОЕМ
+# -> ПОДТВЕРЖДЕНИЕ 5M
+# -> ОБЪЁМ
+# -> ГОТОВНОСТЬ ДО ПРОБОЯ
+# -> АКТИВНЫЙ ВХОД
 #
 # НЕ ТОРГУЕТ.
 # Только анализирует рынок и публикует сигналы.
@@ -73,8 +73,6 @@ MIN_24H_VOLUME_USD = float(
     )
 )
 
-# Было 35.
-# Расширяем поиск хороших сетапов по рынку.
 MAX_SYMBOLS = int(
     os.getenv(
         "MAX_SYMBOLS",
@@ -108,7 +106,6 @@ READY_TTL_MINUTES = int(
     )
 )
 
-# Максимальное расстояние от уровня для раннего READY.
 MAX_PREBREAK_DISTANCE_PCT = float(
     os.getenv(
         "MAX_PREBREAK_DISTANCE_PCT",
@@ -116,7 +113,6 @@ MAX_PREBREAK_DISTANCE_PCT = float(
     )
 )
 
-# Максимальное удаление цены после пробоя.
 MAX_CHASE_PCT = float(
     os.getenv(
         "MAX_CHASE_PCT",
@@ -425,15 +421,15 @@ def grade_volume(
 ) -> str:
 
     if ratio >= 2.0:
-        return "VERY HIGH"
+        return "ОЧЕНЬ ВЫСОКИЙ"
 
     if ratio >= 1.5:
-        return "HIGH"
+        return "ВЫСОКИЙ"
 
     if ratio >= 1.25:
-        return "GOOD"
+        return "ХОРОШИЙ"
 
-    return "NORMAL"
+    return "НОРМАЛЬНЫЙ"
 
 
 def score_label(
@@ -441,15 +437,84 @@ def score_label(
 ) -> str:
 
     if score >= 95:
-        return "🚀 ELITE"
+        return "🚀 ЭЛИТНЫЙ СЕТАП"
 
     if score >= 90:
-        return "🔥 PREMIUM"
+        return "🔥 ПРЕМИУМ СЕТАП"
 
     if score >= 85:
-        return "💎 STRONG"
+        return "💎 СИЛЬНЫЙ СЕТАП"
 
-    return "⚡ SIGNAL"
+    return "⚡ ХОРОШИЙ СЕТАП"
+
+
+def direction_label(
+    direction: str
+) -> str:
+
+    if direction == "LONG":
+        return "ЛОНГ 🟢"
+
+    return "ШОРТ 🔴"
+
+
+def liquidity_label(
+    liquidity: str
+) -> str:
+
+    mapping = {
+        "HIGH": "ВЫСОКАЯ",
+        "GOOD": "ХОРОШАЯ",
+        "MEDIUM": "СРЕДНЯЯ"
+    }
+
+    return mapping.get(
+        liquidity,
+        liquidity
+    )
+
+
+def oi_label(
+    oi_status: str
+) -> str:
+
+    if oi_status == "AVAILABLE":
+        return "ДОСТУПЕН"
+
+    return "НЕТ ДАННЫХ"
+
+
+def strategy_label(
+    strategy: str
+) -> str:
+
+    mapping = {
+        "Horizontal Level Breakout":
+            "ПРОБОЙ ГОРИЗОНТАЛЬНОГО УРОВНЯ",
+
+        "Trendline Compression Breakout":
+            "ПРОБОЙ НАКЛОННОЙ СТРУКТУРЫ"
+    }
+
+    return mapping.get(
+        strategy,
+        strategy
+    )
+
+
+def level_tf_label(
+    level_tf: str
+) -> str:
+
+    mapping = {
+        "1H": "1 ЧАС",
+        "15M": "15 МИНУТ"
+    }
+
+    return mapping.get(
+        level_tf,
+        level_tf
+    )
 
 
 # ============================================================
@@ -1093,10 +1158,6 @@ def nearest_level(
 
     candidates = []
 
-    # --------------------------------------------------------
-    # 1H / APPROX 1D LEVELS
-    # --------------------------------------------------------
-
     if len(candles_1h) >= 40:
 
         window = candles_1h[-35:-1]
@@ -1185,10 +1246,6 @@ def nearest_level(
                         )
                     )
 
-    # --------------------------------------------------------
-    # 15M LEVELS
-    # --------------------------------------------------------
-
     highs = pivot_highs(
         candles_15m,
         2,
@@ -1276,8 +1333,6 @@ def nearest_level(
     if not candidates:
         return None, "", 0, 0
 
-    # Сначала качество уровня,
-    # затем близость.
     candidates.sort(
         key=lambda x: (
             x[2],
@@ -1320,11 +1375,6 @@ def approach_quality(
 
     if direction == "LONG":
 
-        highs = [
-            c.high
-            for c in recent
-        ]
-
         lows = [
             c.low
             for c in recent
@@ -1340,15 +1390,6 @@ def approach_quality(
 
         if distance_end < distance_start:
             score += 8
-
-        if all(
-            lows[i] <= lows[i + 1]
-            for i in range(
-                len(lows) - 3,
-                len(lows) - 1
-            )
-        ):
-            pass
 
         rising_lows = (
             lows[-1] > lows[-4]
@@ -1603,7 +1644,6 @@ def detect_trendline_pressure(
         ):
             return False, 0, ""
 
-        # Проверяем, что наклон не случайный.
         slope1 = (
             values[1]
             - values[0]
@@ -1932,7 +1972,7 @@ def detect_momentum(
     return (
         True,
         8,
-        "5M momentum подтверждает направление "
+        "5M импульс подтверждает направление "
         "движения."
     )
 
@@ -1986,10 +2026,6 @@ def analyze_symbol(
 
     direction = trend
 
-    # --------------------------------------------------------
-    # STRONG LEVEL
-    # --------------------------------------------------------
-
     (
         level,
         level_tf,
@@ -2015,19 +2051,11 @@ def analyze_symbol(
     if distance > MAX_PREBREAK_DISTANCE_PCT:
         return None
 
-    # Слишком далёкий уровень нам не нужен.
-    # Слишком близкий тоже может означать уже начавшийся пробой.
     if distance < 0.03:
         return None
 
-    # Сильный уровень должен иметь хотя бы минимальное
-    # количество подтверждений.
     if reactions < 2:
         return None
-
-    # --------------------------------------------------------
-    # ATR
-    # --------------------------------------------------------
 
     atr_value = atr(
         confirmed_5m,
@@ -2049,18 +2077,10 @@ def analyze_symbol(
     if atr_pct > 2.5:
         return None
 
-    # --------------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------------
-
     v_ratio = volume_ratio(
         confirmed_5m,
         20
     )
-
-    # --------------------------------------------------------
-    # PRE-BREAKOUT STRUCTURE
-    # --------------------------------------------------------
 
     approach_points, approach_ok, approach_reason = (
         approach_quality(
@@ -2092,10 +2112,6 @@ def analyze_symbol(
         )
     )
 
-    # --------------------------------------------------------
-    # ACTUAL BREAKOUT CHECK
-    # --------------------------------------------------------
-
     breakout_ok, breakout_points, breakout_reason = (
         detect_real_breakout(
             confirmed_5m,
@@ -2104,25 +2120,12 @@ def analyze_symbol(
         )
     )
 
-    # --------------------------------------------------------
-    # MOMENTUM
-    # --------------------------------------------------------
-
     momentum_ok, momentum_points, momentum_reason = (
         detect_momentum(
             confirmed_5m,
             direction
         )
     )
-
-    # --------------------------------------------------------
-    # STRATEGY SELECTION
-    #
-    # IMPORTANT:
-    # READY может быть ДО пробоя.
-    # Но обязательно должна существовать
-    # качественная pre-breakout структура.
-    # --------------------------------------------------------
 
     strategy_candidates = []
 
@@ -2160,8 +2163,6 @@ def analyze_symbol(
             )
         )
 
-    # После фактического пробоя разрешаем
-    # отдельный сильный вариант.
     if breakout_ok:
 
         strategy_candidates.append(
@@ -2184,49 +2185,36 @@ def analyze_symbol(
         strategy_candidates[0]
     )
 
-    # --------------------------------------------------------
-    # SCORE
-    # --------------------------------------------------------
-
     score = 0
 
-    # 1H structure
     score += 15
 
-    # Strong level
     score += min(
         level_points,
         20
     )
 
-    # Pre-breakout approach
     if approach_ok:
         score += approach_points
 
-    # Compression
     if compression_ok:
         score += compression_points
 
-    # Trendline
     if trendline_ok:
         score += min(
             trendline_points,
             15
         )
 
-    # Candle pressure
     if candle_ok:
         score += candle_points
 
-    # Actual breakout
     if breakout_ok:
         score += breakout_points
 
-    # Momentum is confirmation only.
     if momentum_ok:
         score += momentum_points
 
-    # Multiple confirmations.
     confirmations = sum(
         [
             approach_ok,
@@ -2244,10 +2232,6 @@ def analyze_symbol(
     if confirmations >= 4:
         score += 5
 
-    # --------------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------------
-
     if v_ratio >= 1.15:
         score += 5
 
@@ -2260,15 +2244,8 @@ def analyze_symbol(
     if v_ratio >= 2.00:
         score += 4
 
-    # Для чистого pre-breakout допускаем нормальный объём,
-    # потому что максимальный объём может появиться именно
-    # на момент пробоя.
     if not breakout_ok and v_ratio < 0.75:
         return None
-
-    # --------------------------------------------------------
-    # LIQUIDITY
-    # --------------------------------------------------------
 
     volume_24h = float(
         ticker["vol24h_usd"]
@@ -2288,10 +2265,6 @@ def analyze_symbol(
     else:
         liquidity = "MEDIUM"
 
-    # --------------------------------------------------------
-    # OI
-    # --------------------------------------------------------
-
     oi_value = get_open_interest(
         inst_id
     )
@@ -2301,10 +2274,6 @@ def analyze_symbol(
         score += 2
     else:
         oi_status = "N/A"
-
-    # --------------------------------------------------------
-    # CHASE PROTECTION
-    # --------------------------------------------------------
 
     if direction == "LONG":
 
@@ -2321,13 +2290,6 @@ def analyze_symbol(
             - MAX_CHASE_PCT / 100.0
         ):
             return None
-
-    # --------------------------------------------------------
-    # ENTRY ZONE
-    #
-    # В pre-breakout режиме зона строится вокруг уровня.
-    # Это позволяет каналу получить сигнал заранее.
-    # --------------------------------------------------------
 
     zone_pct = clamp(
         atr_pct * 0.35,
@@ -2350,10 +2312,6 @@ def analyze_symbol(
             + zone_pct / 100.0
         )
     )
-
-    # --------------------------------------------------------
-    # STRUCTURAL STOP
-    # --------------------------------------------------------
 
     recent_15 = candles_15m[-18:]
 
@@ -2409,10 +2367,6 @@ def analyze_symbol(
     if risk_pct > 1.80:
         return None
 
-    # --------------------------------------------------------
-    # TAKE PROFITS
-    # --------------------------------------------------------
-
     if direction == "LONG":
 
         tp1 = level + risk * 1.0
@@ -2425,10 +2379,6 @@ def analyze_symbol(
         tp2 = level - risk * 2.0
         tp3 = level - risk * 3.0
 
-    # --------------------------------------------------------
-    # FINAL SCORE
-    # --------------------------------------------------------
-
     score = int(
         clamp(
             score,
@@ -2440,15 +2390,11 @@ def analyze_symbol(
     if score < MIN_SCORE:
         return None
 
-    # --------------------------------------------------------
-    # FINAL REASON
-    # --------------------------------------------------------
-
     if breakout_ok:
 
         final_reason = (
             f"{reason} "
-            f"Пробой уже подтверждён 5M свечой."
+            f"Пробой уже подтверждён закрытием свечи 5M."
         )
 
     else:
@@ -2624,7 +2570,7 @@ def make_chart(
         color="#f5c542",
         linewidth=2.0,
         linestyle="--",
-        label="LEVEL"
+        label="УРОВЕНЬ"
     )
 
     ax.axhspan(
@@ -2639,7 +2585,7 @@ def make_chart(
         color="#ff3b30",
         linewidth=1.7,
         linestyle="-.",
-        label="SL"
+        label="СТОП"
     )
 
     for tp in (
@@ -2659,7 +2605,7 @@ def make_chart(
     ax.text(
         last_x,
         setup.level,
-        " LEVEL",
+        " УРОВЕНЬ",
         color="#f5c542",
         va="bottom",
         fontsize=10,
@@ -2669,7 +2615,7 @@ def make_chart(
     ax.text(
         last_x,
         setup.sl,
-        " SL",
+        " СТОП",
         color="#ff3b30",
         va="bottom",
         fontsize=10,
@@ -2679,7 +2625,7 @@ def make_chart(
     ax.text(
         last_x,
         setup.tp1,
-        " TP1",
+        " ЦЕЛЬ 1",
         color="#ffd166",
         va="bottom",
         fontsize=9
@@ -2688,7 +2634,7 @@ def make_chart(
     ax.text(
         last_x,
         setup.tp2,
-        " TP2",
+        " ЦЕЛЬ 2",
         color="#ffd166",
         va="bottom",
         fontsize=9
@@ -2697,7 +2643,7 @@ def make_chart(
     ax.text(
         last_x,
         setup.tp3,
-        " TP3",
+        " ЦЕЛЬ 3",
         color="#ffd166",
         va="bottom",
         fontsize=9
@@ -2706,9 +2652,9 @@ def make_chart(
     ax.set_title(
         (
             f"{setup.coin}USDT | "
-            f"{setup.direction} | "
-            f"{setup.strategy}\n"
-            f"Score {setup.score}/100 | 5M"
+            f"{direction_label(setup.direction)} | "
+            f"{strategy_label(setup.strategy)}\n"
+            f"Оценка {setup.score}/100 | 5 минут"
         ),
         color="white",
         fontsize=15,
@@ -2763,17 +2709,18 @@ def build_signal_text(
     if state == "READY":
 
         state_line = (
-            "🟡 *SETUP READY*\n"
-            "Сильный сетап находится перед уровнем. "
-            "Готовимся к возможному пробою."
+            "🟡 *СЕТАП ГОТОВ*\n"
+            "Цена находится непосредственно перед "
+            "ключевым уровнем. Формируется ситуация "
+            "для возможного пробоя."
         )
 
     elif state == "ACTIVE":
 
         state_line = (
-            "🟢 *ENTRY ACTIVE*\n"
-            "Триггер выполнен. "
-            "Рабочая зона активна."
+            "🟢 *ВХОД АКТИВИРОВАН*\n"
+            "Цена пересекла ключевой уровень. "
+            "Сценарий перешёл из ожидания в активную фазу."
         )
 
     else:
@@ -2794,71 +2741,94 @@ def build_signal_text(
         / 1_000_000
     )
 
+    direction = direction_label(
+        setup.direction
+    )
+
+    strategy = strategy_label(
+        setup.strategy
+    )
+
+    level_tf = level_tf_label(
+        setup.level_tf
+    )
+
+    liquidity = liquidity_label(
+        setup.liquidity
+    )
+
+    oi = oi_label(
+        setup.oi_status
+    )
+
     return (
         f"🔥 *{setup.coin}USDT — "
-        f"{setup.direction}*\n\n"
+        f"{direction}*\n\n"
 
-        f"💰 *Цена:* "
+        f"💰 *Текущая цена:* "
         f"`{fmt_price(setup.current_price)}`\n"
 
-        f"📊 *24H оборот:* "
-        f"${volume_m:,.1f}M\n"
+        f"📊 *Оборот за 24 часа:* "
+        f"${volume_m:,.1f} млн\n"
 
-        f"📈 *Volume confirmation:* "
+        f"📈 *Подтверждение объёмом:* "
         f"`{setup.breakout_volume_ratio:.2f}x`\n\n"
 
         f"{state_line}\n\n"
 
-        f"🧠 *ЛОГИКА СДЕЛКИ*\n"
+        f"🧠 *ПОЧЕМУ СЕТАП ИНТЕРЕСЕН*\n"
         f"{setup.reason}\n\n"
 
-        f"🎯 *ТОЧКА ВХОДА*\n"
+        f"🎯 *ЗОНА ВХОДА*\n"
         f"`{fmt_price(setup.entry_low)}` – "
         f"`{fmt_price(setup.entry_high)}`\n\n"
 
-        f"🛑 *STOP LOSS*\n"
+        f"🛑 *СТОП-ЛОСС*\n"
         f"`{fmt_price(setup.sl)}`\n"
-        f"Риск: `−{risk:.2f}%`\n\n"
+        f"Риск от уровня: `−{risk:.2f}%`\n\n"
 
-        f"🪜 *ЗАКРЫТИЕ ЛЕСЕНКОЙ*\n"
+        f"🪜 *ФИКСАЦИЯ ПОЗИЦИИ ЧАСТЯМИ*\n\n"
 
-        f"TP1 — 30%\n"
+        f"1️⃣ *Цель 1 — 30%*\n"
         f"`{fmt_price(setup.tp1)}`\n\n"
 
-        f"TP2 — 30%\n"
+        f"2️⃣ *Цель 2 — 30%*\n"
         f"`{fmt_price(setup.tp2)}`\n\n"
 
-        f"TP3 — 40%\n"
+        f"3️⃣ *Цель 3 — 40%*\n"
         f"`{fmt_price(setup.tp3)}`\n\n"
 
-        f"🔒 После TP1 → SL в BE\n\n"
+        f"🔒 *После достижения первой цели:* "
+        f"перевести стоп-лосс в безубыток.\n\n"
 
-        f"📊 *Стратегия:*\n"
-        f"`{setup.strategy}`\n\n"
+        f"📊 *СТРАТЕГИЯ*\n"
+        f"`{strategy}`\n\n"
 
-        f"📍 *Основной уровень:*\n"
-        f"`{setup.level_tf}` — "
+        f"📍 *КЛЮЧЕВОЙ УРОВЕНЬ*\n"
+        f"`{level_tf}` — "
         f"`{fmt_price(setup.level)}`\n\n"
 
         f"💧 *Ликвидность:* "
-        f"`{setup.liquidity}`\n"
+        f"`{liquidity}`\n"
 
-        f"📦 *Volume grade:* "
+        f"📦 *Качество объёма:* "
         f"`{setup.volume_grade}`\n"
 
-        f"⚡ *OI:* "
-        f"`{setup.oi_status}`\n\n"
+        f"⚡ *Открытый интерес:* "
+        f"`{oi}`\n\n"
 
-        f"⭐ *SIGNAL SCORE:* "
+        f"⭐ *ОБЩАЯ ОЦЕНКА СЕТАПА:* "
         f"`{setup.score}/100` "
         f"{label}\n\n"
 
-        f"⏱ *READY действует:* "
+        f"⏱ *Время действия сетапа:* "
         f"`{READY_TTL_MINUTES} мин`\n\n"
 
-        f"⚠️ *Соблюдаем управление риском.*\n"
-        f"Не догоняем рынок и не входим после "
-        f"сильного движения.\n"
+        f"⚠️ *ВАЖНО*\n"
+        f"Не догоняем цену после резкого движения.\n"
+        f"Не увеличиваем риск ради одной сделки.\n"
+        f"Если структура ломается — сценарий отменяется.\n\n"
+
         f"*Качество важнее количества.*"
     )
 
@@ -2885,9 +2855,9 @@ def send_photo_and_text(
 
         caption = (
             f"🔥 *{setup.coin}USDT — "
-            f"{setup.direction}*\n"
+            f"{direction_label(setup.direction)}*\n"
             f"{score_label(setup.score)} · "
-            f"{setup.strategy}"
+            f"{strategy_label(setup.strategy)}"
         )
 
         with open(
@@ -3106,9 +3076,10 @@ def expire_old_ready():
             bot.send_message(
                 CHANNEL_ID,
                 (
-                    f"🔴 *SETUP EXPIRED — "
+                    f"🔴 *СЕТАП ОТМЕНЁН — "
                     f"{setup.coin}USDT*\n\n"
-                    f"Цена не дала своевременный вход.\n"
+                    f"Цена не дала своевременный вход "
+                    f"в течение отведённого времени.\n\n"
                     f"*Рынок не догоняем.*"
                 ),
                 parse_mode="Markdown"
@@ -3205,28 +3176,34 @@ def check_activation(
         bot.send_message(
             CHANNEL_ID,
             (
-                f"🟢 *ENTRY ACTIVE — "
+                f"🟢 *ВХОД АКТИВИРОВАН — "
                 f"{setup.coin}USDT "
-                f"{setup.direction}*\n\n"
+                f"{direction_label(setup.direction)}*\n\n"
 
-                f"Цена пересекла уровень "
+                f"Цена пересекла ключевой уровень "
                 f"`{fmt_price(setup.level)}`.\n\n"
 
-                f"Рабочая зона:\n"
+                f"🎯 *Рабочая зона:*\n"
                 f"`{fmt_price(setup.entry_low)}` – "
                 f"`{fmt_price(setup.entry_high)}`\n\n"
 
-                f"🛑 SL: "
-                f"`{fmt_price(setup.sl)}`\n"
+                f"🛑 *Стоп-лосс:* "
+                f"`{fmt_price(setup.sl)}`\n\n"
 
-                f"🎯 TP1: "
+                f"1️⃣ *Цель 1:* "
                 f"`{fmt_price(setup.tp1)}`\n"
 
-                f"🎯 TP2: "
+                f"2️⃣ *Цель 2:* "
                 f"`{fmt_price(setup.tp2)}`\n"
 
-                f"🏆 TP3: "
-                f"`{fmt_price(setup.tp3)}`"
+                f"3️⃣ *Цель 3:* "
+                f"`{fmt_price(setup.tp3)}`\n\n"
+
+                f"🔒 После первой цели "
+                f"стоп переводится в безубыток.\n\n"
+
+                f"⚠️ Не догоняем цену "
+                f"после резкого движения."
             ),
             parse_mode="Markdown"
         )
@@ -3330,35 +3307,35 @@ def reset_daily_counter():
 def startup_message():
 
     message = (
-        "🚀 *QUANTUM SCALPER V4 ONLINE*\n\n"
+        "🚀 *QUANTUM SCALPER V4 ЗАПУЩЕН*\n\n"
 
         "OKX: 🟢\n"
         "Telegram: 🟢\n"
-        "Scanner: 🟢\n\n"
+        "Сканер: 🟢\n\n"
 
-        "🧠 *SEARCH MODE*\n"
-        "• Strong Horizontal Level\n"
-        "• Pre-Breakout Pressure\n"
-        "• Trendline Compression\n"
-        "• 5M Confirmation\n"
-        "• Volume Confirmation\n\n"
+        "🧠 *РЕЖИМ ПОИСКА*\n"
+        "• Сильный горизонтальный уровень\n"
+        "• Давление перед пробоем\n"
+        "• Наклонная структура и сжатие\n"
+        "• Подтверждение на 5 минутах\n"
+        "• Подтверждение объёмом\n\n"
 
-        f"💧 Minimum 24H turnover: "
+        f"💧 Минимальный оборот за 24 часа: "
         f"`$60M`\n"
 
-        f"⭐ Minimum Score: "
+        f"⭐ Минимальная оценка: "
         f"`{MIN_SCORE}/100`\n"
 
-        f"⏱ READY TTL: "
-        f"`{READY_TTL_MINUTES} min`\n"
+        f"⏱ Время действия сетапа: "
+        f"`{READY_TTL_MINUTES} мин`\n"
 
-        f"🔒 Cooldown: "
-        f"`{COOLDOWN_MINUTES} min`\n"
+        f"🔒 Перерыв между сигналами: "
+        f"`{COOLDOWN_MINUTES} мин`\n"
 
-        f"📊 Max symbols: "
+        f"📊 Максимум инструментов: "
         f"`{MAX_SYMBOLS}`\n\n"
 
-        "*PRE-BREAKOUT MODE ACTIVE*\n"
+        "*РЕЖИМ ПОИСКА ПЕРЕД ПРОБОЕМ АКТИВЕН*\n"
         "*Качество важнее количества.*"
     )
 
@@ -3403,15 +3380,7 @@ def scan_market():
         scan_count
     )
 
-    # --------------------------------------------------------
-    # TICKERS
-    # --------------------------------------------------------
-
     tickers = get_tickers()
-
-    # --------------------------------------------------------
-    # LIQUIDITY
-    # --------------------------------------------------------
 
     liquid = []
 
@@ -3470,10 +3439,6 @@ def scan_market():
             " | ".join(top_names)
         )
 
-    # --------------------------------------------------------
-    # ANALYSIS
-    # --------------------------------------------------------
-
     for inst_id, ticker in selected:
 
         try:
@@ -3482,7 +3447,6 @@ def scan_market():
                 ticker["last"]
             )
 
-            # Сначала проверяем старые READY.
             check_activation(
                 inst_id,
                 current_price
@@ -3495,10 +3459,6 @@ def scan_market():
                 inst_id
             ):
                 continue
-
-            # ------------------------------------------------
-            # CANDLES
-            # ------------------------------------------------
 
             candles_1h = get_candles(
                 inst_id,
@@ -3547,10 +3507,6 @@ def scan_market():
                 ),
                 setup.volume_24h / 1_000_000
             )
-
-            # ------------------------------------------------
-            # TELEGRAM
-            # ------------------------------------------------
 
             photo_id, text_id = (
                 send_photo_and_text(
@@ -3705,15 +3661,7 @@ def main():
         "=================================================="
     )
 
-    # --------------------------------------------------------
-    # TELEGRAM TEST
-    # --------------------------------------------------------
-
     startup_message()
-
-    # --------------------------------------------------------
-    # OKX TEST
-    # --------------------------------------------------------
 
     try:
 
@@ -3750,10 +3698,6 @@ def main():
         log.exception(
             "INITIAL OKX CONNECTION FAILED"
         )
-
-    # --------------------------------------------------------
-    # MAIN LOOP
-    # --------------------------------------------------------
 
     while True:
 

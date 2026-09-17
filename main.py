@@ -1,4 +1,6 @@
 import os
+import html
+import re
 import time
 import logging
 import sqlite3
@@ -87,28 +89,27 @@ TIMEZONE = os.getenv(
 MIN_24H_VOLUME_USD = float(
     os.getenv(
         "MIN_24H_VOLUME_USD",
-        "30000000"
+        "60000000"
     )
 )
 
-# Максимум монет для глубокой обработки.
-# В отличие от V3 это НЕ означает:
-# "берём только эти монеты и забываем остальные".
-#
-# Сначала рынок проходит быстрый фильтр,
-# затем наиболее интересные кандидаты анализируются глубже.
+# Ограничение глубокой обработки.
+# 0 = без искусственного лимита: после фильтра $60M+
+# бот анализирует ВСЕ доступные ликвидные USDT-инструменты.
+# Переменные оставлены для совместимости с окружением.
 MAX_SYMBOLS = int(
     os.getenv(
         "MAX_SYMBOLS",
-        "80"
+        "0"
     )
 )
 
-# Максимум кандидатов после первого быстрого фильтра.
+# Ограничение кандидатов после быстрого фильтра.
+# 0 = без ограничения.
 MAX_CANDIDATES = int(
     os.getenv(
         "MAX_CANDIDATES",
-        "45"
+        "0"
     )
 )
 
@@ -116,7 +117,7 @@ MAX_CANDIDATES = int(
 MIN_CANDIDATE_VOLUME_USD = float(
     os.getenv(
         "MIN_CANDIDATE_VOLUME_USD",
-        "30000000"
+        "60000000"
     )
 )
 
@@ -199,12 +200,10 @@ MAX_SIGNALS_PER_DAY = int(
 # SCANNER
 # ============================================================
 
-SCAN_INTERVAL_SECONDS = int(
-    os.getenv(
-        "SCAN_INTERVAL_SECONDS",
-        "20"
-    )
-)
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "20"))
+FAST_PASS_SECONDS = int(os.getenv("FAST_PASS_SECONDS", "60"))
+DEEP_CANDIDATES = int(os.getenv("DEEP_CANDIDATES", "40"))
+FINAL_SIGNAL_CANDIDATES = int(os.getenv("FINAL_SIGNAL_CANDIDATES", "10"))
 
 HTTP_TIMEOUT = int(
     os.getenv(
@@ -293,7 +292,7 @@ log = logging.getLogger(
 
 bot = telebot.TeleBot(
     TELEGRAM_TOKEN,
-    parse_mode="Markdown"
+    parse_mode="HTML"
 )
 
 
@@ -346,7 +345,53 @@ CREATE TABLE IF NOT EXISTS bot_state (
 )
 """)
 
+db.execute("""
+CREATE TABLE IF NOT EXISTS market_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inst_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    pattern TEXT NOT NULL DEFAULT '',
+    volume_ratio REAL DEFAULT 0,
+    oi_change_pct REAL,
+    funding_rate REAL,
+    result TEXT DEFAULT '',
+    r_multiple REAL DEFAULT 0,
+    created_at REAL NOT NULL
+)
+""")
+
 db.commit()
+
+
+# ============================================================
+# DATABASE MIGRATIONS
+# ============================================================
+
+def ensure_column(table: str, column: str, definition: str):
+    cols = {
+        row[1]
+        for row in db.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in cols:
+        db.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        )
+        db.commit()
+
+
+# Result tracking / exactly-once public notification state.
+for _column, _definition in (
+    ("tp1_hit", "INTEGER NOT NULL DEFAULT 0"),
+    ("tp2_hit", "INTEGER NOT NULL DEFAULT 0"),
+    ("tp3_hit", "INTEGER NOT NULL DEFAULT 0"),
+    ("result", "TEXT"),
+    ("result_r", "REAL"),
+    ("closed_at", "REAL"),
+    ("be_hit", "INTEGER NOT NULL DEFAULT 0"),
+    ("result_notified", "INTEGER NOT NULL DEFAULT 0"),
+):
+    ensure_column("signals", _column, _definition)
 
 
 # ============================================================
@@ -447,6 +492,8 @@ ready_setups: Dict[
 signals_hour: List[float] = []
 
 last_scan_ts = 0.0
+last_fast_pass_ts = 0.0
+watchlist = []
 
 scan_count = 0
 
@@ -1086,6 +1133,64 @@ def get_open_interest(
         )
 
     return None
+
+
+# ============================================================
+# DERIVATIVES CONTEXT
+# ============================================================
+
+oi_cache: Dict[str, Tuple[float, float]] = {}
+
+
+def get_open_interest_context(inst_id: str) -> Tuple[Optional[float], Optional[float]]:
+    current = get_open_interest(inst_id)
+    if current is None:
+        return None, None
+    ts = now_ts()
+    previous = oi_cache.get(inst_id)
+    oi_cache[inst_id] = (ts, current)
+    if previous is None:
+        return current, None
+    prev_ts, prev_value = previous
+    if ts - prev_ts < 120 or prev_value <= 0:
+        return current, None
+    return current, (current - prev_value) / prev_value * 100.0
+
+
+def get_funding_rate(inst_id: str) -> Optional[float]:
+    try:
+        payload = okx_get("/api/v5/public/funding-rate", {"instId": inst_id})
+        data = payload.get("data", [])
+        if not data:
+            return None
+        value = data[0].get("fundingRate")
+        return float(value) if value not in (None, "") else None
+    except Exception as exc:
+        log.warning("FUNDING FAILED | %s | %s", inst_id, exc)
+        return None
+
+
+def derivatives_context_score(direction, price_change_pct, oi_change_pct, funding_rate):
+    points = 0
+    parts = []
+    if oi_change_pct is not None:
+        if direction == "LONG" and price_change_pct > 0 and oi_change_pct > 0:
+            points += 5
+            parts.append("цена↑ + OI↑")
+        elif direction == "SHORT" and price_change_pct < 0 and oi_change_pct > 0:
+            points += 5
+            parts.append("цена↓ + OI↑")
+        elif oi_change_pct < 0:
+            points += 1
+            parts.append("OI снижается")
+    if funding_rate is not None:
+        if abs(funding_rate) >= 0.0008:
+            points -= 3
+            parts.append("экстремальный funding")
+        elif abs(funding_rate) <= 0.0002:
+            points += 2
+            parts.append("умеренный funding")
+    return int(clamp(points, -3, 7)), ", ".join(parts)
 
 
 # ============================================================
@@ -3408,6 +3513,31 @@ def make_chart(
 
 
 # ============================================================
+# TELEGRAM HTML SAFETY
+# ============================================================
+
+def telegram_html(message: str) -> str:
+    """
+    Convert the bot's legacy Markdown-like markup to Telegram HTML.
+    Dynamic market values are escaped so coin/strategy names cannot
+    break Telegram entity parsing.
+    """
+    if not message:
+        return ""
+
+    # Escape first, then restore only our intentional formatting tokens.
+    s = html.escape(str(message), quote=False)
+
+    # Bold
+    s = re.sub(r"\*([^*\n]+)\*", r"<b>\1</b>", s)
+
+    # Inline code
+    s = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", s)
+
+    # Telegram/HTML accepts ordinary emoji and text.
+    return s
+
+# ============================================================
 # TELEGRAM SIGNAL
 # ============================================================
 
@@ -3427,9 +3557,8 @@ def build_signal_text(
     elif state == "ACTIVE":
 
         state_line = (
-            "🟢 *ENTRY ACTIVE*\n"
-            "Уровень подтверждён. "
-            "Сделка активирована."
+            "🟡 *SETUP READY*\n"
+            "Подтверждение контролируется системой."
         )
 
     else:
@@ -3519,6 +3648,26 @@ def build_signal_text(
 
 
 # ============================================================
+# TELEGRAM REACTION
+# ============================================================
+
+def add_signal_reactions(message_id: Optional[int]):
+    if not message_id:
+        return
+    try:
+        reaction_type = getattr(telebot.types, "ReactionTypeEmoji", None)
+        if reaction_type is None:
+            return
+        bot.set_message_reaction(
+            CHANNEL_ID,
+            message_id,
+            reaction=[reaction_type("🔥")]
+        )
+    except Exception as exc:
+        log.debug("REACTION NOT SET | %s", exc)
+
+
+# ============================================================
 # SEND PHOTO + TEXT
 # ============================================================
 
@@ -3553,8 +3702,8 @@ def send_photo_and_text(
                 bot.send_photo(
                     CHANNEL_ID,
                     photo,
-                    caption=caption,
-                    parse_mode="Markdown",
+                    caption=telegram_html(caption),
+                    parse_mode="HTML",
                     show_caption_above_media=True
                 )
             )
@@ -3568,9 +3717,11 @@ def send_photo_and_text(
             bot.send_message(
                 CHANNEL_ID,
                 text,
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
         )
+
+        add_signal_reactions(sent_text.message_id)
 
         log.info(
             "TELEGRAM SENT | %s | %s | score=%s | state=%s",
@@ -3654,7 +3805,7 @@ def send_morning_message():
         bot.send_message(
             CHANNEL_ID,
             message,
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
         last_morning_date = today
@@ -3763,95 +3914,212 @@ def expire_old_ready():
             inst_id
         )
 
-        try:
-
-            bot.send_message(
-                CHANNEL_ID,
-                (
-                    f"🔴 *SETUP EXPIRED — "
-                    f"{setup.coin}USDT*\n\n"
-                    f"Цена не дала своевременного "
-                    f"подтверждения.\n"
-                    f"*Рынок не догоняем.*"
-                ),
-                parse_mode="Markdown"
-            )
-
-        except Exception:
-
-            log.exception(
-                "EXPIRATION TELEGRAM ERROR"
-            )
+        # Expiration is tracked internally, but no public Telegram message is sent.
+        # Public channel updates are reserved for TP1/TP2/TP3 or SL.
 
 
 
 # ============================================================
 # PATTERN FILTER / SETUP SELECTION
-# ============================================================
+
 
 def _pivot_series(candles, highs=True):
     vals = pivot_highs(candles) if highs else pivot_lows(candles)
     return [v for _, v in vals[-6:]]
 
 
+def _avg_range(candles):
+    if not candles:
+        return 0.0
+    return sum(max(c.high - c.low, 0.0) for c in candles) / len(candles)
+
+
+def _avg_volume(candles):
+    if not candles:
+        return 0.0
+    return sum(max(c.volume, 0.0) for c in candles) / len(candles)
+
+
+def _trend_slope(values):
+    if len(values) < 2:
+        return 0.0
+    return (values[-1] - values[0]) / max(abs(values[0]), 1e-12)
+
+
+def _pattern_breakout_state(candles, direction, lookback=24):
+    if len(candles) < lookback + 2:
+        return False, False, False
+    prior = candles[-lookback-1:-1]
+    last = candles[-1]
+    prev = candles[-2]
+    avg_vol = _avg_volume(prior[-20:])
+    if direction == "LONG":
+        boundary = max(c.high for c in prior)
+        breakout = last.close > boundary and prev.close <= boundary
+        retest = (
+            (last.low <= boundary * 1.0015 and last.close > boundary)
+            or (prev.low <= boundary * 1.0015 and last.close > boundary)
+        )
+    else:
+        boundary = min(c.low for c in prior)
+        breakout = last.close < boundary and prev.close >= boundary
+        retest = (
+            (last.high >= boundary * 0.9985 and last.close < boundary)
+            or (prev.high >= boundary * 0.9985 and last.close < boundary)
+        )
+    volume_confirmed = avg_vol > 0 and last.volume >= avg_vol * 1.35
+    return breakout, retest, volume_confirmed
+
+
 def chart_pattern_analysis(candles_15m, candles_5m, direction):
-    """Lightweight chart-pattern filter used only for coin selection.
-    It does not change the Telegram signal format.
+    """Rule-based chart pattern/confluence engine.
+
+    Pattern names are backed by price/volume geometry; the names themselves are
+    never used as a trigger. This is an additional quality layer over V4.
     """
-    if len(candles_15m) < 40:
+    if len(candles_15m) < 60:
         return 0, False, ""
 
-    recent = candles_15m[-40:]
+    recent = candles_15m[-48:]
     highs = _pivot_series(recent, True)
     lows = _pivot_series(recent, False)
+    ref = max(recent[-1].close, 1e-12)
     points = 0
     patterns = []
 
-    # Ascending / descending triangle style compression.
+    # Ascending / descending / symmetrical triangles.
     if len(highs) >= 3 and len(lows) >= 3:
-        high_span = max(highs[-3:]) - min(highs[-3:])
-        low_span = max(lows[-3:]) - min(lows[-3:])
-        ref = recent[-1].close or 1.0
-        high_flat = high_span / ref <= 0.012
-        low_rising = lows[-1] > lows[-2] > lows[-3]
-        low_falling = lows[-1] < lows[-2] < lows[-3]
-        if direction == "LONG" and high_flat and low_rising:
+        high_span = (max(highs[-3:]) - min(highs[-3:])) / ref
+        low_span = (max(lows[-3:]) - min(lows[-3:])) / ref
+        hs = _trend_slope(highs[-3:])
+        ls = _trend_slope(lows[-3:])
+
+        if direction == "LONG" and high_span <= 0.012 and ls > 0.002:
+            points += 14
+            patterns.append("ascending triangle")
+        elif direction == "SHORT" and low_span <= 0.012 and hs < -0.002:
+            points += 14
+            patterns.append("descending triangle")
+        elif high_span <= 0.020 and low_span <= 0.020 and hs < -0.001 and ls > 0.001:
+            points += 12
+            patterns.append("symmetrical triangle")
+
+        if high_span <= 0.018 and low_span <= 0.018:
+            points += 5
+            patterns.append("compression")
+
+        # Falling/rising wedge.
+        if hs < -0.001 and ls < -0.001 and high_span < 0.025 and low_span < 0.025 and direction == "LONG":
             points += 10
-            patterns.append("восходящий треугольник")
-        elif direction == "SHORT" and high_flat and low_falling:
+            patterns.append("falling wedge")
+        elif hs > 0.001 and ls > 0.001 and high_span < 0.025 and low_span < 0.025 and direction == "SHORT":
             points += 10
-            patterns.append("нисходящий треугольник")
+            patterns.append("rising wedge")
 
-        # Symmetrical compression / pennant-like structure.
-        if high_span / ref <= 0.02 and low_span / ref <= 0.02:
-            points += 7
-            patterns.append("сжатие/пеннант")
+        # Double top / bottom with a real middle reaction.
+        if direction == "SHORT":
+            h1, h2 = highs[-3], highs[-1]
+            middle = min(lows[-3:]) if lows else 0.0
+            if h1 > 0 and abs(h2-h1)/h1 <= 0.009 and middle < min(h1, h2) * 0.985:
+                points += 12
+                patterns.append("double top")
+        else:
+            l1, l2 = lows[-3], lows[-1]
+            middle = max(highs[-3:]) if highs else 0.0
+            if l1 > 0 and abs(l2-l1)/l1 <= 0.009 and middle > max(l1, l2) * 1.015:
+                points += 12
+                patterns.append("double bottom")
 
-    # Double top / bottom near the latest structure.
-    if len(highs) >= 3:
-        a, b = highs[-3], highs[-1]
-        if a and abs(b-a)/a <= 0.008 and direction == "SHORT":
-            points += 9
-            patterns.append("двойная вершина")
-    if len(lows) >= 3:
-        a, b = lows[-3], lows[-1]
-        if a and abs(b-a)/a <= 0.008 and direction == "LONG":
-            points += 9
-            patterns.append("двойное дно")
+    # Bull/bear flag or pennant: impulse followed by contraction and quieter volume.
+    if len(recent) >= 30:
+        impulse = abs(recent[-30].close - recent[-18].close) / max(abs(recent[-30].close), 1e-12) * 100
+        old_range = _avg_range(recent[-30:-15])
+        new_range = _avg_range(recent[-15:])
+        old_vol = _avg_volume(recent[-30:-15])
+        new_vol = _avg_volume(recent[-15:])
+        contraction = new_range / old_range if old_range > 0 else 1.0
+        vol_contract = new_vol / old_vol if old_vol > 0 else 1.0
+        if impulse >= 1.0 and contraction <= 0.72:
+            points += 11
+            patterns.append("flag/pennant")
+            if vol_contract <= 0.85:
+                points += 3
+                patterns.append("volume contraction")
 
-    # Flag/pennant-like continuation: impulse followed by tighter range.
+    # Rectangle / range breakout preparation.
     if len(recent) >= 24:
-        impulse = abs(recent[-24].close - recent[-13].close) / max(recent[-24].close, 1e-12) * 100
-        old_range = sum(c.high-c.low for c in recent[-24:-12]) / 12
-        new_range = sum(c.high-c.low for c in recent[-12:]) / 12
-        if impulse >= 1.2 and old_range > 0 and new_range / old_range <= 0.72:
+        box = recent[-24:]
+        box_high = max(c.high for c in box)
+        box_low = min(c.low for c in box)
+        box_width = (box_high - box_low) / ref
+        near_top = sum(1 for c in box if abs(c.high-box_high)/ref <= 0.003)
+        near_bottom = sum(1 for c in box if abs(c.low-box_low)/ref <= 0.003)
+        if box_width <= 0.045 and near_top >= 2 and near_bottom >= 2:
             points += 8
-            patterns.append("флаг после импульса")
+            patterns.append("rectangle/range")
+
+    # Live breakout + retest + volume confirmation on 5M.
+    breakout, retest, volume_confirmed = _pattern_breakout_state(candles_5m, direction)
+    if breakout:
+        points += 12
+        patterns.append("breakout")
+    if volume_confirmed and breakout:
+        points += 7
+        patterns.append("breakout volume confirmation")
+    if retest:
+        points += 10
+        patterns.append("breakout + retest")
 
     if not patterns:
         return 0, False, ""
 
-    return min(points, 25), True, "Паттерн: " + ", ".join(patterns) + "."
+    unique_patterns = list(dict.fromkeys(patterns))
+    if len(unique_patterns) >= 2:
+        points += 4
+    if len(unique_patterns) >= 3:
+        points += 4
+
+    return min(points, 40), True, "Паттерн/структура: " + ", ".join(unique_patterns) + "."
+
+
+def pattern_quality_gate(setup: Setup, candles: Dict[str, List[Candle]]) -> Tuple[bool, str]:
+    c5 = [c for c in candles.get("5m", []) if c.confirmed]
+    c15 = [c for c in candles.get("15m", []) if c.confirmed]
+    c1 = [c for c in candles.get("1H", []) if c.confirmed]
+    c4 = [c for c in candles.get("4H", []) if c.confirmed]
+
+    if min(len(c5), len(c15), len(c1), len(c4)) < 30:
+        return False, "insufficient confirmed candles"
+
+    last = c5[-1]
+    avg_vol = _avg_volume(c5[-21:-1])
+    vol_ratio = last.volume / avg_vol if avg_vol > 0 else 0.0
+    body = candle_body_ratio(last)
+
+    if structure_direction(c1) != setup.direction:
+        return False, "1H structure mismatch"
+    if structure_direction(c4) != setup.direction:
+        return False, "4H structure mismatch"
+
+    if setup.setup_state == "ACTIVE":
+        if setup.direction == "LONG" and last.close <= setup.level:
+            return False, "breakout not closed above level"
+        if setup.direction == "SHORT" and last.close >= setup.level:
+            return False, "breakout not closed below level"
+        if body < 0.45:
+            return False, "weak breakout body"
+        if vol_ratio < 1.20:
+            return False, "weak breakout volume"
+
+    if setup.setup_state == "READY":
+        distance = abs(pct(setup.current_price, setup.level))
+        if distance > PRE_TRIGGER_DISTANCE_PCT:
+            return False, "READY too far from level"
+        p_score, p_ok, _ = chart_pattern_analysis(c15, c5, setup.direction)
+        if not p_ok or p_score < 12:
+            return False, "pattern evidence too weak"
+
+    return True, "passed"
 
 
 def analyze_symbol_with_patterns(inst_id, ticker, candles):
@@ -3863,16 +4131,41 @@ def analyze_symbol_with_patterns(inst_id, ticker, candles):
         candles.get("15m", []), candles.get("5m", []), setup.direction
     )
 
-    # Existing V4 logic remains the primary engine. A detected chart pattern
-    # adds quality; a completely pattern-free setup is still allowed when the
-    # original V4 trigger itself is strong (breakout/momentum).
     if ok:
         setup.score = int(clamp(setup.score + p5, 0, 100))
         setup.reason = setup.reason + " " + reason
+    elif setup.setup_state == "READY":
+        return None
+
+    c5 = [c for c in candles.get("5m", []) if c.confirmed]
+    price_change = 0.0
+    if len(c5) >= 13 and c5[-13].close > 0:
+        price_change = (c5[-1].close - c5[-13].close) / c5[-13].close * 100.0
+
+    oi_value, oi_change = get_open_interest_context(inst_id)
+    funding = get_funding_rate(inst_id)
+    d_points, d_reason = derivatives_context_score(
+        setup.direction, price_change, oi_change, funding
+    )
+    setup.score = int(clamp(setup.score + d_points, 0, 100))
+
+    if oi_value is not None:
+        setup.oi_status = (
+            f"OI {oi_value:,.0f} USD"
+            + (f" | Δ {oi_change:+.2f}%" if oi_change is not None else "")
+        )
+
+    if d_reason:
+        setup.reason += " Деривативный контекст: " + d_reason + "."
+
+    passed, gate_reason = pattern_quality_gate(setup, candles)
+    if not passed:
+        log.info("QUALITY GATE REJECT | %s | %s", inst_id, gate_reason)
+        return None
+
     return setup
 
 
-# ============================================================
 # RESULT TRACKING
 # ============================================================
 
@@ -3898,6 +4191,27 @@ def _row_risk(row):
     entry = float(row[4])
     sl = float(row[7])
     return abs(entry - sl)
+
+
+def _send_result_update(inst_id, direction, result):
+    """Send one public result update. Only this function publishes trade results."""
+    coin = get_coin(inst_id)
+    if result == "TP1":
+        message = f"🟢 *TP1 — {coin}USDT*\n\nПервая цель достигнута. Стоп переносится в безубыток по логике сигнала."
+    elif result == "TP2":
+        message = f"🟢 *TP2 — {coin}USDT*\n\nВторая цель достигнута. Движение развивается по плану."
+    elif result == "TP3":
+        message = f"💎 *TP3 — {coin}USDT*\n\nФинальная цель достигнута. Сделка завершена."
+    elif result == "SL":
+        message = f"🔴 *STOP LOSS — {coin}USDT*\n\nСделка закрыта по стопу. Дисциплина прежде всего."
+    elif result == "BE":
+        message = f"🟡 *BREAK EVEN — {coin}USDT*\n\nСделка закрыта в безубытке."
+    else:
+        return
+    try:
+        bot.send_message(CHANNEL_ID, telegram_html(message), parse_mode="HTML")
+    except Exception:
+        log.exception("RESULT TELEGRAM ERROR | %s | %s", inst_id, result)
 
 
 def update_signal_results():
@@ -3931,10 +4245,6 @@ def update_signal_results():
             touched = entry_low <= price <= entry_high
             if touched:
                 db.execute("UPDATE signals SET status='ACTIVE', activated_at=? WHERE id=?", (now_ts(), sid))
-                try:
-                    bot.send_message(CHANNEL_ID, f"🟢 *ENTRY ACTIVE — {get_coin(inst_id)}USDT*\n\nЦена вошла в опубликованную зону входа.", parse_mode="Markdown")
-                except Exception:
-                    log.exception("ACTIVE TELEGRAM ERROR")
                 status = "ACTIVE"
             elif now_ts() > float(row[14]):
                 db.execute("UPDATE signals SET status='EXPIRED', result='EXPIRED', closed_at=? WHERE id=?", (now_ts(), sid))
@@ -3950,31 +4260,54 @@ def update_signal_results():
         tp2_now = (c.high >= tp2) if direction == "LONG" else (c.low <= tp2)
         tp3_now = (c.high >= tp3) if direction == "LONG" else (c.low <= tp3)
 
-        if sl_hit and not tp1_hit and not tp2_hit and not tp3_hit:
-            db.execute("UPDATE signals SET status='CLOSED', result='SL', closed_at=?, r_multiple=-1 WHERE id=?", (now_ts(), sid))
+        # A result flag is also the de-duplication key. Once a target is marked
+        # hit in SQLite, later scan cycles cannot publish it again.
+        new_tp1 = bool(tp1_now and not tp1_hit)
+        new_tp2 = bool(tp2_now and not tp2_hit)
+        new_tp3 = bool(tp3_now and not tp3_hit)
+
+        if sl_hit and not tp1_hit and not tp2_hit and not tp3_hit and not (new_tp1 or new_tp2 or new_tp3):
+            db.execute("UPDATE signals SET status='CLOSED', result='SL', closed_at=?, r_multiple=-1 WHERE id=? AND status='ACTIVE'", (now_ts(), sid))
+            if db.rowcount:
+                db.commit()
+                _send_result_update(inst_id, direction, "SL")
             continue
 
-        if tp1_now and not tp1_hit:
-            tp1_hit = 1
-            db.execute("UPDATE signals SET tp1_hit=1 WHERE id=?", (sid,))
-        if tp2_now and not tp2_hit:
-            tp2_hit = 1
-            db.execute("UPDATE signals SET tp2_hit=1 WHERE id=?", (sid,))
-        if tp3_now and not tp3_hit:
-            tp3_hit = 1
-            db.execute("UPDATE signals SET tp3_hit=1 WHERE id=?", (sid,))
+        if new_tp1:
+            db.execute("UPDATE signals SET tp1_hit=1 WHERE id=? AND tp1_hit=0", (sid,))
+            if db.rowcount:
+                tp1_hit = 1
+                db.commit()
+                _send_result_update(inst_id, direction, "TP1")
+        if new_tp2:
+            db.execute("UPDATE signals SET tp2_hit=1 WHERE id=? AND tp2_hit=0", (sid,))
+            if db.rowcount:
+                tp2_hit = 1
+                db.commit()
+                _send_result_update(inst_id, direction, "TP2")
+        if new_tp3:
+            db.execute("UPDATE signals SET tp3_hit=1 WHERE id=? AND tp3_hit=0", (sid,))
+            if db.rowcount:
+                tp3_hit = 1
+                db.commit()
+                _send_result_update(inst_id, direction, "TP3")
 
         if tp3_hit:
-            db.execute("UPDATE signals SET status='CLOSED', result='TP3', closed_at=?, r_multiple=3 WHERE id=?", (now_ts(), sid))
+            db.execute("UPDATE signals SET status='CLOSED', result='TP3', closed_at=?, r_multiple=3 WHERE id=? AND status='ACTIVE'", (now_ts(), sid))
         elif tp2_hit:
-            db.execute("UPDATE signals SET status='ACTIVE', result='TP2', r_multiple=2 WHERE id=?", (sid,))
+            db.execute("UPDATE signals SET status='ACTIVE', result='TP2', r_multiple=2 WHERE id=? AND status='ACTIVE'", (sid,))
         elif tp1_hit:
-            # After TP1 the original signal explicitly moves SL to BE.
-            be_hit = (c.low <= entry_high) if direction == "LONG" else (c.high >= entry_low)
-            if be_hit:
-                db.execute("UPDATE signals SET status='CLOSED', result='BE', closed_at=?, r_multiple=0 WHERE id=?", (now_ts(), sid))
-            else:
-                db.execute("UPDATE signals SET status='ACTIVE', result='TP1', r_multiple=1 WHERE id=?", (sid,))
+            # Do not evaluate BE on the same candle that first hit TP1.
+            # The stop can move to BE only on a later scan/candle.
+            if not new_tp1:
+                be_hit = (c.low <= entry_high) if direction == "LONG" else (c.high >= entry_low)
+                if be_hit:
+                    db.execute("UPDATE signals SET status='CLOSED', result='BE', closed_at=?, r_multiple=0 WHERE id=? AND status='ACTIVE'", (now_ts(), sid))
+                    if db.rowcount:
+                        db.commit()
+                        _send_result_update(inst_id, direction, "BE")
+                        continue
+            db.execute("UPDATE signals SET status='ACTIVE', result='TP1', r_multiple=1 WHERE id=? AND status='ACTIVE'", (sid,))
 
     db.commit()
 
@@ -3999,7 +4332,10 @@ def report_period(start_ts, end_ts, title):
     tp2 = sum(1 for r in rows if r[1] in ("TP2", "TP3"))
     r_sum = sum(float(r[2] or 0) for r in rows)
     avg_r = (r_sum / len(closed)) if closed else 0.0
-    win_rate = (tp3 / len(closed) * 100.0) if closed else 0.0
+    outcome_rate = ((tp3 + be) / len(closed) * 100.0) if closed else 0.0
+    tp1_rate = (tp1 / total * 100.0) if total else 0.0
+    tp2_rate = (tp2 / total * 100.0) if total else 0.0
+    tp3_rate = (tp3 / total * 100.0) if total else 0.0
 
     lines = [
         f"📊 *{title}*",
@@ -4008,7 +4344,8 @@ def report_period(start_ts, end_ts, title):
         f"Закрыто: *{len(closed)}*",
         f"TP1: *{tp1}* | TP2: *{tp2}* | TP3: *{tp3}*",
         f"SL: *{sl}* | BE: *{be}*",
-        f"Закрытых TP3: *{win_rate:.1f}%*",
+        f"TP1 hit rate: *{tp1_rate:.1f}%* | TP2: *{tp2_rate:.1f}%* | TP3: *{tp3_rate:.1f}%*",
+        f"Закрытие без SL (TP3/BE): *{outcome_rate:.1f}%*",
         f"Суммарно R: *{r_sum:+.2f}R*",
         f"Средний R закрытых: *{avg_r:+.2f}R*",
     ]
@@ -4093,7 +4430,7 @@ def load_candles_for_symbol(inst_id):
 
 
 def scan_market():
-    global signals_today
+    global signals_today, last_fast_pass_ts, watchlist
 
     n = local_now()
     day_key = n.date().isoformat()
@@ -4110,6 +4447,7 @@ def scan_market():
     instruments = get_instruments()
     tickers = get_tickers()
     candidates = []
+
     for inst_id, ticker in tickers.items():
         if inst_id not in instruments:
             continue
@@ -4119,10 +4457,15 @@ def scan_market():
         candidates.append((fast_market_score(ticker), volume, inst_id, ticker))
 
     candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    candidates = candidates[:MAX_CANDIDATES]
+
+    now = now_ts()
+    if now - last_fast_pass_ts >= FAST_PASS_SECONDS or not watchlist:
+        watchlist = candidates[:DEEP_CANDIDATES] if DEEP_CANDIDATES > 0 else candidates
+        last_fast_pass_ts = now
+        log.info("WATCHLIST UPDATED | liquid=%s | deep=%s", len(candidates), len(watchlist))
 
     setups = []
-    for _, _, inst_id, ticker in candidates:
+    for _, _, inst_id, ticker in watchlist:
         if not can_send_new_signal(inst_id):
             continue
         try:
@@ -4134,7 +4477,9 @@ def scan_market():
             log.warning("ANALYZE FAILED | %s | %s", inst_id, exc)
 
     setups.sort(key=lambda x: x.score, reverse=True)
-    for setup in setups:
+    final_setups = setups[:FINAL_SIGNAL_CANDIDATES] if FINAL_SIGNAL_CANDIDATES > 0 else setups
+
+    for setup in final_setups:
         if not can_send_new_signal(setup.inst_id):
             continue
         photo_id, text_id = send_photo_and_text(setup, setup.setup_state)
@@ -4155,7 +4500,7 @@ def scan_market():
 
 
 def main():
-    log.info("QUANTUM SCALPER V4 STARTED")
+    log.info("QUANTUM SCALPER V7 STARTED")
     while True:
         try:
             send_morning_message()

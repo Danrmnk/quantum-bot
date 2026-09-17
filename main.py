@@ -4096,10 +4096,24 @@ def pattern_quality_gate(setup: Setup, candles: Dict[str, List[Candle]]) -> Tupl
     vol_ratio = last.volume / avg_vol if avg_vol > 0 else 0.0
     body = candle_body_ratio(last)
 
+    # 1H is the setup's primary directional timeframe.
+    # A mismatch here means the setup direction is internally inconsistent.
     if structure_direction(c1) != setup.direction:
         return False, "1H structure mismatch"
-    if structure_direction(c4) != setup.direction:
-        return False, "4H structure mismatch"
+
+    # 4H disagreement is NOT a hard rejection.
+    # analyze_symbol() already treats it as a quality penalty. Making it
+    # a second hard gate caused the live scanner to reject virtually every
+    # candidate whenever 4H was counter-trend, despite the strategy allowing
+    # 1H setups with a weaker 4H alignment.
+    structure_4h = structure_direction(c4)
+    if structure_4h != setup.direction:
+        log.info(
+            "QUALITY GATE NOTE | %s | 4H counter-trend: %s vs %s",
+            setup.inst_id,
+            structure_4h,
+            setup.direction,
+        )
 
     if setup.setup_state == "ACTIVE":
         if setup.direction == "LONG" and last.close <= setup.level:

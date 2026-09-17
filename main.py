@@ -3364,7 +3364,6 @@ def make_chart(
             f"{setup.coin}USDT | "
             f"{setup.direction} | "
             f"{setup.strategy}\n"
-            f"Score {setup.score}/100 | "
             f"5M trigger"
         ),
         color="white",
@@ -3416,10 +3415,6 @@ def build_signal_text(
     setup: Setup,
     state: str = "READY"
 ) -> str:
-
-    label = score_label(
-        setup.score
-    )
 
     if state == "READY":
 
@@ -3514,17 +3509,12 @@ def build_signal_text(
         f"🌡 *ATR:* "
         f"`{setup.atr_pct:.2f}%`\n\n"
 
-        f"⭐ *SIGNAL SCORE:* "
-        f"`{setup.score}/100` "
-        f"{label}\n\n"
-
         f"⏱ *READY действует:* "
         f"`{READY_TTL_MINUTES} мин`\n\n"
 
-        f"⚠️ *Соблюдаем управление риском.*\n"
-        f"Не догоняем рынок и не входим после "
-        f"сильного движения.\n"
-        f"*Качество важнее количества.*"
+        f"💎 *Дисциплина. Терпение. Чёткое исполнение.*\n"
+        f"🔥 Следим за движением и работаем строго по плану.\n"
+        f"Не догоняем цену."
     )
 
 
@@ -3551,7 +3541,6 @@ def send_photo_and_text(
         caption = (
             f"🔥 *{setup.coin}USDT — "
             f"{setup.direction}*\n"
-            f"{score_label(setup.score)} · "
             f"{setup.strategy}"
         )
 
@@ -4080,7 +4069,7 @@ def send_reports_once_per_day():
     ]
     try:
         for message in messages:
-            bot.send_message(CHANNEL_ID, message, parse_mode="Markdown")
+            bot.send_message(CHANNEL_ID, message)
         db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)", (key, "1"))
         db.commit()
         log.info("REPORTS SENT | %s", n.date())

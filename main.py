@@ -3196,22 +3196,11 @@ def can_send_new_signal(
 
     current = now_ts()
 
+    # Never duplicate an already active READY setup.
     if inst_id in ready_setups:
         return False
 
-    # --------------------------------------------------------
-    # DAILY LIMIT
-    # --------------------------------------------------------
-
-    if signals_today >= (
-        MAX_SIGNALS_PER_DAY
-    ):
-        return False
-
-    # --------------------------------------------------------
-    # COOLDOWN
-    # --------------------------------------------------------
-
+    # Keep only the per-symbol cooldown as duplicate protection.
     row = db.execute(
         """
         SELECT created_at
@@ -3226,37 +3215,13 @@ def can_send_new_signal(
     ).fetchone()
 
     if row:
-
-        last_time = float(
-            row[0]
-        )
-
+        last_time = float(row[0])
         if (
             current
             - last_time
             < COOLDOWN_MINUTES * 60
         ):
             return False
-
-    # --------------------------------------------------------
-    # HOURLY LIMIT
-    # --------------------------------------------------------
-
-    cutoff = (
-        current
-        - 3600
-    )
-
-    signals_hour[:] = [
-        value
-        for value in signals_hour
-        if value >= cutoff
-    ]
-
-    if len(signals_hour) >= (
-        MAX_SIGNALS_PER_HOUR
-    ):
-        return False
 
     return True
 
@@ -3698,8 +3663,7 @@ def send_photo_and_text(
         sent_text = (
             bot.send_message(
                 CHANNEL_ID,
-                text,
-                parse_mode="HTML"
+                telegram_html(text)
             )
         )
 
@@ -4436,9 +4400,6 @@ def scan_market():
         db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)", (state_key, day_key))
         db.commit()
 
-    if signals_today >= MAX_SIGNALS_PER_DAY:
-        return
-
     instruments = get_instruments()
     tickers = get_tickers()
     candidates = []
@@ -4490,8 +4451,6 @@ def scan_market():
                 )
             signals_hour.append(now_ts())
             signals_today += 1
-            if signals_today >= MAX_SIGNALS_PER_DAY:
-                break
 
 
 def main():

@@ -181,19 +181,10 @@ PRE_TRIGGER_DISTANCE_PCT = float(
 # SIGNAL LIMITS
 # ============================================================
 
-MAX_SIGNALS_PER_HOUR = int(
-    os.getenv(
-        "MAX_SIGNALS_PER_HOUR",
-        "8"
-    )
-)
-
-MAX_SIGNALS_PER_DAY = int(
-    os.getenv(
-        "MAX_SIGNALS_PER_DAY",
-        "40"
-    )
-)
+# No hourly/daily publication cap.
+# Kept as compatibility variables; value 0 means unlimited.
+MAX_SIGNALS_PER_HOUR = 0
+MAX_SIGNALS_PER_DAY = 0
 
 
 # ============================================================
@@ -292,7 +283,7 @@ log = logging.getLogger(
 
 bot = telebot.TeleBot(
     TELEGRAM_TOKEN,
-    parse_mode="HTML"
+    parse_mode=None
 )
 
 
@@ -3518,24 +3509,16 @@ def make_chart(
 
 def telegram_html(message: str) -> str:
     """
-    Convert the bot's legacy Markdown-like markup to Telegram HTML.
-    Dynamic market values are escaped so coin/strategy names cannot
-    break Telegram entity parsing.
+    Public Telegram text is intentionally plain.
+    Remove legacy Markdown/code markers and escape HTML-sensitive data.
     """
     if not message:
         return ""
 
-    # Escape first, then restore only our intentional formatting tokens.
-    s = html.escape(str(message), quote=False)
-
-    # Bold
-    s = re.sub(r"\*([^*\n]+)\*", r"<b>\1</b>", s)
-
-    # Inline code
-    s = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", s)
-
-    # Telegram/HTML accepts ordinary emoji and text.
-    return s
+    s = str(message)
+    s = s.replace("*", "")
+    s = s.replace("`", "")
+    return html.escape(s, quote=False)
 
 # ============================================================
 # TELEGRAM SIGNAL
@@ -3703,7 +3686,6 @@ def send_photo_and_text(
                     CHANNEL_ID,
                     photo,
                     caption=telegram_html(caption),
-                    parse_mode="HTML",
                     show_caption_above_media=True
                 )
             )
@@ -3804,8 +3786,7 @@ def send_morning_message():
 
         bot.send_message(
             CHANNEL_ID,
-            message,
-            parse_mode="HTML"
+            message
         )
 
         last_morning_date = today
@@ -4223,7 +4204,7 @@ def _send_result_update(inst_id, direction, result):
     else:
         return
     try:
-        bot.send_message(CHANNEL_ID, telegram_html(message), parse_mode="HTML")
+        bot.send_message(CHANNEL_ID, telegram_html(message))
     except Exception:
         log.exception("RESULT TELEGRAM ERROR | %s | %s", inst_id, result)
 

@@ -2608,12 +2608,13 @@ LEVEL_COOLDOWN_MINUTES = int(os.getenv("LEVEL_COOLDOWN_MINUTES", "45"))
 LEVEL_CHART_CANDLES = int(os.getenv("LEVEL_CHART_CANDLES", "96"))
 LEVEL_MAX_MESSAGES_PER_SCAN = int(os.getenv("LEVEL_MAX_MESSAGES_PER_SCAN", "1"))
 LEVEL_MIN_TESTS = int(os.getenv("LEVEL_MIN_TESTS", "3"))
+LEVEL_MAX_DISTINCT_TESTS = int(os.getenv("LEVEL_MAX_DISTINCT_TESTS", "7"))
 LEVEL_MIN_REACTIONS = int(os.getenv("LEVEL_MIN_REACTIONS", "2"))
 LEVEL_MAX_DISTANCE_PCT = float(os.getenv("LEVEL_MAX_DISTANCE_PCT", "1.20"))
 LEVEL_APPROACH_MIN_PCT = float(os.getenv("LEVEL_APPROACH_MIN_PCT", "0.15"))
 LEVEL_APPROACH_MAX_ATR = float(os.getenv("LEVEL_APPROACH_MAX_ATR", "1.10"))
-LEVEL_ZONE_ATR_MULT = float(os.getenv("LEVEL_ZONE_ATR_MULT", "0.18"))
-LEVEL_MAX_ZONE_PCT = float(os.getenv("LEVEL_MAX_ZONE_PCT", "0.45"))
+LEVEL_ZONE_ATR_MULT = float(os.getenv("LEVEL_ZONE_ATR_MULT", "0.10"))
+LEVEL_MAX_ZONE_PCT = float(os.getenv("LEVEL_MAX_ZONE_PCT", "0.30"))
 LEVEL_TRENDLINE_MIN_TOUCHES = int(os.getenv("LEVEL_TRENDLINE_MIN_TOUCHES", "3"))
 LEVEL_MIN_QUALITY = int(os.getenv("LEVEL_MIN_QUALITY", "82"))
 LEVEL_MAX_SAME_COIN = int(os.getenv("LEVEL_MAX_SAME_COIN", "1"))
@@ -2707,7 +2708,12 @@ def _distinct_touch_events(candles: List[Candle], lower: float, upper: float) ->
     i = start
     # Outside buffer prevents tiny one-candle wiggles from creating new tests.
     width = max(upper - lower, 1e-12)
-    outside = width * 0.55
+    # A new test requires a meaningful excursion away from the zone.
+    # For scalping, tiny oscillations around the boundary are still the same test.
+    avg_ranges = [max(c.high - c.low, 1e-12) for c in candles[max(start, 0):]]
+    avg_range = sum(avg_ranges[-60:]) / max(1, min(60, len(avg_ranges)))
+    outside = max(width * 1.25, avg_range * 0.80)
+    min_gap = 3
     while i < len(candles):
         if not _is_zone_touch(candles[i], lower, upper):
             i += 1
@@ -2728,7 +2734,7 @@ def _distinct_touch_events(candles: List[Candle], lower: float, upper: float) ->
             j += 1
         events.append((first, last))
         if left:
-            i = j + 1
+            i = max(j + 1, last + min_gap + 1)
         else:
             # Current/unfinished interaction: do not manufacture another test.
             break
@@ -2853,6 +2859,8 @@ def _build_horizontal_candidates(inst_id: str, ticker: dict, candles_by_tf: Dict
         anchor_tf = _anchor_tf_for_level(real_tfs)
         if not anchor_tf:
             continue
+        if anchor_tf == "1D" and not any(tf in real_tfs for tf in ("4H", "1H")):
+            continue
         anchor = candles_by_tf.get(anchor_tf, [])
         # Scalping level lifecycle is measured on 15M; HTF only establishes structure.
         measure = candles_by_tf.get("15m", []) if len(candles_by_tf.get("15m", [])) >= 50 else anchor
@@ -2891,7 +2899,8 @@ def _build_horizontal_candidates(inst_id: str, ticker: dict, candles_by_tf: Dict
         if status == "TOO_LATE":
             continue
         # Internal quality for ranking only. It is NOT displayed as a score.
-        quality = round(30 * min(1, touches / 5) +
+        test_quality = 1.0 if 3 <= touches <= 5 else (0.82 if touches == 6 else 0.68)
+        quality = round(30 * test_quality +
                         25 * min(1, reactions / 4) +
                         18 * consolidation +
                         10 * rejection_q +

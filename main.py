@@ -108,7 +108,16 @@ MAX_SYMBOLS = int(
 MAX_CANDIDATES = int(
     os.getenv(
         "MAX_CANDIDATES",
-        "45"
+        "40"
+    )
+)
+
+# Широкий первый пул: сначала дешёвый 15M-скрининг,
+# затем только лучшие кандидаты проходят полный MTF-анализ.
+FAST_CANDIDATE_POOL = int(
+    os.getenv(
+        "FAST_CANDIDATE_POOL",
+        "100"
     )
 )
 
@@ -137,7 +146,9 @@ MIN_SCORE = int(
 MIN_15M_ATR_PCT = float(os.getenv("MIN_15M_ATR_PCT", "0.45"))
 MIN_5M_VOLUME_SURGE = float(os.getenv("MIN_5M_VOLUME_SURGE", "1.20"))
 MIN_ACTIVE_VOLUME_SURGE = float(os.getenv("MIN_ACTIVE_VOLUME_SURGE", "1.50"))
-MIN_RELATIVE_STRENGTH = float(os.getenv("MIN_RELATIVE_STRENGTH", "0.0"))
+MIN_RELATIVE_STRENGTH = float(os.getenv("MIN_RELATIVE_STRENGTH", "0.15"))
+MIN_FAST_VOLUME_RATIO = float(os.getenv("MIN_FAST_VOLUME_RATIO", "0.85"))
+MIN_FAST_15M_ATR_PCT = float(os.getenv("MIN_FAST_15M_ATR_PCT", "0.45"))
 MIN_LEVEL_STRENGTH = int(os.getenv("MIN_LEVEL_STRENGTH", "48"))
 
 
@@ -2125,83 +2136,63 @@ def pre_trigger_analysis(
     candles_5m: List[Candle],
     direction: str
 ) -> Tuple[int, bool, str]:
-
-    if not candles_5m:
+    if len(candles_5m) < 12:
         return 0, False, ""
 
-    distance = abs(
-        pct(
-            current,
-            level.price
-        )
-    )
-
+    distance = abs(pct(current, level.price))
     if distance > PRE_TRIGGER_DISTANCE_PCT:
         return 0, False, ""
 
-    recent = candles_5m[-8:]
+    recent = candles_5m[-12:]
+    closes = [c.close for c in recent]
+    ranges = [c.high - c.low for c in recent if c.high > c.low]
+    if not ranges:
+        return 0, False, ""
+
+    # PRE должен быть именно подготовкой к пробою, а не просто близостью к уровню.
+    old_range = sum(ranges[:6]) / max(len(ranges[:6]), 1)
+    new_range = sum(ranges[6:]) / max(len(ranges[6:]), 1)
+    compressed = old_range > 0 and new_range / old_range <= 0.82
 
     if direction == "LONG":
-
-        # Цена должна подходить к сопротивлению,
-        # а не удаляться от него.
-        closes = [
-            c.close
-            for c in recent
-        ]
-
-        approaching = (
-            closes[-1]
-            >= closes[0]
+        highs = [c.high for c in recent]
+        lows = [c.low for c in recent]
+        approaching = closes[-1] > closes[0]
+        higher_lows = lows[-1] > lows[-3] > lows[-5]
+        resistance_pressure = highs[-1] >= highs[-4]
+        touches = sum(
+            1 for c in recent
+            if abs(pct(c.high, level.price)) <= 0.20
         )
-
-        if not approaching:
+        if not (approaching and higher_lows and resistance_pressure and compressed and touches >= 2):
             return 0, False, ""
-
-        score = 12
-
-        if distance <= 0.20:
-            score += 5
-
-        if distance <= 0.10:
-            score += 3
-
-        return (
-            score,
-            True,
-            "Цена заранее подошла к сильной зоне "
-            "и формирует подготовку к пробою."
-        )
-
     else:
-
-        closes = [
-            c.close
-            for c in recent
-        ]
-
-        approaching = (
-            closes[-1]
-            <= closes[0]
+        highs = [c.high for c in recent]
+        lows = [c.low for c in recent]
+        approaching = closes[-1] < closes[0]
+        lower_highs = highs[-1] < highs[-3] < highs[-5]
+        support_pressure = lows[-1] <= lows[-4]
+        touches = sum(
+            1 for c in recent
+            if abs(pct(c.low, level.price)) <= 0.20
         )
-
-        if not approaching:
+        if not (approaching and lower_highs and support_pressure and compressed and touches >= 2):
             return 0, False, ""
 
-        score = 12
+    score = 14
+    if distance <= 0.20:
+        score += 4
+    if distance <= 0.10:
+        score += 3
+    score += 4  # compression
+    if touches >= 3:
+        score += 3
 
-        if distance <= 0.20:
-            score += 5
-
-        if distance <= 0.10:
-            score += 3
-
-        return (
-            score,
-            True,
-            "Цена заранее подошла к сильной зоне "
-            "и формирует подготовку к пробою."
-        )
+    return (
+        min(score, 28),
+        True,
+        "Цена сжимается у сильной зоны и делает повторные тесты перед возможным пробоем."
+    )
 
 
 # ============================================================
@@ -2418,6 +2409,96 @@ def activity_score(
 # ============================================================
 # FAST MARKET RANKING
 # ============================================================
+
+# BTC-контекст загружается один раз за проход сканера,
+# а не отдельным HTTP-запросом для каждой монеты.
+BTC_15M_CONTEXT: List[Candle] = []
+
+def fast_candidate_score(
+    candles_15m: List[Candle],
+    btc_candles: List[Candle]
+) -> Tuple[float, str, float, float, float]:
+    """Дешёвый 15M-скрининг до полного MTF анализа.
+
+    Возвращает: score, direction, ATR%, volume_ratio, relative_strength.
+    Здесь нет требований к конкретному уровню: задача этапа — не пропустить
+    хорошую монету из-за того, что она не попала в первые N по 24H обороту.
+    """
+    if len(candles_15m) < 30:
+        return 0.0, "NEUTRAL", 0.0, 0.0, 0.0
+
+    current = candles_15m[-1].close
+    if current <= 0:
+        return 0.0, "NEUTRAL", 0.0, 0.0, 0.0
+
+    atr15 = atr(candles_15m, 14)
+    atr15_pct = (atr15 / current * 100.0) if atr15 > 0 else 0.0
+    if atr15_pct < MIN_FAST_15M_ATR_PCT or atr15_pct > 3.0:
+        return 0.0, "NEUTRAL", atr15_pct, 0.0, 0.0
+
+    direction = structure_direction(candles_15m)
+    if direction == "NEUTRAL":
+        # Не выбрасываем сразу: сильное сжатие может быть до нового импульса.
+        closes = [c.close for c in candles_15m[-20:]]
+        direction = "LONG" if closes[-1] > closes[0] else "SHORT" if closes[-1] < closes[0] else "NEUTRAL"
+
+    v_ratio = volume_ratio(candles_15m, 20)
+
+    rs = 0.0
+    if len(btc_candles) >= 20:
+        btc_base = btc_candles[-20].open
+        coin_base = candles_15m[-20].open
+        if btc_base > 0 and coin_base > 0:
+            btc_perf = (btc_candles[-1].close - btc_base) / btc_base * 100.0
+            coin_perf = (candles_15m[-1].close - coin_base) / coin_base * 100.0
+            rs = coin_perf - btc_perf
+
+    score = 0.0
+
+    # Ликвидность/волатильность уже учитываются в основном ticker score,
+    # здесь оцениваем именно текущее состояние.
+    if atr15_pct >= 0.60:
+        score += 12
+    elif atr15_pct >= 0.45:
+        score += 8
+
+    if v_ratio >= 1.50:
+        score += 15
+    elif v_ratio >= 1.20:
+        score += 11
+    elif v_ratio >= MIN_FAST_VOLUME_RATIO:
+        score += 5
+
+    if direction == "LONG" and rs >= 0.80:
+        score += 15
+    elif direction == "LONG" and rs >= 0.40:
+        score += 11
+    elif direction == "LONG" and rs >= 0.15:
+        score += 7
+    elif direction == "SHORT" and rs <= -0.80:
+        score += 15
+    elif direction == "SHORT" and rs <= -0.40:
+        score += 11
+    elif direction == "SHORT" and rs <= -0.15:
+        score += 7
+
+    # Сжатие + направленное давление получают приоритет.
+    recent = candles_15m[-12:]
+    old = candles_15m[-24:-12]
+    if recent and old:
+        recent_range = sum(c.high - c.low for c in recent) / len(recent)
+        old_range = sum(c.high - c.low for c in old) / len(old)
+        if old_range > 0 and recent_range / old_range <= 0.78:
+            score += 10
+
+        highs = [c.high for c in recent]
+        lows = [c.low for c in recent]
+        if direction == "LONG" and lows[-1] > lows[0]:
+            score += 6
+        if direction == "SHORT" and highs[-1] < highs[0]:
+            score += 6
+
+    return min(score, 50.0), direction, atr15_pct, v_ratio, rs
 
 def fast_market_score(
     ticker: dict
@@ -2717,7 +2798,7 @@ def analyze_symbol(
         return None
 
     # Относительная сила к BTC. Это фильтр направления, а не самостоятельный сигнал.
-    btc_candles = get_candles("BTC-USDT-SWAP", "15m", 30)
+    btc_candles = BTC_15M_CONTEXT
     if len(btc_candles) >= 20 and len(c15) >= 20:
         btc_base = btc_candles[-20].open
         coin_base = c15[-20].open
@@ -2872,6 +2953,13 @@ def analyze_symbol(
 
     if setup_state == "ACTIVE" and v_ratio < MIN_ACTIVE_VOLUME_SURGE:
         return None
+
+    # Не догоняем уже чрезмерно растянутую breakout-свечу.
+    current_atr = atr(confirmed_5m, 14)
+    if setup_state == "ACTIVE" and current_atr > 0:
+        candle_range = current_candle.high - current_candle.low
+        if candle_range > current_atr * 2.0:
+            return None
 
     # --------------------------------------------------------
     # MULTI-STRATEGY BONUS
@@ -4152,20 +4240,62 @@ def scan_market():
 
     instruments = get_instruments()
     tickers = get_tickers()
-    candidates = []
+
+    # BTC загружается один раз за проход и используется во всём быстром скрининге.
+    global BTC_15M_CONTEXT
+    try:
+        BTC_15M_CONTEXT = get_candles("BTC-USDT-SWAP", "15m", 30)
+    except Exception:
+        BTC_15M_CONTEXT = []
+
+    # Этап 1: широкий пул по ликвидности + 24H активности.
+    broad = []
     for inst_id, ticker in tickers.items():
         if inst_id not in instruments:
             continue
         volume = float(ticker.get("vol24h_usd", 0) or 0)
-        if volume < MIN_24H_VOLUME_USD:
+        if volume < max(MIN_24H_VOLUME_USD, MIN_CANDIDATE_VOLUME_USD):
             continue
-        candidates.append((fast_market_score(ticker), volume, inst_id, ticker))
+        broad.append((fast_market_score(ticker), volume, inst_id, ticker))
 
-    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    broad.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    broad = broad[:FAST_CANDIDATE_POOL]
+
+    # Этап 2: текущий 15M рынок. Это защищает от ситуации, когда монета
+    # попадает в deep scan только потому, что сильно двигалась за сутки.
+    candidates = []
+    for base_score, volume, inst_id, ticker in broad:
+        try:
+            c15_fast = get_candles(inst_id, "15m", 30)
+            fast_score, direction, atr15_pct, v_ratio, rs = fast_candidate_score(
+                c15_fast, BTC_15M_CONTEXT
+            )
+            if fast_score <= 0:
+                continue
+            candidates.append((
+                base_score + fast_score,
+                fast_score,
+                volume,
+                inst_id,
+                ticker,
+                direction,
+                atr15_pct,
+                v_ratio,
+                rs,
+            ))
+        except Exception as exc:
+            log.debug("FAST FILTER FAILED | %s | %s", inst_id, exc)
+
+    candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
     candidates = candidates[:MAX_CANDIDATES]
 
+    log.info(
+        "SCANNER | market=%d | broad=%d | fast_pass=%d | deep=%d",
+        len(tickers), len(broad), len(candidates), len(candidates)
+    )
+
     setups = []
-    for _, _, inst_id, ticker in candidates:
+    for _, _, _, inst_id, ticker, _, _, _, _ in candidates:
         if not can_send_new_signal(inst_id):
             continue
         try:

@@ -2598,21 +2598,24 @@ from pathlib import Path
 import math
 
 LEVEL_SCAN_INTERVAL = int(os.getenv("LEVEL_SCAN_INTERVAL", "30"))
+# Scalping: 15M = structural setup, 5M = entry/approach timing.
+LEVEL_SCALP_CHART_5M = int(os.getenv("LEVEL_SCALP_CHART_5M", "96"))
+LEVEL_SCALP_CHART_15M = int(os.getenv("LEVEL_SCALP_CHART_15M", "96"))
 LEVEL_DEEP_CANDIDATES = int(os.getenv("LEVEL_DEEP_CANDIDATES", "40"))
 LEVEL_FINAL_COUNT = int(os.getenv("LEVEL_FINAL_COUNT", "3"))
 LEVEL_MIN_VOLUME = float(os.getenv("LEVEL_MIN_VOLUME", "60000000"))
-LEVEL_COOLDOWN_MINUTES = int(os.getenv("LEVEL_COOLDOWN_MINUTES", "180"))
+LEVEL_COOLDOWN_MINUTES = int(os.getenv("LEVEL_COOLDOWN_MINUTES", "45"))
 LEVEL_CHART_CANDLES = int(os.getenv("LEVEL_CHART_CANDLES", "96"))
-LEVEL_MAX_MESSAGES_PER_SCAN = int(os.getenv("LEVEL_MAX_MESSAGES_PER_SCAN", "3"))
+LEVEL_MAX_MESSAGES_PER_SCAN = int(os.getenv("LEVEL_MAX_MESSAGES_PER_SCAN", "1"))
 LEVEL_MIN_TESTS = int(os.getenv("LEVEL_MIN_TESTS", "3"))
 LEVEL_MIN_REACTIONS = int(os.getenv("LEVEL_MIN_REACTIONS", "2"))
-LEVEL_MAX_DISTANCE_PCT = float(os.getenv("LEVEL_MAX_DISTANCE_PCT", "3.5"))
-LEVEL_APPROACH_MIN_PCT = float(os.getenv("LEVEL_APPROACH_MIN_PCT", "0.35"))
-LEVEL_APPROACH_MAX_ATR = float(os.getenv("LEVEL_APPROACH_MAX_ATR", "1.25"))
-LEVEL_ZONE_ATR_MULT = float(os.getenv("LEVEL_ZONE_ATR_MULT", "0.28"))
-LEVEL_MAX_ZONE_PCT = float(os.getenv("LEVEL_MAX_ZONE_PCT", "0.80"))
+LEVEL_MAX_DISTANCE_PCT = float(os.getenv("LEVEL_MAX_DISTANCE_PCT", "1.20"))
+LEVEL_APPROACH_MIN_PCT = float(os.getenv("LEVEL_APPROACH_MIN_PCT", "0.15"))
+LEVEL_APPROACH_MAX_ATR = float(os.getenv("LEVEL_APPROACH_MAX_ATR", "1.10"))
+LEVEL_ZONE_ATR_MULT = float(os.getenv("LEVEL_ZONE_ATR_MULT", "0.18"))
+LEVEL_MAX_ZONE_PCT = float(os.getenv("LEVEL_MAX_ZONE_PCT", "0.45"))
 LEVEL_TRENDLINE_MIN_TOUCHES = int(os.getenv("LEVEL_TRENDLINE_MIN_TOUCHES", "3"))
-LEVEL_MIN_QUALITY = int(os.getenv("LEVEL_MIN_QUALITY", "76"))
+LEVEL_MIN_QUALITY = int(os.getenv("LEVEL_MIN_QUALITY", "82"))
 LEVEL_MAX_SAME_COIN = int(os.getenv("LEVEL_MAX_SAME_COIN", "1"))
 LEVEL_STATE_DB = os.getenv("LEVEL_STATE_DB", DB_PATH)
 
@@ -2642,8 +2645,10 @@ class LevelCandidate:
     status: str = "WATCH"
     current_price: float = 0.0
     volume_24h: float = 0.0
-    chart_tf: str = "1H"
+    chart_tf: str = "15m"
     chart_candles: List[Candle] = field(default_factory=list)
+    chart_candles_5m: List[Candle] = field(default_factory=list)
+    chart_candles_15m: List[Candle] = field(default_factory=list)
     reason: str = ""
     setup: str = ""
 
@@ -2663,6 +2668,8 @@ class TrendlineCandidate:
     current_price: float
     chart_tf: str
     chart_candles: List[Candle]
+    chart_candles_5m: List[Candle] = field(default_factory=list)
+    chart_candles_15m: List[Candle] = field(default_factory=list)
     timeframes: List[str] = field(default_factory=list)
     reason: str = ""
     setup: str = "TRENDLINE"
@@ -2687,38 +2694,44 @@ def _is_zone_touch(c: Candle, lower: float, upper: float) -> bool:
 
 
 def _distinct_touch_events(candles: List[Candle], lower: float, upper: float) -> List[Tuple[int, int]]:
-    """One physical test = one contiguous interaction with the zone.
+    """Count a test only after price has LEFT the zone.
 
-    This intentionally prevents 20 consecutive candles inside a zone from
-    becoming 20 'touches'.
+    A test is an interaction episode, not a candle count:
+      approach -> enter/touch -> rejection/dwell -> leave -> later re-approach.
+    Consecutive candles inside/near the zone therefore remain one test.
     """
     if len(candles) < 30:
         return []
-    start = max(0, len(candles) - 140)
+    start = max(0, len(candles) - 180)
     events = []
     i = start
+    # Outside buffer prevents tiny one-candle wiggles from creating new tests.
+    width = max(upper - lower, 1e-12)
+    outside = width * 0.55
     while i < len(candles):
         if not _is_zone_touch(candles[i], lower, upper):
             i += 1
             continue
         first = i
         last = i
-        gap = 0
-        while last + 1 < len(candles):
-            nxt = candles[last + 1]
-            if _is_zone_touch(nxt, lower, upper):
-                last += 1
-                gap = 0
-                continue
-            gap += 1
-            # A one-candle gap can still belong to the same test.
-            if gap <= 1 and last + 2 < len(candles) and _is_zone_touch(candles[last + 2], lower, upper):
-                last += 2
-                gap = 0
-                continue
-            break
+        # Stay in the same episode while price overlaps the zone.
+        while last + 1 < len(candles) and _is_zone_touch(candles[last + 1], lower, upper):
+            last += 1
+        # Require a real departure before another test can start.
+        j = last + 1
+        left = False
+        while j < len(candles) and j <= last + 8:
+            c = candles[j]
+            if c.close > upper + outside or c.close < lower - outside:
+                left = True
+                break
+            j += 1
         events.append((first, last))
-        i = last + 1
+        if left:
+            i = j + 1
+        else:
+            # Current/unfinished interaction: do not manufacture another test.
+            break
     return events
 
 
@@ -2731,21 +2744,17 @@ def _event_reaction(candles: List[Candle], event: Tuple[int, int], kind: str, lo
     if kind == "SUPPORT":
         test = min(segment, key=lambda c: c.low)
         wick = min(test.open, test.close) - test.low
-        close_away = test.close >= upper
-        move = 0.0
-        for j in range(last + 1, min(last + 7, len(candles))):
-            move = max(move, candles[j].high - test.close)
-        rejected = close_away or (wick >= zone * 0.35 and test.close >= test.open)
+        move = max((candles[j].high - test.close for j in range(last + 1, min(last + 9, len(candles)))), default=0.0)
+        rejected = (test.close >= upper) or (wick >= zone * 0.35 and test.close >= test.open)
     else:
         test = max(segment, key=lambda c: c.high)
         wick = test.high - max(test.open, test.close)
-        close_away = test.close <= lower
-        move = 0.0
-        for j in range(last + 1, min(last + 7, len(candles))):
-            move = max(move, test.close - candles[j].low)
-        rejected = close_away or (wick >= zone * 0.35 and test.close <= test.open)
+        move = max((test.close - candles[j].low for j in range(last + 1, min(last + 9, len(candles)))), default=0.0)
+        rejected = (test.close <= lower) or (wick >= zone * 0.35 and test.close <= test.open)
     displacement = move / max(avg_range, 1e-12)
-    return rejected, displacement, abs(wick) / max(zone, 1e-12)
+    # A reaction is real only when rejection is followed by meaningful displacement.
+    reacted = rejected and displacement >= 0.85
+    return reacted, displacement, abs(wick) / max(zone, 1e-12)
 
 
 def _touch_reaction_metrics(candles: List[Candle], lower: float, upper: float, kind: str) -> Tuple[int, int, float, float]:
@@ -2845,19 +2854,21 @@ def _build_horizontal_candidates(inst_id: str, ticker: dict, candles_by_tf: Dict
         if not anchor_tf:
             continue
         anchor = candles_by_tf.get(anchor_tf, [])
-        lower, upper = _zone_for_price(p, anchor)
+        # Scalping level lifecycle is measured on 15M; HTF only establishes structure.
+        measure = candles_by_tf.get("15m", []) if len(candles_by_tf.get("15m", [])) >= 50 else anchor
+        lower, upper = _zone_for_price(p, measure)
         # Do not allow giant zones.
         if _safe_pct_distance(lower, upper) > LEVEL_MAX_ZONE_PCT * 2.2:
             continue
-        touches, reactions, rejection_q, displacement_q = _touch_reaction_metrics(anchor, lower, upper, kind)
-        consolidation = _consolidation_score(anchor, lower, upper)
+        touches, reactions, rejection_q, displacement_q = _touch_reaction_metrics(measure, lower, upper, kind)
+        consolidation = _consolidation_score(measure, lower, upper)
         if touches < LEVEL_MIN_TESTS or reactions < LEVEL_MIN_REACTIONS:
             continue
         # A decisive break after the latest reaction invalidates the level.
-        latest_event = _distinct_touch_events(anchor, lower, upper)
+        latest_event = _distinct_touch_events(measure, lower, upper)
         if latest_event:
             _, last = latest_event[-1]
-            post = anchor[last + 1:]
+            post = measure[last + 1:]
             if post:
                 if kind == "SUPPORT" and min(c.close for c in post) < lower - (upper - lower) * 0.65:
                     continue
@@ -2867,7 +2878,7 @@ def _build_horizontal_candidates(inst_id: str, ticker: dict, candles_by_tf: Dict
         confluence = min(1.0, (htf_count / 3.0) + (0.15 if len(real_tfs) >= 3 else 0.0))
         freshness = max(x[3] for x in items)
         # Before reaching the zone we want a useful buffer, not a chase.
-        atr_now = _tf_atr_pct(anchor)
+        atr_now = _tf_atr_pct(candles_by_tf.get("5m", []) if len(candles_by_tf.get("5m", [])) >= 30 else measure)
         distance_atr = distance / max(atr_now, 0.01)
         if distance < LEVEL_APPROACH_MIN_PCT:
             status = "TESTING" if lower <= current <= upper else "TOO_LATE"
@@ -2895,8 +2906,10 @@ def _build_horizontal_candidates(inst_id: str, ticker: dict, candles_by_tf: Dict
         if htf_count >= 2:
             reason += " • HTF подтверждение"
         setup = "LONG" if kind == "SUPPORT" else "SHORT"
-        chart_tf = anchor_tf if status == "APPROACHING" else ("1H" if "1H" in real_tfs else anchor_tf)
-        chart = candles_by_tf.get(chart_tf, [])[-LEVEL_CHART_CANDLES:]
+        # Always show scalping execution context: 15M structure + 5M trigger.
+        chart_tf = "15m"
+        chart = candles_by_tf.get("15m", [])[-LEVEL_SCALP_CHART_15M:]
+        chart5 = candles_by_tf.get("5m", [])[-LEVEL_SCALP_CHART_5M:]
         candidates.append(LevelCandidate(
             inst_id=inst_id,
             coin=get_coin(inst_id),
@@ -2920,16 +2933,32 @@ def _build_horizontal_candidates(inst_id: str, ticker: dict, candles_by_tf: Dict
             volume_24h=volume,
             chart_tf=chart_tf,
             chart_candles=chart,
+            chart_candles_5m=chart5,
+            chart_candles_15m=chart,
             reason=reason,
             setup=setup,
         ))
+    # Merge overlapping/nearby zones so one market area produces one candidate.
     candidates.sort(key=lambda x: (x.quality, -x.distance_pct), reverse=True)
     selected = []
     for c in candidates:
-        if any(c.kind == s.kind and abs(c.price - s.price) / c.price * 100 < 0.25 for s in selected):
-            continue
-        selected.append(c)
-    return selected[:6]
+        merged = False
+        for s0 in selected:
+            if c.kind != s0.kind:
+                continue
+            gap = max(s0.lower - c.upper, c.lower - s0.upper, 0.0)
+            near = gap / max(c.price, 1e-12) * 100 <= 0.12
+            overlap = c.lower <= s0.upper and c.upper >= s0.lower
+            center_near = abs(c.price - s0.price) / max(c.price, 1e-12) * 100 <= 0.22
+            if overlap or near or center_near:
+                # Keep the cleaner/narrower structural zone rather than creating a giant union.
+                if c.quality > s0.quality + 2 and (c.upper-c.lower) <= (s0.upper-s0.lower)*1.15:
+                    selected[selected.index(s0)] = c
+                merged = True
+                break
+        if not merged:
+            selected.append(c)
+    return selected[:4]
 
 
 def _line_value(p1: Tuple[int, float], p2: Tuple[int, float], x: int) -> float:
@@ -3006,7 +3035,9 @@ def _trendline_candidates(inst_id: str, ticker: dict, candles_by_tf: Dict[str, L
                         status=status,
                         current_price=current,
                         chart_tf=tf,
-                        chart_candles=cs[-LEVEL_CHART_CANDLES:],
+                        chart_candles=cs[-LEVEL_SCALP_CHART_15M:],
+                        chart_candles_5m=candles_by_tf.get("5m", [])[-LEVEL_SCALP_CHART_5M:],
+                        chart_candles_15m=candles_by_tf.get("15m", [])[-LEVEL_SCALP_CHART_15M:],
                         timeframes=[tf],
                         reason=f"{touches} касания трендовой • чистый наклон • цена подходит к линии",
                     )
@@ -3179,55 +3210,47 @@ def _draw_candles(ax, candles: List[Candle]):
                                facecolor=body_color, edgecolor=body_color, linewidth=0.7, zorder=4))
 
 
-def make_level_chart(level: LevelCandidate) -> str:
-    path = f"level_{level.coin}_{int(time.time()*1000)}.png"
-    candles = level.chart_candles
-    if len(candles) < 20:
-        return ""
-    fig = plt.figure(figsize=(14, 9), facecolor="#070b12")
-    gs = fig.add_gridspec(5, 1, height_ratios=[4, 1, 0.05, 0.05, 0.05])
-    ax = fig.add_subplot(gs[0])
-    av = fig.add_subplot(gs[1], sharex=ax)
-    ax.set_facecolor("#070b12"); av.set_facecolor("#070b12")
+def _draw_chart_panel(ax, candles: List[Candle], level: LevelCandidate, title_tf: str):
     _draw_candles(ax, candles)
-    max_vol = max((c.quote_volume for c in candles), default=1.0)
-    for i, c in enumerate(candles):
-        av.bar(i, c.quote_volume, width=0.62, color="#64748b", alpha=0.65)
     zone_color = "#22c55e" if level.kind == "SUPPORT" else "#ef4444"
     ax.axhspan(level.lower, level.upper, facecolor=zone_color, alpha=0.16, zorder=1)
     ax.axhline(level.lower, color=zone_color, linewidth=1.0, alpha=0.55)
     ax.axhline(level.upper, color=zone_color, linewidth=1.0, alpha=0.55)
-    ax.axhline(level.price, color=zone_color, linewidth=2.4, zorder=6)
+    ax.axhline(level.price, color=zone_color, linewidth=2.2, zorder=6)
     ax.axhline(level.current_price, color="#f8fafc", linewidth=1.0, linestyle=(0, (5, 4)), zorder=6)
     d = _price_decimals(level.price)
-    ax.text(len(candles)-0.2, level.price, f" {level.kind} {level.price:.{d}f} ", color="#fff", fontsize=10, fontweight="bold", va="center", ha="right",
-            bbox=dict(boxstyle="round,pad=0.25", facecolor=zone_color, edgecolor="none"))
-    ax.text(len(candles)-0.2, level.current_price, f" NOW {level.current_price:.{d}f} ", color="#070b12", fontsize=9, fontweight="bold", va="center", ha="right",
-            bbox=dict(boxstyle="round,pad=0.22", facecolor="#f8fafc", edgecolor="none"))
-    panel = f"{level.coin}/USDT\n{level.chart_tf} • {level.status}\n{level.touches} tests • {level.reactions} reactions"
-    ax.text(0.012, 0.975, panel, transform=ax.transAxes, ha="left", va="top", color="#e5e7eb", fontsize=10,
-            bbox=dict(boxstyle="round,pad=0.5", facecolor="#0f172a", edgecolor="#334155", alpha=0.95))
+    ax.text(len(candles)-0.2, level.price, f" {level.kind} {level.price:.{d}f} ", color="#fff", fontsize=9, fontweight="bold", va="center", ha="right",
+            bbox=dict(boxstyle="round,pad=0.22", facecolor=zone_color, edgecolor="none"))
+    ax.text(0.01, 0.96, f"{title_tf} • {level.status}", transform=ax.transAxes, color="#e5e7eb", fontsize=11, fontweight="bold", va="top")
     ticks = list(range(0, len(candles), max(1, len(candles)//7)))[:8]
     labels = [datetime.fromtimestamp(candles[i].ts/1000, tz=ZoneInfo("UTC")).strftime("%d %b\n%H:%M") for i in ticks]
-    ax.set_xticks(ticks); ax.set_xticklabels([])
-    av.set_xticks(ticks); av.set_xticklabels(labels, fontsize=8, color="#94a3b8")
-    ax.yaxis.tick_right(); av.yaxis.tick_right()
-    ax.tick_params(axis="y", colors="#cbd5e1", labelsize=9, length=0)
-    av.tick_params(axis="y", colors="#64748b", labelsize=7, length=0)
+    ax.set_xticks(ticks); ax.set_xticklabels(labels, fontsize=7, color="#94a3b8")
+    ax.yaxis.tick_right(); ax.tick_params(axis="y", colors="#cbd5e1", labelsize=8, length=0)
     ax.grid(axis="y", color="#334155", alpha=0.25, linewidth=0.7)
-    av.grid(axis="y", color="#334155", alpha=0.15, linewidth=0.6)
-    ax.set_ylabel("Price", color="#94a3b8")
-    av.set_ylabel("Vol", color="#64748b", fontsize=8)
     lows = [c.low for c in candles]; highs = [c.high for c in candles]
-    span = max(max(highs)-min(lows), level.current_price*0.004)
+    span = max(max(highs)-min(lows), level.current_price*0.003)
     ax.set_ylim(min(min(lows), level.lower)-span*0.10, max(max(highs), level.upper)+span*0.10)
     ax.set_xlim(-1.5, len(candles)+1.5)
-    ax.set_title(f"{level.coin}/USDT • {level.chart_tf} • {level.kind}", loc="left", color="#f8fafc", fontsize=17, fontweight="bold", pad=16)
-    ax.text(0, 1.005, f"ZONE {fmt_price(level.lower)} — {fmt_price(level.upper)} • {level.distance_pct:.2f}% away",
-            transform=ax.transAxes, color="#94a3b8", fontsize=9.5, va="bottom")
-    for a in (ax, av):
-        for spine in a.spines.values(): spine.set_color("#1e293b")
-    plt.subplots_adjust(left=0.055, right=0.94, top=0.88, bottom=0.09, hspace=0.05)
+    for spine in ax.spines.values(): spine.set_color("#1e293b")
+
+
+def make_level_chart(level: LevelCandidate) -> str:
+    path = f"level_{level.coin}_{int(time.time()*1000)}.png"
+    c15 = level.chart_candles_15m or level.chart_candles
+    c5 = level.chart_candles_5m
+    if len(c15) < 20 or len(c5) < 20:
+        return ""
+    fig = plt.figure(figsize=(15, 11), facecolor="#070b12")
+    gs = fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.12)
+    ax15 = fig.add_subplot(gs[0])
+    ax5 = fig.add_subplot(gs[1])
+    for ax in (ax15, ax5): ax.set_facecolor("#070b12")
+    _draw_chart_panel(ax15, c15, level, "15M STRUCTURE")
+    _draw_chart_panel(ax5, c5, level, "5M SCALP TRIGGER")
+    d = _price_decimals(level.price)
+    fig.suptitle(f"{level.coin}/USDT • SCALPING • {level.kind}", x=0.055, ha="left", color="#f8fafc", fontsize=18, fontweight="bold")
+    fig.text(0.055, 0.965, f"ZONE {fmt_price(level.lower)} — {fmt_price(level.upper)} • NOW {fmt_price(level.current_price)} • {level.touches} tests / {level.reactions} reactions", color="#94a3b8", fontsize=9.5)
+    plt.subplots_adjust(left=0.055, right=0.94, top=0.91, bottom=0.06)
     fig.savefig(path, facecolor=fig.get_facecolor(), dpi=170)
     plt.close(fig)
     return path
@@ -3243,7 +3266,7 @@ def build_level_text(level: LevelCandidate) -> str:
     return (
         f"<b>{title}</b>\n"
         f"Подходит к {'поддержке' if level.kind == 'SUPPORT' else 'сопротивлению'} {fmt_price(level.lower)}–{fmt_price(level.upper)}\n"
-        f"{level.chart_tf} / {' / '.join(level.timeframes[:3])}\n"
+        f"15M / 5M • HTF: {level.anchor_tf}\n"
         f"{level.touches} теста • {level.reactions} реакции"
         + (" • хорошая проторговка" if level.consolidation >= 0.55 else "") + "\n"
         f"<b>{action}</b>"
@@ -3272,28 +3295,34 @@ def send_trendline(candidate: TrendlineCandidate) -> bool:
         text = (
             f"<b>🔵 {candidate.coin}/USDT</b>\n"
             f"Подходит к {'восходящей поддержке' if candidate.kind == 'TRENDLINE_SUPPORT' else 'нисходящему сопротивлению'}\n"
-            f"{candidate.chart_tf}\n"
-            f"{candidate.touches} касания трендовой\n"
+            f"15M / 5M • {candidate.touches} касания трендовой\n"
             f"Можно рассматривать реакцию / пробой с подтверждением."
         )
-        # Reuse horizontal chart renderer only for the base candles; add trendline overlay separately.
         path = f"trend_{candidate.coin}_{int(time.time()*1000)}.png"
-        candles = candidate.chart_candles
-        fig, ax = plt.subplots(figsize=(14, 8), facecolor="#070b12")
-        ax.set_facecolor("#070b12")
-        _draw_candles(ax, candles)
-        piv = pivot_lows(candles,2,2) if candidate.kind == "TRENDLINE_SUPPORT" else pivot_highs(candles,2,2)
-        pts = piv[-25:]
-        if len(pts) >= 2:
-            a,b = pts[-2], pts[-1]
-            xs = list(range(a[0], len(candles)))
-            ys = [_line_value(a,b,x) for x in xs]
-            ax.plot(xs, ys, linewidth=2.5)
-        ax.axhline(candidate.current_price, linewidth=1, linestyle=(0,(5,4)))
-        ax.yaxis.tick_right(); ax.set_title(f"{candidate.coin}/USDT • {candidate.chart_tf} • TRENDLINE", loc="left", fontsize=17, fontweight="bold", color="#f8fafc")
-        lows=[c.low for c in candles]; highs=[c.high for c in candles]
-        ax.set_ylim(min(lows), max(highs)); ax.set_xlim(-1.5,len(candles)+1.5); ax.grid(axis="y", alpha=0.2)
-        for spine in ax.spines.values(): spine.set_color("#1e293b")
+        c15 = candidate.chart_candles_15m or candidate.chart_candles
+        c5 = candidate.chart_candles_5m
+        if len(c15) < 20 or len(c5) < 20:
+            return False
+        fig = plt.figure(figsize=(15, 11), facecolor="#070b12")
+        gs = fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.12)
+        for ax, candles, label in ((fig.add_subplot(gs[0]), c15, "15M STRUCTURE"), (fig.add_subplot(gs[1]), c5, "5M SCALP TRIGGER")):
+            ax.set_facecolor("#070b12")
+            _draw_candles(ax, candles)
+            piv = pivot_lows(candles,2,2) if candidate.kind == "TRENDLINE_SUPPORT" else pivot_highs(candles,2,2)
+            pts = piv[-25:]
+            if len(pts) >= 2:
+                a,b = pts[-2], pts[-1]
+                xs = list(range(a[0], len(candles)))
+                ys = [_line_value(a,b,x) for x in xs]
+                ax.plot(xs, ys, linewidth=2.5)
+            ax.axhline(candidate.current_price, linewidth=1, linestyle=(0,(5,4)))
+            ax.yaxis.tick_right(); ax.set_title(label, loc="left", fontsize=11, fontweight="bold", color="#e5e7eb")
+            ax.grid(axis="y", alpha=0.2)
+            lows=[c.low for c in candles]; highs=[c.high for c in candles]
+            ax.set_ylim(min(lows), max(highs)); ax.set_xlim(-1.5,len(candles)+1.5)
+            for spine in ax.spines.values(): spine.set_color("#1e293b")
+        fig.suptitle(f"{candidate.coin}/USDT • SCALPING • TRENDLINE", x=0.055, ha="left", color="#f8fafc", fontsize=18, fontweight="bold")
+        plt.subplots_adjust(left=0.055, right=0.94, top=0.91, bottom=0.06)
         fig.savefig(path, facecolor=fig.get_facecolor(), dpi=170, bbox_inches="tight"); plt.close(fig)
         with open(path,"rb") as photo: bot.send_photo(CHANNEL_ID, photo, caption=text, parse_mode="HTML")
         try: os.remove(path)

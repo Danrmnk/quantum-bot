@@ -121,6 +121,14 @@ MIN_CANDIDATE_VOLUME_USD = float(
     )
 )
 
+# New market-selection engine. The fast pass only ranks the universe;
+# the deep pass validates structure before a symbol can become a signal.
+MARKET_RANK_LIMIT = int(os.getenv("MARKET_RANK_LIMIT", "60"))
+DEEP_CANDIDATES = int(os.getenv("DEEP_CANDIDATES", "20"))
+MIN_STRUCTURE_SCORE = float(os.getenv("MIN_STRUCTURE_SCORE", "55"))
+MIN_MARKET_SCORE = float(os.getenv("MIN_MARKET_SCORE", "62"))
+
+
 
 # ============================================================
 # SCORE
@@ -181,10 +189,19 @@ PRE_TRIGGER_DISTANCE_PCT = float(
 # SIGNAL LIMITS
 # ============================================================
 
-# No hourly/daily publication cap.
-# Kept as compatibility variables; value 0 means unlimited.
-MAX_SIGNALS_PER_HOUR = 0
-MAX_SIGNALS_PER_DAY = 0
+MAX_SIGNALS_PER_HOUR = int(
+    os.getenv(
+        "MAX_SIGNALS_PER_HOUR",
+        "8"
+    )
+)
+
+MAX_SIGNALS_PER_DAY = int(
+    os.getenv(
+        "MAX_SIGNALS_PER_DAY",
+        "40"
+    )
+)
 
 
 # ============================================================
@@ -283,7 +300,7 @@ log = logging.getLogger(
 
 bot = telebot.TeleBot(
     TELEGRAM_TOKEN,
-    parse_mode=None
+    parse_mode="HTML"
 )
 
 
@@ -458,6 +475,15 @@ class Setup:
     setup_state: str
 
     candles_5m: List[Candle]
+
+    # V5 classification: tells Telegram how the setup is meant to be traded.
+    trade_type: str = "SCALP"
+    market_score: int = 0
+    hold_hours: str = "0.1–0.5h"
+    build_entries: str = "1 entry"
+    entry_1: float = 0.0
+    entry_2: float = 0.0
+    entry_3: float = 0.0
 
 
 @dataclass
@@ -2567,6 +2593,127 @@ def fast_market_score(
 
 
 # ============================================================
+# V5 MARKET SELECTION ENGINE
+# ============================================================
+
+def _safe_return(candles: List[Candle], lookback: int) -> float:
+    if len(candles) <= lookback or candles[-lookback-1].close <= 0:
+        return 0.0
+    return (candles[-1].close / candles[-lookback-1].close - 1.0) * 100.0
+
+
+def _range_pct(candles: List[Candle], lookback: int) -> float:
+    if len(candles) < lookback:
+        return 0.0
+    window = candles[-lookback:]
+    base = window[0].close
+    if base <= 0:
+        return 0.0
+    return (max(c.high for c in window) - min(c.low for c in window)) / base * 100.0
+
+
+def _volume_ratio(candles: List[Candle], lookback: int = 5, baseline: int = 30) -> float:
+    if len(candles) < lookback + baseline:
+        return 1.0
+    recent = sum(c.quote_volume or c.volume * c.close for c in candles[-lookback:]) / lookback
+    old = sum(c.quote_volume or c.volume * c.close for c in candles[-lookback-baseline:-lookback]) / baseline
+    return recent / old if old > 0 else 1.0
+
+
+def structure_score_v5(candles: List[Candle]) -> Tuple[float, str]:
+    """Swing-aware directional quality used only for ranking candidates.
+    It is deliberately conservative: no clear swing progression => no high score.
+    """
+    if len(candles) < 60:
+        return 0.0, "insufficient history"
+    highs = pivot_highs(candles)
+    lows = pivot_lows(candles)
+    if len(highs) < 2 or len(lows) < 2:
+        return 0.0, "not enough swings"
+
+    hs = [v for _, v in highs[-4:]]
+    ls = [v for _, v in lows[-4:]]
+    bull = sum(1 for a,b in zip(hs, hs[1:]) if b > a) + sum(1 for a,b in zip(ls, ls[1:]) if b > a)
+    bear = sum(1 for a,b in zip(hs, hs[1:]) if b < a) + sum(1 for a,b in zip(ls, ls[1:]) if b < a)
+    close = candles[-1].close
+    e20 = ema([c.close for c in candles], 20)[-1]
+    e50 = ema([c.close for c in candles], 50)[-1]
+    slope = _safe_return(candles, min(20, len(candles)-1))
+
+    if bull >= 3 and e20 > e50 and slope > 0:
+        score = min(100.0, 55 + bull * 8 + min(15, max(0, slope) * 2))
+        return score, "HH/HL + bullish trend"
+    if bear >= 3 and e20 < e50 and slope < 0:
+        score = min(100.0, 55 + bear * 8 + min(15, abs(min(0, slope)) * 2))
+        return score, "LL/LH + bearish trend"
+
+    # Transitional structure is useful for scalp, but not for position building.
+    if bull > bear and e20 >= e50:
+        return 48.0, "developing bullish structure"
+    if bear > bull and e20 <= e50:
+        return 48.0, "developing bearish structure"
+    return 25.0, "mixed structure"
+
+
+def classify_trade_type(setup: Setup, candles: Dict[str, List[Candle]]) -> Tuple[str, str, str]:
+    c1 = candles.get("1H", [])
+    c4 = candles.get("4H", [])
+    c15 = candles.get("15m", [])
+    r1 = abs(_safe_return(c1, min(12, max(1, len(c1)-1)))) if c1 else 0.0
+    r4 = abs(_safe_return(c4, min(8, max(1, len(c4)-1)))) if c4 else 0.0
+    s1, _ = structure_score_v5(c1) if c1 else (0.0, "")
+    s4, _ = structure_score_v5(c4) if c4 else (0.0, "")
+
+    if setup.strategy in ("Horizontal Level Breakout", "Momentum Breakout") and setup.breakout_volume_ratio >= 1.35:
+        return "⚡ SCALP / БЫСТРЫЙ ПРОБОЙ", "5–45 мин", "1 entry"
+    if (s1 >= 70 and s4 >= 60 and r1 >= 0.8) or setup.strategy == "Pre-Breakout Level Setup":
+        return "🏦 POSITION BUILD / НАБОР", "1–6 ч", "1–3 entries"
+    if s4 >= 72 and r4 >= 1.5:
+        return "🔥 TREND HOLD / УДЕРЖАНИЕ", "3–12 ч", "1–2 entries"
+    return "⚡ SCALP / БЫСТРЫЙ ПРОБОЙ", "5–45 мин", "1 entry"
+
+
+def market_selection_score(ticker: dict, c1: List[Candle], c15: List[Candle]) -> Tuple[float, str]:
+    """Rank coins before expensive deep analysis.
+    Liquidity is necessary but not sufficient; recent movement, volatility,
+    volume expansion and structure all contribute.
+    """
+    vol = float(ticker.get("vol24h_usd", 0) or 0)
+    price = float(ticker.get("last", 0) or 0)
+    if price <= 0 or vol < MIN_CANDIDATE_VOLUME_USD:
+        return 0.0, "failed liquidity"
+
+    score = 0.0
+    # 20: liquidity quality
+    if vol >= 1_000_000_000: score += 20
+    elif vol >= 500_000_000: score += 18
+    elif vol >= 250_000_000: score += 16
+    elif vol >= 100_000_000: score += 13
+    elif vol >= 60_000_000: score += 9
+    else: score += 4
+
+    ret1 = _safe_return(c1, min(12, max(1, len(c1)-1)))
+    rng1 = _range_pct(c1, min(24, len(c1))) if c1 else 0.0
+    vr = _volume_ratio(c15) if c15 else 1.0
+    s, why = structure_score_v5(c1) if c1 else (0.0, "no 1H data")
+
+    # 20: actionable activity, not just a giant 24h candle
+    score += min(20, abs(ret1) * 4.0)
+    # 15: volatility sweet spot; penalize dead and wildly extended markets
+    if 0.8 <= rng1 <= 8.0: score += 15
+    elif 0.4 <= rng1 < 0.8 or 8.0 < rng1 <= 12.0: score += 8
+    # 15: structure
+    score += s * 0.15
+    # 15: volume expansion
+    score += min(15, max(0.0, (vr - 1.0) * 12.0))
+    # 15: avoid chasing a vertical 1H move; reward controlled movement
+    if abs(ret1) <= 4.0: score += 10
+    elif abs(ret1) <= 7.0: score += 5
+
+    return min(100.0, score), why
+
+
+# ============================================================
 # ANALYZE SYMBOL
 # ============================================================
 
@@ -3156,7 +3303,7 @@ def analyze_symbol(
         f"{cluster_reason}"
     )
 
-    return Setup(
+    setup = Setup(
         inst_id=inst_id,
         coin=get_coin(inst_id),
         direction=direction,
@@ -3185,6 +3332,19 @@ def analyze_symbol(
         candles_5m=confirmed_5m[-80:]
     )
 
+    setup.trade_type, setup.hold_hours, setup.build_entries = classify_trade_type(setup, candles)
+    if setup.trade_type.startswith("🏦"):
+        mid = (setup.entry_low + setup.entry_high) / 2.0
+        if setup.direction == "LONG":
+            setup.entry_1, setup.entry_2, setup.entry_3 = setup.entry_high, mid, setup.entry_low
+        else:
+            setup.entry_1, setup.entry_2, setup.entry_3 = setup.entry_low, mid, setup.entry_high
+    else:
+        setup.entry_1 = setup.entry_low
+        setup.entry_2 = setup.entry_high
+        setup.entry_3 = 0.0
+    return setup
+
 
 # ============================================================
 # SIGNAL CONTROL
@@ -3196,11 +3356,22 @@ def can_send_new_signal(
 
     current = now_ts()
 
-    # Never duplicate an already active READY setup.
     if inst_id in ready_setups:
         return False
 
-    # Keep only the per-symbol cooldown as duplicate protection.
+    # --------------------------------------------------------
+    # DAILY LIMIT
+    # --------------------------------------------------------
+
+    if signals_today >= (
+        MAX_SIGNALS_PER_DAY
+    ):
+        return False
+
+    # --------------------------------------------------------
+    # COOLDOWN
+    # --------------------------------------------------------
+
     row = db.execute(
         """
         SELECT created_at
@@ -3215,13 +3386,37 @@ def can_send_new_signal(
     ).fetchone()
 
     if row:
-        last_time = float(row[0])
+
+        last_time = float(
+            row[0]
+        )
+
         if (
             current
             - last_time
             < COOLDOWN_MINUTES * 60
         ):
             return False
+
+    # --------------------------------------------------------
+    # HOURLY LIMIT
+    # --------------------------------------------------------
+
+    cutoff = (
+        current
+        - 3600
+    )
+
+    signals_hour[:] = [
+        value
+        for value in signals_hour
+        if value >= cutoff
+    ]
+
+    if len(signals_hour) >= (
+        MAX_SIGNALS_PER_HOUR
+    ):
+        return False
 
     return True
 
@@ -3474,16 +3669,24 @@ def make_chart(
 
 def telegram_html(message: str) -> str:
     """
-    Public Telegram text is intentionally plain.
-    Remove legacy Markdown/code markers and escape HTML-sensitive data.
+    Convert the bot's legacy Markdown-like markup to Telegram HTML.
+    Dynamic market values are escaped so coin/strategy names cannot
+    break Telegram entity parsing.
     """
     if not message:
         return ""
 
-    s = str(message)
-    s = s.replace("*", "")
-    s = s.replace("`", "")
-    return html.escape(s, quote=False)
+    # Escape first, then restore only our intentional formatting tokens.
+    s = html.escape(str(message), quote=False)
+
+    # Bold
+    s = re.sub(r"\*([^*\n]+)\*", r"<b>\1</b>", s)
+
+    # Inline code
+    s = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", s)
+
+    # Telegram/HTML accepts ordinary emoji and text.
+    return s
 
 # ============================================================
 # TELEGRAM SIGNAL
@@ -3531,6 +3734,10 @@ def build_signal_text(
         f"🔥 *{setup.coin}USDT — "
         f"{setup.direction}*\n\n"
 
+        f"🧭 *ТИП СДЕЛКИ:* `{setup.trade_type}`\n"
+        f"⏱ *Удержание:* `{setup.hold_hours}`\n"
+        f"🪜 *Набор:* `{setup.build_entries}`\n\n"
+
         f"💰 *Цена:* "
         f"`{fmt_price(setup.current_price)}`\n"
 
@@ -3547,7 +3754,15 @@ def build_signal_text(
 
         f"🎯 *ТОЧКА ВХОДА*\n"
         f"`{fmt_price(setup.entry_low)}` – "
-        f"`{fmt_price(setup.entry_high)}`\n\n"
+        f"`{fmt_price(setup.entry_high)}`\n"
+        + (
+            f"\n🏦 *ЛЕСТНИЦА НАБОРА*\n"
+            f"Entry 1 — 30%: `{fmt_price(setup.entry_1)}`\n"
+            f"Entry 2 — 30%: `{fmt_price(setup.entry_2)}`\n"
+            f"Entry 3 — 40%: `{fmt_price(setup.entry_3)}`\n"
+            if setup.trade_type.startswith("🏦") else ""
+        )
+        + "\n"
 
         f"🛑 *STOP LOSS*\n"
         f"`{fmt_price(setup.sl)}`\n"
@@ -3651,6 +3866,7 @@ def send_photo_and_text(
                     CHANNEL_ID,
                     photo,
                     caption=telegram_html(caption),
+                    parse_mode="HTML",
                     show_caption_above_media=True
                 )
             )
@@ -3663,7 +3879,8 @@ def send_photo_and_text(
         sent_text = (
             bot.send_message(
                 CHANNEL_ID,
-                telegram_html(text)
+                text,
+                parse_mode="HTML"
             )
         )
 
@@ -3750,7 +3967,8 @@ def send_morning_message():
 
         bot.send_message(
             CHANNEL_ID,
-            message
+            message,
+            parse_mode="HTML"
         )
 
         last_morning_date = today
@@ -4168,7 +4386,7 @@ def _send_result_update(inst_id, direction, result):
     else:
         return
     try:
-        bot.send_message(CHANNEL_ID, telegram_html(message))
+        bot.send_message(CHANNEL_ID, telegram_html(message), parse_mode="HTML")
     except Exception:
         log.exception("RESULT TELEGRAM ERROR | %s | %s", inst_id, result)
 
@@ -4389,50 +4607,73 @@ def load_candles_for_symbol(inst_id):
 
 
 def scan_market():
-    global signals_today, last_fast_pass_ts, watchlist
+    """Two-stage scanner: cheap universe ranking -> structure ranking -> deep setups."""
+    global signals_today, last_fast_pass_ts, watchlist, scan_count
 
     n = local_now()
     day_key = n.date().isoformat()
-    state_key = "signals_day"
-    saved_day = db.execute("SELECT value FROM bot_state WHERE key=?", (state_key,)).fetchone()
+    saved_day = db.execute("SELECT value FROM bot_state WHERE key=?", ("signals_day",)).fetchone()
     if not saved_day or saved_day[0] != day_key:
         signals_today = 0
-        db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)", (state_key, day_key))
+        db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)", ("signals_day", day_key))
         db.commit()
+    if signals_today >= MAX_SIGNALS_PER_DAY:
+        return
 
     instruments = get_instruments()
     tickers = get_tickers()
-    candidates = []
-
+    fast = []
     for inst_id, ticker in tickers.items():
         if inst_id not in instruments:
             continue
         volume = float(ticker.get("vol24h_usd", 0) or 0)
-        if volume < MIN_24H_VOLUME_USD:
+        if volume < MIN_CANDIDATE_VOLUME_USD:
             continue
-        candidates.append((fast_market_score(ticker), volume, inst_id, ticker))
+        fs = fast_market_score(ticker)
+        fast.append((fs, volume, inst_id, ticker))
+    fast.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    fast = fast[:MARKET_RANK_LIMIT] if MARKET_RANK_LIMIT > 0 else fast
 
-    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-
-    now = now_ts()
-    if now - last_fast_pass_ts >= FAST_PASS_SECONDS or not watchlist:
-        watchlist = candidates[:DEEP_CANDIDATES] if DEEP_CANDIDATES > 0 else candidates
-        last_fast_pass_ts = now
-        log.info("WATCHLIST UPDATED | liquid=%s | deep=%s", len(candidates), len(watchlist))
+    # Structure-ranking pass. Only 1H/15M are loaded here to keep API usage bounded.
+    ranked = []
+    for fs, volume, inst_id, ticker in fast:
+        try:
+            c1 = get_candles(inst_id, "1H", 100)
+            c15 = get_candles(inst_id, "15m", 100)
+            ms, why = market_selection_score(ticker, c1, c15)
+            if ms < MIN_MARKET_SCORE:
+                continue
+            ranked.append((ms, fs, volume, inst_id, ticker, why))
+        except Exception as exc:
+            log.warning("RANK FAILED | %s | %s", inst_id, exc)
+    ranked.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    watchlist = ranked[:DEEP_CANDIDATES] if DEEP_CANDIDATES > 0 else ranked
+    last_fast_pass_ts = now_ts()
+    scan_count += 1
+    log.info("MARKET ENGINE | universe=%s | ranked=%s | deep=%s", len(tickers), len(ranked), len(watchlist))
 
     setups = []
-    for _, _, inst_id, ticker in watchlist:
+    for market_score, _, _, inst_id, ticker, why in watchlist:
         if not can_send_new_signal(inst_id):
             continue
         try:
             candles = load_candles_for_symbol(inst_id)
             setup = analyze_symbol_with_patterns(inst_id, ticker, candles)
-            if setup is not None and setup.score >= MIN_SCORE:
+            if setup is None:
+                continue
+            setup.market_score = int(round(market_score))
+            # Hard structure veto for position-style setups.
+            s1, _ = structure_score_v5(candles.get("1H", []))
+            if setup.trade_type.startswith("🏦") and s1 < MIN_STRUCTURE_SCORE:
+                log.info("POSITION REJECT | %s | structure=%.1f", inst_id, s1)
+                continue
+            if setup.score >= MIN_SCORE:
+                setup.reason += f" Market rank: {setup.market_score}/100 ({why})."
                 setups.append(setup)
         except Exception as exc:
             log.warning("ANALYZE FAILED | %s | %s", inst_id, exc)
 
-    setups.sort(key=lambda x: x.score, reverse=True)
+    setups.sort(key=lambda x: (x.score, x.market_score), reverse=True)
     final_setups = setups[:FINAL_SIGNAL_CANDIDATES] if FINAL_SIGNAL_CANDIDATES > 0 else setups
 
     for setup in final_setups:
@@ -4451,6 +4692,8 @@ def scan_market():
                 )
             signals_hour.append(now_ts())
             signals_today += 1
+            if signals_today >= MAX_SIGNALS_PER_DAY:
+                break
 
 
 def main():

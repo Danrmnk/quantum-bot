@@ -121,14 +121,6 @@ MIN_CANDIDATE_VOLUME_USD = float(
     )
 )
 
-# New market-selection engine. The fast pass only ranks the universe;
-# the deep pass validates structure before a symbol can become a signal.
-MARKET_RANK_LIMIT = int(os.getenv("MARKET_RANK_LIMIT", "60"))
-DEEP_CANDIDATES = int(os.getenv("DEEP_CANDIDATES", "20"))
-MIN_STRUCTURE_SCORE = float(os.getenv("MIN_STRUCTURE_SCORE", "55"))
-MIN_MARKET_SCORE = float(os.getenv("MIN_MARKET_SCORE", "62"))
-
-
 
 # ============================================================
 # SCORE
@@ -475,15 +467,6 @@ class Setup:
     setup_state: str
 
     candles_5m: List[Candle]
-
-    # V5 classification: tells Telegram how the setup is meant to be traded.
-    trade_type: str = "SCALP"
-    market_score: int = 0
-    hold_hours: str = "0.1–0.5h"
-    build_entries: str = "1 entry"
-    entry_1: float = 0.0
-    entry_2: float = 0.0
-    entry_3: float = 0.0
 
 
 @dataclass
@@ -2592,2125 +2575,574 @@ def fast_market_score(
     return score
 
 
-# ============================================================
-# V5 MARKET SELECTION ENGINE
-# ============================================================
-
-def _safe_return(candles: List[Candle], lookback: int) -> float:
-    if len(candles) <= lookback or candles[-lookback-1].close <= 0:
-        return 0.0
-    return (candles[-1].close / candles[-lookback-1].close - 1.0) * 100.0
-
-
-def _range_pct(candles: List[Candle], lookback: int) -> float:
-    if len(candles) < lookback:
-        return 0.0
-    window = candles[-lookback:]
-    base = window[0].close
-    if base <= 0:
-        return 0.0
-    return (max(c.high for c in window) - min(c.low for c in window)) / base * 100.0
-
-
-def _volume_ratio(candles: List[Candle], lookback: int = 5, baseline: int = 30) -> float:
-    if len(candles) < lookback + baseline:
-        return 1.0
-    recent = sum(c.quote_volume or c.volume * c.close for c in candles[-lookback:]) / lookback
-    old = sum(c.quote_volume or c.volume * c.close for c in candles[-lookback-baseline:-lookback]) / baseline
-    return recent / old if old > 0 else 1.0
-
-
-def structure_score_v5(candles: List[Candle]) -> Tuple[float, str]:
-    """Swing-aware directional quality used only for ranking candidates.
-    It is deliberately conservative: no clear swing progression => no high score.
-    """
-    if len(candles) < 60:
-        return 0.0, "insufficient history"
-    highs = pivot_highs(candles)
-    lows = pivot_lows(candles)
-    if len(highs) < 2 or len(lows) < 2:
-        return 0.0, "not enough swings"
-
-    hs = [v for _, v in highs[-4:]]
-    ls = [v for _, v in lows[-4:]]
-    bull = sum(1 for a,b in zip(hs, hs[1:]) if b > a) + sum(1 for a,b in zip(ls, ls[1:]) if b > a)
-    bear = sum(1 for a,b in zip(hs, hs[1:]) if b < a) + sum(1 for a,b in zip(ls, ls[1:]) if b < a)
-    close = candles[-1].close
-    e20 = ema([c.close for c in candles], 20)[-1]
-    e50 = ema([c.close for c in candles], 50)[-1]
-    slope = _safe_return(candles, min(20, len(candles)-1))
-
-    if bull >= 3 and e20 > e50 and slope > 0:
-        score = min(100.0, 55 + bull * 8 + min(15, max(0, slope) * 2))
-        return score, "HH/HL + bullish trend"
-    if bear >= 3 and e20 < e50 and slope < 0:
-        score = min(100.0, 55 + bear * 8 + min(15, abs(min(0, slope)) * 2))
-        return score, "LL/LH + bearish trend"
-
-    # Transitional structure is useful for scalp, but not for position building.
-    if bull > bear and e20 >= e50:
-        return 48.0, "developing bullish structure"
-    if bear > bull and e20 <= e50:
-        return 48.0, "developing bearish structure"
-    return 25.0, "mixed structure"
-
-
-def classify_trade_type(setup: Setup, candles: Dict[str, List[Candle]]) -> Tuple[str, str, str]:
-    c1 = candles.get("1H", [])
-    c4 = candles.get("4H", [])
-    c15 = candles.get("15m", [])
-    r1 = abs(_safe_return(c1, min(12, max(1, len(c1)-1)))) if c1 else 0.0
-    r4 = abs(_safe_return(c4, min(8, max(1, len(c4)-1)))) if c4 else 0.0
-    s1, _ = structure_score_v5(c1) if c1 else (0.0, "")
-    s4, _ = structure_score_v5(c4) if c4 else (0.0, "")
-
-    if setup.strategy in ("Horizontal Level Breakout", "Momentum Breakout") and setup.breakout_volume_ratio >= 1.35:
-        return "⚡ SCALP / БЫСТРЫЙ ПРОБОЙ", "5–45 мин", "1 entry"
-    if (s1 >= 70 and s4 >= 60 and r1 >= 0.8) or setup.strategy == "Pre-Breakout Level Setup":
-        return "🏦 POSITION BUILD / НАБОР", "1–6 ч", "1–3 entries"
-    if s4 >= 72 and r4 >= 1.5:
-        return "🔥 TREND HOLD / УДЕРЖАНИЕ", "3–12 ч", "1–2 entries"
-    return "⚡ SCALP / БЫСТРЫЙ ПРОБОЙ", "5–45 мин", "1 entry"
-
-
-def market_selection_score(ticker: dict, c1: List[Candle], c15: List[Candle]) -> Tuple[float, str]:
-    """Rank coins before expensive deep analysis.
-    Liquidity is necessary but not sufficient; recent movement, volatility,
-    volume expansion and structure all contribute.
-    """
-    vol = float(ticker.get("vol24h_usd", 0) or 0)
-    price = float(ticker.get("last", 0) or 0)
-    if price <= 0 or vol < MIN_CANDIDATE_VOLUME_USD:
-        return 0.0, "failed liquidity"
-
-    score = 0.0
-    # 20: liquidity quality
-    if vol >= 1_000_000_000: score += 20
-    elif vol >= 500_000_000: score += 18
-    elif vol >= 250_000_000: score += 16
-    elif vol >= 100_000_000: score += 13
-    elif vol >= 60_000_000: score += 9
-    else: score += 4
-
-    ret1 = _safe_return(c1, min(12, max(1, len(c1)-1)))
-    rng1 = _range_pct(c1, min(24, len(c1))) if c1 else 0.0
-    vr = _volume_ratio(c15) if c15 else 1.0
-    s, why = structure_score_v5(c1) if c1 else (0.0, "no 1H data")
-
-    # 20: actionable activity, not just a giant 24h candle
-    score += min(20, abs(ret1) * 4.0)
-    # 15: volatility sweet spot; penalize dead and wildly extended markets
-    if 0.8 <= rng1 <= 8.0: score += 15
-    elif 0.4 <= rng1 < 0.8 or 8.0 < rng1 <= 12.0: score += 8
-    # 15: structure
-    score += s * 0.15
-    # 15: volume expansion
-    score += min(15, max(0.0, (vr - 1.0) * 12.0))
-    # 15: avoid chasing a vertical 1H move; reward controlled movement
-    if abs(ret1) <= 4.0: score += 10
-    elif abs(ret1) <= 7.0: score += 5
-
-    return min(100.0, score), why
-
 
 # ============================================================
-# ANALYZE SYMBOL
+# QUANTUM LEVEL ENGINE V8
+# Replaces the old signal-generation loop with a pure level scanner.
+# The original OKX market/candle infrastructure and indicator helpers are
+# intentionally reused; the output is a ranked list of technical zones.
 # ============================================================
 
-def analyze_symbol(
-    inst_id: str,
-    ticker: dict,
-    candles: Dict[str, List[Candle]]
-) -> Optional[Setup]:
-
-    current = float(
-        ticker.get(
-            "last",
-            0
-        )
-        or 0
-    )
-
-    if current <= 0:
-        return None
-
-    c1h = candles.get(
-        "1H",
-        []
-    )
-
-    c4h = candles.get(
-        "4H",
-        []
-    )
-
-    c30 = candles.get(
-        "30m",
-        []
-    )
-
-    c15 = candles.get(
-        "15m",
-        []
-    )
-
-    c5 = candles.get(
-        "5m",
-        []
-    )
-
-    confirmed_5m = [
-        c
-        for c in c5
-        if c.confirmed
-    ]
-
-    if len(c1h) < 60:
-        return None
-
-    if len(c4h) < 50:
-        return None
-
-    if len(c15) < 50:
-        return None
-
-    if len(confirmed_5m) < 35:
-        return None
-
-    # --------------------------------------------------------
-    # 1H + 4H STRUCTURE
-    # --------------------------------------------------------
-
-    structure_1h = structure_direction(
-        c1h
-    )
-
-    structure_4h = structure_direction(
-        c4h
-    )
-
-    if structure_1h == "NEUTRAL":
-        return None
-
-    direction = structure_1h
-
-    # 4H против 1H не запрещает сетап полностью,
-    # но сильно снижает качество.
-    higher_tf_alignment = (
-        structure_4h == direction
-    )
-
-    score = 0
-
-    score += 15
-
-    if higher_tf_alignment:
-        score += 12
-
-    else:
-        score -= 5
-
-    score += structure_strength(
-        c1h,
-        direction
-    )
-
-    score += structure_strength(
-        c4h,
-        direction
-    ) // 2
-
-    # --------------------------------------------------------
-    # LEVELS
-    # --------------------------------------------------------
-
-    level_data = {
-        "1D": candles.get(
-            "1D",
-            []
-        ),
-        "4H": c4h,
-        "1H": c1h,
-        "30m": c30,
-        "15m": c15,
-        "5m": confirmed_5m,
-    }
-
-    levels = build_levels(
-        current,
-        direction,
-        level_data
-    )
-
-    clusters = cluster_levels(
-        levels,
-        current
-    )
-
-    level = best_level(
-        clusters,
-        current
-    )
-
-    if level is None:
-        return None
-
-    # Не берём слишком далёкие уровни.
-    if level.distance_pct > 1.20:
-        return None
-
-    # Сильный кластер.
-    score += int(
-        clamp(
-            level.strength * 0.35,
-            5,
-            25
-        )
-    )
-
-    # Несколько старших TF.
-    higher_tfs = sum(
-        1
-        for tf in level.timeframes
-        if tf in (
-            "1D",
-            "4H",
-            "1H"
-        )
-    )
-
-    if higher_tfs >= 2:
-        score += 8
-
-    if higher_tfs >= 3:
-        score += 5
-
-    # --------------------------------------------------------
-    # ATR
-    # --------------------------------------------------------
-
-    atr_value = atr(
-        confirmed_5m,
-        14
-    )
-
-    if atr_value <= 0:
-        return None
-
-    volatility_pct = (
-        atr_value
-        / current
-        * 100.0
-    )
-
-    if volatility_pct < 0.025:
-        return None
-
-    if volatility_pct > 3.0:
-        return None
-
-    # --------------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------------
-
-    activity_points, v_ratio = (
-        activity_score(
-            confirmed_5m,
-            ticker
-        )
-    )
-
-    score += activity_points
-
-    # --------------------------------------------------------
-    # LEVEL REACTION
-    # --------------------------------------------------------
-
-    reaction_points, reaction_ok = (
-        level_reaction(
-            confirmed_5m,
-            level.price,
-            direction
-        )
-    )
-
-    if reaction_ok:
-        score += reaction_points
-
-    # --------------------------------------------------------
-    # STRATEGIES
-    # --------------------------------------------------------
-
-    current_candle = confirmed_5m[-1]
-    previous = confirmed_5m[-2]
-
-    strategies = []
-
-    # 1. Actual breakout.
-    breakout_points, breakout_ok, breakout_reason = (
-        breakout_analysis(
-            current,
-            level,
-            previous,
-            current_candle,
-            direction
-        )
-    )
-
-    if breakout_ok:
-
-        strategies.append(
-            (
-                "Horizontal Level Breakout",
-                breakout_points,
-                breakout_reason,
-                "ACTIVE"
-            )
-        )
-
-    # 2. Compression.
-    compression_points, compression_ok, compression_reason = (
-        compression_analysis(
-            c15,
-            direction
-        )
-    )
-
-    if compression_ok:
-
-        strategies.append(
-            (
-                "Trendline Compression Breakout",
-                compression_points,
-                compression_reason,
-                "READY"
-            )
-        )
-
-    # 3. Momentum.
-    momentum_points, momentum_ok, momentum_reason = (
-        momentum_analysis(
-            confirmed_5m,
-            direction
-        )
-    )
-
-    if momentum_ok:
-
-        strategies.append(
-            (
-                "Momentum Breakout",
-                momentum_points,
-                momentum_reason,
-                "ACTIVE"
-            )
-        )
-
-    # 4. Pre-trigger.
-    pre_points, pre_ok, pre_reason = (
-        pre_trigger_analysis(
-            current,
-            level,
-            confirmed_5m,
-            direction
-        )
-    )
-
-    if pre_ok:
-
-        strategies.append(
-            (
-                "Pre-Breakout Level Setup",
-                pre_points,
-                pre_reason,
-                "READY"
-            )
-        )
-
-    if not strategies:
-        return None
-
-    strategies.sort(
-        key=lambda item: item[1],
-        reverse=True
-    )
-
-    strategy, strategy_points, reason, setup_state = (
-        strategies[0]
-    )
-
-    score += strategy_points
-
-    # --------------------------------------------------------
-    # MULTI-STRATEGY BONUS
-    # --------------------------------------------------------
-
-    if len(strategies) >= 2:
-        score += 5
-
-    if len(strategies) >= 3:
-        score += 5
-
-    # --------------------------------------------------------
-    # LIQUIDITY
-    # --------------------------------------------------------
-
-    volume_24h = float(
-        ticker.get(
-            "vol24h_usd",
-            0
-        )
-        or 0
-    )
-
-    if volume_24h < MIN_CANDIDATE_VOLUME_USD:
-        return None
-
-    if volume_24h >= 1_000_000_000:
-
-        liquidity = "HIGH"
-        score += 6
-
-    elif volume_24h >= 500_000_000:
-
-        liquidity = "HIGH"
-        score += 5
-
-    elif volume_24h >= 250_000_000:
-
-        liquidity = "GOOD"
-        score += 4
-
-    elif volume_24h >= 100_000_000:
-
-        liquidity = "GOOD"
-        score += 3
-
-    else:
-
-        liquidity = "MEDIUM"
-        score += 1
-
-    # --------------------------------------------------------
-    # OI
-    # --------------------------------------------------------
-
-    oi_value = get_open_interest(
-        inst_id
-    )
-
-    if oi_value is not None:
-
-        oi_status = "AVAILABLE"
-        score += 3
-
-    else:
-
-        oi_status = "N/A"
-
-    # --------------------------------------------------------
-    # DISTANCE / CHASE
-    # --------------------------------------------------------
-
-    if level.distance_pct > 0.75:
-        return None
-
-    # После пробоя не берём сильно убежавшую цену.
-    if direction == "LONG":
-
-        if current > (
-            level.price
-            * (
-                1
-                + MAX_CHASE_PCT / 100.0
-            )
-        ):
-
-            return None
-
-    else:
-
-        if current < (
-            level.price
-            * (
-                1
-                - MAX_CHASE_PCT / 100.0
-            )
-        ):
-
-            return None
-
-    # --------------------------------------------------------
-    # ENTRY ZONE
-    # --------------------------------------------------------
-
-    zone_pct = clamp(
-        volatility_pct * 0.40,
-        0.08,
-        0.30
-    )
-
-    if direction == "LONG":
-
-        entry_low = (
-            level.price
-            * (
-                1
-                - zone_pct / 100.0
-            )
-        )
-
-        entry_high = (
-            level.price
-            * (
-                1
-                + zone_pct / 100.0
-            )
-        )
-
-    else:
-
-        entry_low = (
-            level.price
-            * (
-                1
-                - zone_pct / 100.0
-            )
-        )
-
-        entry_high = (
-            level.price
-            * (
-                1
-                + zone_pct / 100.0
-            )
-        )
-
-    # --------------------------------------------------------
-    # STRUCTURAL STOP
-    # --------------------------------------------------------
-
-    recent_15 = c15[-24:]
-
-    if len(recent_15) < 12:
-        return None
-
-    if direction == "LONG":
-
-        structural_low = min(
-            c.low
-            for c in recent_15
-        )
-
-        # Для long SL ниже структуры.
-        sl = (
-            structural_low
-            - atr_value * 0.30
-        )
-
-        if sl >= current:
-            return None
-
-        risk = (
-            current
-            - sl
-        )
-
-    else:
-
-        structural_high = max(
-            c.high
-            for c in recent_15
-        )
-
-        sl = (
-            structural_high
-            + atr_value * 0.30
-        )
-
-        if sl <= current:
-            return None
-
-        risk = (
-            sl
-            - current
-        )
-
-    if risk <= 0:
-        return None
-
-    risk_pct = (
-        risk
-        / current
-        * 100.0
-    )
-
-    if risk_pct < 0.15:
-        risk_pct = 0.15
-
-    if risk_pct > 2.20:
-        return None
-
-    # --------------------------------------------------------
-    # TAKE PROFITS
-    # --------------------------------------------------------
-
-    # TP строим от текущего риска.
-    # Это сохраняет знакомую нам лестницу.
-    if direction == "LONG":
-
-        tp1 = current + risk * 1.0
-        tp2 = current + risk * 2.0
-        tp3 = current + risk * 3.0
-
-    else:
-
-        tp1 = current - risk * 1.0
-        tp2 = current - risk * 2.0
-        tp3 = current - risk * 3.0
-
-    # --------------------------------------------------------
-    # FINAL SCORE
-    # --------------------------------------------------------
-
-    score = int(
-        clamp(
-            score,
-            0,
-            100
-        )
-    )
-
-    if score < MIN_SCORE:
-        return None
-
-    # --------------------------------------------------------
-    # REASON
-    # --------------------------------------------------------
-
-    tf_text = ", ".join(
-        level.timeframes
-    )
-
-    cluster_reason = (
-        f"Ключевой кластер уровня "
-        f"подтверждён таймфреймами: {tf_text}. "
-        f"Сила зоны: {level.strength}/100."
-    )
-
-    full_reason = (
-        f"{reason} "
-        f"{cluster_reason}"
-    )
-
-    setup = Setup(
-        inst_id=inst_id,
-        coin=get_coin(inst_id),
-        direction=direction,
-        strategy=strategy,
-        level=level.price,
-        level_strength=level.strength,
-        level_tf=tf_text,
-        current_price=current,
-        entry_low=entry_low,
-        entry_high=entry_high,
-        sl=sl,
-        tp1=tp1,
-        tp2=tp2,
-        tp3=tp3,
-        score=score,
-        liquidity=liquidity,
-        volume_grade=grade_volume(
-            v_ratio
-        ),
-        oi_status=oi_status,
-        reason=full_reason,
-        volume_24h=volume_24h,
-        breakout_volume_ratio=v_ratio,
-        atr_pct=volatility_pct,
-        setup_state=setup_state,
-        candles_5m=confirmed_5m[-80:]
-    )
-
-    setup.trade_type, setup.hold_hours, setup.build_entries = classify_trade_type(setup, candles)
-    if setup.trade_type.startswith("🏦"):
-        mid = (setup.entry_low + setup.entry_high) / 2.0
-        if setup.direction == "LONG":
-            setup.entry_1, setup.entry_2, setup.entry_3 = setup.entry_high, mid, setup.entry_low
-        else:
-            setup.entry_1, setup.entry_2, setup.entry_3 = setup.entry_low, mid, setup.entry_high
-    else:
-        setup.entry_1 = setup.entry_low
-        setup.entry_2 = setup.entry_high
-        setup.entry_3 = 0.0
-    return setup
-
-
-# ============================================================
-# SIGNAL CONTROL
-# ============================================================
-
-def can_send_new_signal(
+from dataclasses import dataclass, field
+from collections import defaultdict
+from pathlib import Path
+
+LEVEL_SCAN_INTERVAL = int(os.getenv("LEVEL_SCAN_INTERVAL", "30"))
+LEVEL_DEEP_CANDIDATES = int(os.getenv("LEVEL_DEEP_CANDIDATES", "50"))
+LEVEL_FINAL_COUNT = int(os.getenv("LEVEL_FINAL_COUNT", "5"))
+LEVEL_MIN_SCORE = int(os.getenv("LEVEL_MIN_SCORE", "78"))
+LEVEL_MIN_VOLUME = float(os.getenv("LEVEL_MIN_VOLUME", "60000000"))
+LEVEL_MAX_DISTANCE = float(os.getenv("LEVEL_MAX_DISTANCE", "4.0"))
+LEVEL_NEAR_DISTANCE = float(os.getenv("LEVEL_NEAR_DISTANCE", "1.0"))
+LEVEL_COOLDOWN_MINUTES = int(os.getenv("LEVEL_COOLDOWN_MINUTES", "120"))
+LEVEL_CHART_CANDLES = int(os.getenv("LEVEL_CHART_CANDLES", "90"))
+LEVEL_MAX_MESSAGES_PER_SCAN = int(os.getenv("LEVEL_MAX_MESSAGES_PER_SCAN", "5"))
+
+LEVEL_TF_WEIGHTS = {
+    "1D": 34,
+    "4H": 28,
+    "1H": 22,
+    "30m": 15,
+    "15m": 10,
+    "5m": 5,
+}
+
+@dataclass
+class LevelCandidate:
     inst_id: str
-) -> bool:
-
-    current = now_ts()
-
-    if inst_id in ready_setups:
-        return False
-
-    # --------------------------------------------------------
-    # DAILY LIMIT
-    # --------------------------------------------------------
-
-    if signals_today >= (
-        MAX_SIGNALS_PER_DAY
-    ):
-        return False
-
-    # --------------------------------------------------------
-    # COOLDOWN
-    # --------------------------------------------------------
-
-    row = db.execute(
-        """
-        SELECT created_at
-        FROM signals
-        WHERE inst_id = ?
-        ORDER BY created_at DESC
-        LIMIT 1
-        """,
-        (
-            inst_id,
-        )
-    ).fetchone()
-
-    if row:
-
-        last_time = float(
-            row[0]
-        )
-
-        if (
-            current
-            - last_time
-            < COOLDOWN_MINUTES * 60
-        ):
-            return False
-
-    # --------------------------------------------------------
-    # HOURLY LIMIT
-    # --------------------------------------------------------
-
-    cutoff = (
-        current
-        - 3600
-    )
-
-    signals_hour[:] = [
-        value
-        for value in signals_hour
-        if value >= cutoff
-    ]
-
-    if len(signals_hour) >= (
-        MAX_SIGNALS_PER_HOUR
-    ):
-        return False
-
-    return True
+    coin: str
+    kind: str
+    lower: float
+    upper: float
+    price: float
+    score: int
+    distance_pct: float
+    timeframes: List[str] = field(default_factory=list)
+    touches: int = 0
+    reactions: int = 0
+    volume_score: int = 0
+    structure_score: int = 0
+    confluence_score: int = 0
+    freshness_score: int = 0
+    rejection_score: int = 0
+    displacement_score: int = 0
+    liquidity_score: int = 0
+    role_score: int = 0
+    reason: str = ""
+    status: str = "WATCH"
+    current_price: float = 0.0
+    volume_24h: float = 0.0
+    candles_1h: List[Candle] = field(default_factory=list)
 
 
-# ============================================================
-# CHART
-# ============================================================
+def _level_tf_tolerance(tf: str, candles: List[Candle], price: float) -> float:
+    if price <= 0:
+        return 0.15
+    ap = atr_pct(candles[-80:]) if candles else 0.0
+    base = {"1D": 0.55, "4H": 0.40, "1H": 0.28, "30m": 0.20, "15m": 0.14, "5m": 0.09}.get(tf, 0.20)
+    return max(base, min(base * 1.8, ap * 0.65 if ap > 0 else base))
 
-def make_chart(
-    setup: Setup
-) -> str:
 
-    candles = setup.candles_5m[
-        -70:
-    ]
+def _pivot_candidates(candles: List[Candle], tf: str) -> List[Tuple[float, str, int]]:
+    if len(candles) < 25:
+        return []
+    out = []
+    ph = pivot_highs(candles, 2 if tf not in ("1D", "4H") else 2, 2)
+    pl = pivot_lows(candles, 2 if tf not in ("1D", "4H") else 2, 2)
+    # Keep enough history to discover repeated institutional zones.
+    for idx, price in ph[-45:]:
+        age = len(candles) - 1 - idx
+        out.append((price, "RESISTANCE", max(1, 100 - min(age, 100))))
+    for idx, price in pl[-45:]:
+        age = len(candles) - 1 - idx
+        out.append((price, "SUPPORT", max(1, 100 - min(age, 100))))
+    return out
 
+
+def _extreme_candidates(candles: List[Candle], tf: str) -> List[Tuple[float, str, int]]:
+    if len(candles) < 30:
+        return []
+    windows = [20, 50, 100]
+    out = []
+    for w in windows:
+        if len(candles) < w:
+            continue
+        part = candles[-w:]
+        hi = max(part, key=lambda c: c.high)
+        lo = min(part, key=lambda c: c.low)
+        out.append((hi.high, "RESISTANCE", 70))
+        out.append((lo.low, "SUPPORT", 70))
+    return out
+
+
+def _round_level_candidates(current: float) -> List[Tuple[float, str, int]]:
+    if current <= 0:
+        return []
+    # Psychological levels are weak evidence by themselves; they only help
+    # when another source already places a real technical level nearby.
+    step = 10 ** max(0, int(__import__('math').floor(__import__('math').log10(current))) - 1)
+    if step <= 0:
+        return []
+    out = []
+    center = round(current / step) * step
+    for k in range(-4, 5):
+        p = center + k * step
+        if p > 0:
+            out.append((p, "PSYCHOLOGICAL", 20))
+    return out
+
+
+def _cluster_raw_levels(raw: List[Tuple[float, str, str, int]], current: float) -> List[dict]:
+    if not raw or current <= 0:
+        return []
+    raw = sorted(raw, key=lambda x: x[0])
+    clusters = []
+    for price, kind, tf, recency in raw:
+        tolerance = 0.18
+        if kind == "PSYCHOLOGICAL":
+            tolerance = 0.12
+        placed = False
+        for cl in clusters:
+            mid = cl["price"]
+            width = max(tolerance, cl["width"])
+            if abs(price - mid) / mid * 100 <= width:
+                cl["items"].append((price, kind, tf, recency))
+                weights = [LEVEL_TF_WEIGHTS.get(x[2], 5) for x in cl["items"]]
+                cl["price"] = sum(x[0] * w for x, w in zip(cl["items"], weights)) / sum(weights)
+                cl["width"] = max(cl["width"], tolerance)
+                placed = True
+                break
+        if not placed:
+            clusters.append({"price": price, "width": tolerance, "items": [(price, kind, tf, recency)]})
+    return clusters
+
+
+def _zone_from_cluster(cluster: dict, current: float, candles_by_tf: Dict[str, List[Candle]]) -> Tuple[float, float]:
+    price = cluster["price"]
+    spreads = []
+    for _, _, tf, _ in cluster["items"]:
+        cs = candles_by_tf.get(tf, [])
+        if cs:
+            a = atr_pct(cs[-80:])
+            if a > 0:
+                spreads.append(a * 0.32)
+    width_pct = max(0.08, min(0.45, (sum(spreads) / len(spreads)) if spreads else 0.15))
+    return price * (1 - width_pct / 100), price * (1 + width_pct / 100)
+
+
+def _level_touch_metrics(candles: List[Candle], lower: float, upper: float) -> Tuple[int, int, int, int]:
     if len(candles) < 10:
-        raise RuntimeError(
-            "Not enough candles."
+        return 0, 0, 0, 0
+    touches = reactions = rejection = displacement = 0
+    lo = min(lower, upper)
+    hi = max(lower, upper)
+    zone = max(hi - lo, 1e-12)
+    start = max(1, len(candles) - 100)
+    for i in range(start, len(candles)):
+        c = candles[i]
+        intersects = c.high >= lo and c.low <= hi
+        if not intersects:
+            continue
+        touches += 1
+        body = candle_body_ratio(c)
+        upper_wick = c.high - max(c.open, c.close)
+        lower_wick = min(c.open, c.close) - c.low
+        # Rejection: price trades through the zone but closes back away.
+        if c.close < lo and upper_wick > zone * 0.25 and upper_wick > abs(c.close - c.open):
+            reactions += 1
+            rejection += int(6 + min(10, body * 6))
+        elif c.close > hi and lower_wick > zone * 0.25 and lower_wick > abs(c.close - c.open):
+            reactions += 1
+            rejection += int(6 + min(10, body * 6))
+        elif body >= 0.55:
+            reactions += 1
+        # Displacement away from the zone within the next few candles.
+        future = candles[i + 1:min(i + 5, len(candles))]
+        if future:
+            if c.close <= hi:
+                move = max(x.high for x in future) - c.close
+            else:
+                move = c.close - min(x.low for x in future)
+            if move / max(abs(c.close), 1e-12) * 100 > 0.35:
+                displacement += 1
+    return touches, reactions, min(30, rejection), min(20, displacement * 5)
+
+
+def _volume_at_level(candles: List[Candle], lower: float, upper: float) -> int:
+    if len(candles) < 25:
+        return 0
+    vals = [c.quote_volume for c in candles[-100:] if c.quote_volume > 0]
+    if len(vals) < 20:
+        return 0
+    avg = sum(vals[:-1]) / max(1, len(vals) - 1)
+    if avg <= 0:
+        return 0
+    best = 0.0
+    for c in candles[-100:]:
+        if c.high >= lower and c.low <= upper:
+            best = max(best, c.quote_volume / avg)
+    if best >= 3.0: return 15
+    if best >= 2.0: return 12
+    if best >= 1.5: return 9
+    if best >= 1.2: return 6
+    return 2 if best > 0 else 0
+
+
+def _structure_context(candles_by_tf: Dict[str, List[Candle]], kind: str, price: float) -> int:
+    points = 0
+    for tf, weight in (("1D", 15), ("4H", 15), ("1H", 10)):
+        cs = candles_by_tf.get(tf, [])
+        if len(cs) < 60:
+            continue
+        closes = [c.close for c in cs]
+        e20 = ema(closes, 20)[-1]
+        e50 = ema(closes, 50)[-1]
+        if kind == "SUPPORT" and e20 >= e50:
+            points += weight
+        elif kind == "RESISTANCE" and e20 <= e50:
+            points += weight
+    return min(40, points)
+
+
+def _liquidity_context(candles_by_tf: Dict[str, List[Candle]], lower: float, upper: float) -> int:
+    points = 0
+    for tf in ("4H", "1H", "15m"):
+        cs = candles_by_tf.get(tf, [])
+        if len(cs) < 30:
+            continue
+        hits = 0
+        for c in cs[-80:]:
+            if c.high >= lower and c.low <= upper:
+                hits += 1
+        if hits >= 2:
+            points += 4
+        if hits >= 4:
+            points += 3
+    return min(12, points)
+
+
+def _status_for_level(current: float, lower: float, upper: float) -> str:
+    if lower <= current <= upper:
+        return "TESTING"
+    distance = (lower - current) / current * 100 if current < lower else (current - upper) / current * 100
+    if distance <= 0.20:
+        return "VERY NEAR"
+    if distance <= LEVEL_NEAR_DISTANCE:
+        return "APPROACHING"
+    return "WATCH"
+
+
+def _build_level_candidates(inst_id: str, ticker: dict, candles_by_tf: Dict[str, List[Candle]]) -> List[LevelCandidate]:
+    current = float(ticker.get("last", 0) or 0)
+    volume = float(ticker.get("vol24h_usd", 0) or 0)
+    if current <= 0 or volume < LEVEL_MIN_VOLUME:
+        return []
+
+    raw = []
+    for tf, cs in candles_by_tf.items():
+        if len(cs) < 30:
+            continue
+        for price, kind, recency in _pivot_candidates(cs, tf):
+            raw.append((price, kind, tf, recency))
+        for price, kind, recency in _extreme_candidates(cs, tf):
+            raw.append((price, kind, tf, recency))
+        if tf in ("1D", "4H", "1H"):
+            for price, kind, recency in _round_level_candidates(current):
+                if abs(price - current) / current * 100 <= LEVEL_MAX_DISTANCE:
+                    raw.append((price, kind, tf, recency))
+
+    clusters = _cluster_raw_levels(raw, current)
+    candidates = []
+    for cl in clusters:
+        p = cl["price"]
+        distance = abs(current - p) / current * 100
+        if distance > LEVEL_MAX_DISTANCE:
+            continue
+        items = cl["items"]
+        real_items = [x for x in items if x[1] != "PSYCHOLOGICAL"]
+        if not real_items:
+            continue
+        kinds = [x[1] for x in real_items]
+        support = sum(k == "SUPPORT" for k in kinds)
+        resistance = sum(k == "RESISTANCE" for k in kinds)
+        kind = "SUPPORT" if support >= resistance else "RESISTANCE"
+        lower, upper = _zone_from_cluster(cl, current, candles_by_tf)
+        tfs = list(dict.fromkeys(x[2] for x in real_items))
+        touches = reactions = rejection = displacement = 0
+        volume_score = 0
+        for tf in tfs:
+            cs = candles_by_tf.get(tf, [])
+            t, r, rej, disp = _level_touch_metrics(cs, lower, upper)
+            touches += t
+            reactions += r
+            rejection += rej
+            displacement += disp
+            volume_score = max(volume_score, _volume_at_level(cs, lower, upper))
+        confluence = min(30, sum(LEVEL_TF_WEIGHTS.get(tf, 5) for tf in tfs) // 2)
+        confluence += min(10, max(0, len(tfs) - 1) * 4)
+        confluence = min(40, confluence)
+        touch_score = min(18, touches * 2)
+        reaction_score = min(20, reactions * 4)
+        freshness = max(0, 12 - max(0, min(12, int(distance * 2))))
+        structure = _structure_context(candles_by_tf, kind, p)
+        liquidity = _liquidity_context(candles_by_tf, lower, upper)
+        role_score = 5 if len(set(kinds)) > 1 else 0
+        raw_score = confluence + touch_score + reaction_score + min(30, rejection) + min(20, displacement) + volume_score + structure + liquidity + freshness + role_score
+        # Distance is a discovery factor, not a quality factor. Very far levels
+        # are still allowed inside LEVEL_MAX_DISTANCE, but get a modest penalty.
+        distance_penalty = min(12, distance * 2.0)
+        score = int(clamp(raw_score - distance_penalty, 0, 100))
+        if score < LEVEL_MIN_SCORE:
+            continue
+        reason_parts = []
+        if len(tfs) >= 3: reason_parts.append("3+ TF confluence")
+        elif len(tfs) == 2: reason_parts.append("multi-TF confluence")
+        if touches >= 4: reason_parts.append(f"{touches} touches")
+        if reactions >= 2: reason_parts.append(f"{reactions} reactions")
+        if volume_score >= 9: reason_parts.append("volume confirmation")
+        if structure >= 20: reason_parts.append("HTF structure aligned")
+        if liquidity >= 8: reason_parts.append("liquidity concentration")
+        if not reason_parts: reason_parts.append("clustered technical level")
+        candidates.append(LevelCandidate(
+            inst_id=inst_id,
+            coin=get_coin(inst_id),
+            kind=kind,
+            lower=lower,
+            upper=upper,
+            price=p,
+            score=score,
+            distance_pct=distance,
+            timeframes=tfs,
+            touches=touches,
+            reactions=reactions,
+            volume_score=volume_score,
+            structure_score=structure,
+            confluence_score=confluence,
+            freshness_score=freshness,
+            rejection_score=min(30, rejection),
+            displacement_score=min(20, displacement),
+            liquidity_score=liquidity,
+            role_score=role_score,
+            reason="; ".join(reason_parts),
+            status=_status_for_level(current, lower, upper),
+            current_price=current,
+            volume_24h=volume,
+            candles_1h=candles_by_tf.get("1H", [])[-LEVEL_CHART_CANDLES:],
+        ))
+    candidates.sort(key=lambda x: (x.score, -x.distance_pct), reverse=True)
+    # Deduplicate overlapping candidates of the same coin/type.
+    selected = []
+    for c in candidates:
+        if any(c.kind == s.kind and abs(c.price - s.price) / c.price * 100 < 0.20 for s in selected):
+            continue
+        selected.append(c)
+    return selected[:8]
+
+
+def _level_key(c: LevelCandidate) -> str:
+    return f"{c.inst_id}:{c.kind}:{c.lower:.12g}:{c.upper:.12g}"
+
+
+def _init_level_db():
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS levels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            level_key TEXT UNIQUE NOT NULL,
+            inst_id TEXT NOT NULL,
+            coin TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            lower REAL NOT NULL,
+            upper REAL NOT NULL,
+            price REAL NOT NULL,
+            score INTEGER NOT NULL,
+            distance_pct REAL NOT NULL,
+            timeframes TEXT NOT NULL,
+            touches INTEGER NOT NULL,
+            reactions INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            last_sent_at REAL
         )
+    """)
+    db.commit()
 
-    safe_coin = (
-        setup.coin
-        .replace(
-            "/",
-            "_"
-        )
-        .replace(
-            "\\",
-            "_"
-        )
-    )
+_init_level_db()
 
-    path = (
-        f"/tmp/quantum_"
-        f"{safe_coin}_"
-        f"{int(time.time() * 1000)}.png"
-    )
 
-    fig, ax = plt.subplots(
-        figsize=(
-            12,
-            7
-        ),
-        dpi=140
-    )
+def _level_recently_sent(candidate: LevelCandidate) -> bool:
+    row = db.execute("SELECT last_sent_at FROM levels WHERE level_key=?", (_level_key(candidate),)).fetchone()
+    return bool(row and row[0] and now_ts() - float(row[0]) < LEVEL_COOLDOWN_MINUTES * 60)
 
-    fig.patch.set_facecolor(
-        "#0b1020"
-    )
 
-    ax.set_facecolor(
-        "#0b1020"
-    )
+def _save_level(candidate: LevelCandidate, sent: bool):
+    key = _level_key(candidate)
+    ts = now_ts()
+    db.execute("""
+        INSERT INTO levels(level_key,inst_id,coin,kind,lower,upper,price,score,distance_pct,timeframes,touches,reactions,status,reason,created_at,last_sent_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(level_key) DO UPDATE SET
+            score=excluded.score,
+            distance_pct=excluded.distance_pct,
+            timeframes=excluded.timeframes,
+            touches=excluded.touches,
+            reactions=excluded.reactions,
+            status=excluded.status,
+            reason=excluded.reason,
+            last_sent_at=CASE WHEN ? THEN excluded.last_sent_at ELSE levels.last_sent_at END
+    """, (key,candidate.inst_id,candidate.coin,candidate.kind,candidate.lower,candidate.upper,candidate.price,candidate.score,candidate.distance_pct,",".join(candidate.timeframes),candidate.touches,candidate.reactions,candidate.status,candidate.reason,ts,ts if sent else None,1 if sent else 0))
+    db.commit()
 
-    width = 0.65
 
-    for i, candle in enumerate(
-        candles
-    ):
+def _draw_candles(ax, candles: List[Candle]):
+    if not candles:
+        return
+    width = 0.62
+    for i, c in enumerate(candles):
+        ax.vlines(i, c.low, c.high, linewidth=1.0)
+        body_low = min(c.open, c.close)
+        body_h = max(abs(c.close - c.open), max(c.high - c.low, 1e-12) * 0.008)
+        from matplotlib.patches import Rectangle
+        ax.add_patch(Rectangle((i - width / 2, body_low), width, body_h, fill=False, linewidth=1.0))
 
-        color = (
-            "#16c784"
-            if candle.close >= candle.open
-            else "#ea3943"
-        )
 
-        ax.plot(
-            [i, i],
-            [
-                candle.low,
-                candle.high
-            ],
-            color=color,
-            linewidth=1.0
-        )
-
-        body_low = min(
-            candle.open,
-            candle.close
-        )
-
-        body_height = abs(
-            candle.close
-            - candle.open
-        )
-
-        if body_height == 0:
-
-            body_height = (
-                candle.close
-                * 0.00001
-            )
-
-        rect = Rectangle(
-            (
-                i - width / 2,
-                body_low
-            ),
-            width,
-            body_height,
-            facecolor=color,
-            edgecolor=color,
-            linewidth=0.5
-        )
-
-        ax.add_patch(
-            rect
-        )
-
-    # LEVEL
-    ax.axhline(
-        setup.level,
-        color="#f5c542",
-        linewidth=2.2,
-        linestyle="--",
-        label="LEVEL CLUSTER"
-    )
-
-    # ENTRY
-    ax.axhspan(
-        setup.entry_low,
-        setup.entry_high,
-        color="#00aaff",
-        alpha=0.10
-    )
-
-    # SL
-    ax.axhline(
-        setup.sl,
-        color="#ff3b30",
-        linewidth=1.7,
-        linestyle="-.",
-        label="SL"
-    )
-
-    # TP
-    for tp in (
-        setup.tp1,
-        setup.tp2,
-        setup.tp3
-    ):
-
-        ax.axhline(
-            tp,
-            color="#ffd166",
-            linewidth=1.2
-        )
-
-    last_x = len(candles) - 1
-
-    ax.text(
-        last_x,
-        setup.level,
-        " LEVEL",
-        color="#f5c542",
-        va="bottom",
-        fontsize=10,
-        fontweight="bold"
-    )
-
-    ax.text(
-        last_x,
-        setup.sl,
-        " SL",
-        color="#ff3b30",
-        va="bottom",
-        fontsize=10,
-        fontweight="bold"
-    )
-
-    ax.text(
-        last_x,
-        setup.tp1,
-        " TP1",
-        color="#ffd166",
-        va="bottom",
-        fontsize=9
-    )
-
-    ax.text(
-        last_x,
-        setup.tp2,
-        " TP2",
-        color="#ffd166",
-        va="bottom",
-        fontsize=9
-    )
-
-    ax.text(
-        last_x,
-        setup.tp3,
-        " TP3",
-        color="#ffd166",
-        va="bottom",
-        fontsize=9
-    )
-
-    ax.set_title(
-        (
-            f"{setup.coin}USDT | "
-            f"{setup.direction} | "
-            f"{setup.strategy}\n"
-            f"5M trigger"
-        ),
-        color="white",
-        fontsize=15,
-        fontweight="bold",
-        pad=15
-    )
-
-    ax.grid(
-        alpha=0.12,
-        color="white"
-    )
-
-    ax.tick_params(
-        colors="#9ca3af"
-    )
-
+def make_level_chart(level: LevelCandidate) -> str:
+    path = f"level_{level.coin}_{int(time.time()*1000)}.png"
+    candles = level.candles_1h[-LEVEL_CHART_CANDLES:]
+    if not candles:
+        return ""
+    fig, ax = plt.subplots(figsize=(13, 7), facecolor="#0b1020")
+    ax.set_facecolor("#0b1020")
+    _draw_candles(ax, candles)
+    ax.axhspan(level.lower, level.upper, alpha=0.20, label=f"{level.kind} zone")
+    ax.axhline(level.price, linewidth=1.8, label="Level")
+    ax.axhline(level.current_price, linewidth=1.0, linestyle="--", label="Current")
+    ax.set_title(f"{level.coin}/USDT | 1H | {level.kind} | Score {level.score}/100", color="white", fontsize=15, fontweight="bold")
+    ax.grid(alpha=0.12)
+    ax.tick_params(colors="#9ca3af")
     for spine in ax.spines.values():
-        spine.set_color(
-            "#29334d"
-        )
-
-    ax.legend(
-        facecolor="#111827",
-        labelcolor="white",
-        loc="upper left"
-    )
-
+        spine.set_color("#29334d")
+    ax.legend(facecolor="#111827", labelcolor="white", loc="upper left")
     plt.tight_layout()
-
-    fig.savefig(
-        path,
-        facecolor=fig.get_facecolor(),
-        bbox_inches="tight"
-    )
-
-    plt.close(
-        fig
-    )
-
+    fig.savefig(path, facecolor=fig.get_facecolor(), bbox_inches="tight", dpi=140)
+    plt.close(fig)
     return path
 
 
-# ============================================================
-# TELEGRAM HTML SAFETY
-# ============================================================
-
-def telegram_html(message: str) -> str:
-    """
-    Convert the bot's legacy Markdown-like markup to Telegram HTML.
-    Dynamic market values are escaped so coin/strategy names cannot
-    break Telegram entity parsing.
-    """
-    if not message:
-        return ""
-
-    # Escape first, then restore only our intentional formatting tokens.
-    s = html.escape(str(message), quote=False)
-
-    # Bold
-    s = re.sub(r"\*([^*\n]+)\*", r"<b>\1</b>", s)
-
-    # Inline code
-    s = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", s)
-
-    # Telegram/HTML accepts ordinary emoji and text.
-    return s
-
-# ============================================================
-# TELEGRAM SIGNAL
-# ============================================================
-
-def build_signal_text(
-    setup: Setup,
-    state: str = "READY"
-) -> str:
-
-    if state == "READY":
-
-        state_line = (
-            "🟡 *SETUP READY*\n"
-            "Рынок находится возле рабочей зоны. "
-            "Ждём подтверждение и не догоняем цену."
-        )
-
-    elif state == "ACTIVE":
-
-        state_line = (
-            "🟡 *SETUP READY*\n"
-            "Подтверждение контролируется системой."
-        )
-
-    else:
-
-        state_line = state
-
-    risk = (
-        abs(
-            setup.current_price
-            - setup.sl
-        )
-        / setup.current_price
-        * 100
-    )
-
-    volume_m = (
-        setup.volume_24h
-        / 1_000_000
-    )
-
+def build_level_text(level: LevelCandidate) -> str:
+    tf = ", ".join(level.timeframes)
+    distance = f"{level.distance_pct:.2f}%"
     return (
-        f"🔥 *{setup.coin}USDT — "
-        f"{setup.direction}*\n\n"
-
-        f"🧭 *ТИП СДЕЛКИ:* `{setup.trade_type}`\n"
-        f"⏱ *Удержание:* `{setup.hold_hours}`\n"
-        f"🪜 *Набор:* `{setup.build_entries}`\n\n"
-
-        f"💰 *Цена:* "
-        f"`{fmt_price(setup.current_price)}`\n"
-
-        f"📊 *24H оборот:* "
-        f"${volume_m:,.1f}M\n"
-
-        f"📈 *Volume confirmation:* "
-        f"`{setup.breakout_volume_ratio:.2f}x`\n\n"
-
-        f"{state_line}\n\n"
-
-        f"🧠 *ЛОГИКА СДЕЛКИ*\n"
-        f"{setup.reason}\n\n"
-
-        f"🎯 *ТОЧКА ВХОДА*\n"
-        f"`{fmt_price(setup.entry_low)}` – "
-        f"`{fmt_price(setup.entry_high)}`\n"
-        + (
-            f"\n🏦 *ЛЕСТНИЦА НАБОРА*\n"
-            f"Entry 1 — 30%: `{fmt_price(setup.entry_1)}`\n"
-            f"Entry 2 — 30%: `{fmt_price(setup.entry_2)}`\n"
-            f"Entry 3 — 40%: `{fmt_price(setup.entry_3)}`\n"
-            if setup.trade_type.startswith("🏦") else ""
-        )
-        + "\n"
-
-        f"🛑 *STOP LOSS*\n"
-        f"`{fmt_price(setup.sl)}`\n"
-        f"Риск: `−{risk:.2f}%`\n\n"
-
-        f"🪜 *ЗАКРЫТИЕ ЛЕСЕНКОЙ*\n\n"
-
-        f"TP1 — 30%\n"
-        f"`{fmt_price(setup.tp1)}`\n\n"
-
-        f"TP2 — 30%\n"
-        f"`{fmt_price(setup.tp2)}`\n\n"
-
-        f"TP3 — 40%\n"
-        f"`{fmt_price(setup.tp3)}`\n\n"
-
-        f"🔒 После TP1 → SL в BE\n\n"
-
-        f"📊 *Стратегия:*\n"
-        f"`{setup.strategy}`\n\n"
-
-        f"📍 *LEVEL CLUSTER:*\n"
-        f"`{setup.level_tf}`\n"
-        f"`{fmt_price(setup.level)}`\n"
-        f"Сила зоны: `{setup.level_strength}/100`\n\n"
-
-        f"💧 *Ликвидность:* "
-        f"`{setup.liquidity}`\n"
-
-        f"📦 *Volume grade:* "
-        f"`{setup.volume_grade}`\n"
-
-        f"⚡ *OI:* "
-        f"`{setup.oi_status}`\n"
-
-        f"🌡 *ATR:* "
-        f"`{setup.atr_pct:.2f}%`\n\n"
-
-        f"⏱ *READY действует:* "
-        f"`{READY_TTL_MINUTES} мин`\n\n"
-
-        f"💎 *Дисциплина. Терпение. Чёткое исполнение.*\n"
-        f"🔥 Следим за движением и работаем строго по плану.\n"
-        f"Не догоняем цену."
+        f"<b>{'🟢 SUPPORT' if level.kind == 'SUPPORT' else '🔴 RESISTANCE'} — {level.coin}/USDT</b>\n\n"
+        f"<b>Зона:</b> {fmt_price(level.lower)} — {fmt_price(level.upper)}\n"
+        f"<b>Центр:</b> {fmt_price(level.price)}\n"
+        f"<b>Цена:</b> {fmt_price(level.current_price)}\n"
+        f"<b>Дистанция:</b> {distance}\n"
+        f"<b>Level Score:</b> {level.score}/100\n"
+        f"<b>Статус:</b> {level.status}\n\n"
+        f"<b>Подтверждение:</b> {tf}\n"
+        f"Касания: {level.touches} | Реакции: {level.reactions}\n"
+        f"Объём: {level.volume_score}/15 | Структура: {level.structure_score}/40\n\n"
+        f"<b>Почему уровень:</b> {html.escape(level.reason)}\n\n"
+        f"⚠️ Уровень — зона интереса, а не гарантия разворота. Ждём реакцию цены."
     )
 
 
-# ============================================================
-# TELEGRAM REACTION
-# ============================================================
-
-def add_signal_reactions(message_id: Optional[int]):
-    if not message_id:
-        return
+def send_level(candidate: LevelCandidate) -> bool:
     try:
-        reaction_type = getattr(telebot.types, "ReactionTypeEmoji", None)
-        if reaction_type is None:
-            return
-        bot.set_message_reaction(
-            CHANNEL_ID,
-            message_id,
-            reaction=[reaction_type("🔥")]
-        )
-    except Exception as exc:
-        log.debug("REACTION NOT SET | %s", exc)
-
-
-# ============================================================
-# SEND PHOTO + TEXT
-# ============================================================
-
-def send_photo_and_text(
-    setup: Setup,
-    state: str = "READY"
-) -> Tuple[
-    Optional[int],
-    Optional[int]
-]:
-
-    chart_path = None
-
-    try:
-
-        chart_path = make_chart(
-            setup
-        )
-
-        caption = (
-            f"🔥 *{setup.coin}USDT — "
-            f"{setup.direction}*\n"
-            f"{setup.strategy}"
-        )
-
-        with open(
-            chart_path,
-            "rb"
-        ) as photo:
-
-            sent_photo = (
-                bot.send_photo(
-                    CHANNEL_ID,
-                    photo,
-                    caption=telegram_html(caption),
-                    parse_mode="HTML",
-                    show_caption_above_media=True
-                )
-            )
-
-        text = build_signal_text(
-            setup,
-            state
-        )
-
-        sent_text = (
-            bot.send_message(
-                CHANNEL_ID,
-                text,
-                parse_mode="HTML"
-            )
-        )
-
-        add_signal_reactions(sent_text.message_id)
-
-        log.info(
-            "TELEGRAM SENT | %s | %s | score=%s | state=%s",
-            setup.coin,
-            setup.direction,
-            setup.score,
-            state
-        )
-
-        return (
-            sent_photo.message_id,
-            sent_text.message_id
-        )
-
-    except Exception as exc:
-
-        log.exception(
-            "TELEGRAM SEND FAILED | %s | %s",
-            setup.inst_id,
-            exc
-        )
-
-        return None, None
-
-    finally:
-
-        if chart_path:
-
+        path = make_level_chart(candidate)
+        text = build_level_text(candidate)
+        if path and os.path.exists(path):
+            with open(path, "rb") as photo:
+                bot.send_photo(CHANNEL_ID, photo, caption=text, parse_mode="HTML")
             try:
-                os.remove(
-                    chart_path
-                )
+                os.remove(path)
             except OSError:
                 pass
-
-
-# ============================================================
-# MORNING MESSAGE
-# ============================================================
-
-def send_morning_message():
-
-    global last_morning_date
-
-    if not MORNING_ENABLED:
-        return
-
-    current = local_now()
-
-    if (
-        current.hour != MORNING_HOUR
-        or current.minute != MORNING_MINUTE
-    ):
-        return
-
-    today = current.date()
-
-    if last_morning_date == today:
-        return
-
-    message = (
-        "🌅 *ДОБРОЕ УТРО, РЕБЯТА!*\n\n"
-
-        "QUANTUM SCALPER V4 начинает новый "
-        "торговый день.\n\n"
-
-        "🔎 Ищем рынок широко.\n"
-        "📍 Проверяем уровни на нескольких ТФ.\n"
-        "🧠 Ищем сильные зоны.\n"
-        "🟡 Сигнал даём заранее.\n"
-        "🚫 Не догоняем движение.\n"
-        "🛑 Не увеличиваем риск.\n\n"
-
-        "*Качество важнее количества.*\n\n"
-
-        "Всем продуктивного торгового дня! 🚀"
-    )
-
-    try:
-
-        bot.send_message(
-            CHANNEL_ID,
-            message,
-            parse_mode="HTML"
-        )
-
-        last_morning_date = today
-
-        log.info(
-            "MORNING MESSAGE SENT"
-        )
-
-    except Exception:
-
-        log.exception(
-            "MORNING MESSAGE FAILED"
-        )
-
-
-# ============================================================
-# DATABASE SIGNAL
-# ============================================================
-
-def save_signal(
-    setup: Setup,
-    status: str
-):
-
-    created = now_ts()
-
-    db.execute(
-        """
-        INSERT INTO signals (
-            inst_id,
-            direction,
-            strategy,
-            level,
-            entry_low,
-            entry_high,
-            sl,
-            tp1,
-            tp2,
-            tp3,
-            score,
-            status,
-            created_at,
-            expires_at
-        )
-        VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?
-        )
-        """,
-        (
-            setup.inst_id,
-            setup.direction,
-            setup.strategy,
-            setup.level,
-            setup.entry_low,
-            setup.entry_high,
-            setup.sl,
-            setup.tp1,
-            setup.tp2,
-            setup.tp3,
-            setup.score,
-            status,
-            created,
-            created
-            + READY_TTL_MINUTES * 60
-        )
-    )
-
-    db.commit()
-
-
-# ============================================================
-# EXPIRE READY
-# ============================================================
-
-def expire_old_ready():
-
-    current = now_ts()
-
-    expired = []
-
-    for inst_id, ready in list(
-        ready_setups.items()
-    ):
-
-        if current >= ready.expires_at:
-
-            expired.append(
-                inst_id
-            )
-
-    for inst_id in expired:
-
-        ready = ready_setups.pop(
-            inst_id,
-            None
-        )
-
-        if ready is None:
-            continue
-
-        setup = ready.setup
-
-        log.info(
-            "READY EXPIRED | %s",
-            inst_id
-        )
-
-        # Expiration is tracked internally, but no public Telegram message is sent.
-        # Public channel updates are reserved for TP1/TP2/TP3 or SL.
-
-
-
-# ============================================================
-# PATTERN FILTER / SETUP SELECTION
-
-
-def _pivot_series(candles, highs=True):
-    vals = pivot_highs(candles) if highs else pivot_lows(candles)
-    return [v for _, v in vals[-6:]]
-
-
-def _avg_range(candles):
-    if not candles:
-        return 0.0
-    return sum(max(c.high - c.low, 0.0) for c in candles) / len(candles)
-
-
-def _avg_volume(candles):
-    if not candles:
-        return 0.0
-    return sum(max(c.volume, 0.0) for c in candles) / len(candles)
-
-
-def _trend_slope(values):
-    if len(values) < 2:
-        return 0.0
-    return (values[-1] - values[0]) / max(abs(values[0]), 1e-12)
-
-
-def _pattern_breakout_state(candles, direction, lookback=24):
-    if len(candles) < lookback + 2:
-        return False, False, False
-    prior = candles[-lookback-1:-1]
-    last = candles[-1]
-    prev = candles[-2]
-    avg_vol = _avg_volume(prior[-20:])
-    if direction == "LONG":
-        boundary = max(c.high for c in prior)
-        breakout = last.close > boundary and prev.close <= boundary
-        retest = (
-            (last.low <= boundary * 1.0015 and last.close > boundary)
-            or (prev.low <= boundary * 1.0015 and last.close > boundary)
-        )
-    else:
-        boundary = min(c.low for c in prior)
-        breakout = last.close < boundary and prev.close >= boundary
-        retest = (
-            (last.high >= boundary * 0.9985 and last.close < boundary)
-            or (prev.high >= boundary * 0.9985 and last.close < boundary)
-        )
-    volume_confirmed = avg_vol > 0 and last.volume >= avg_vol * 1.35
-    return breakout, retest, volume_confirmed
-
-
-def chart_pattern_analysis(candles_15m, candles_5m, direction):
-    """Rule-based chart pattern/confluence engine.
-
-    Pattern names are backed by price/volume geometry; the names themselves are
-    never used as a trigger. This is an additional quality layer over V4.
-    """
-    if len(candles_15m) < 60:
-        return 0, False, ""
-
-    recent = candles_15m[-48:]
-    highs = _pivot_series(recent, True)
-    lows = _pivot_series(recent, False)
-    ref = max(recent[-1].close, 1e-12)
-    points = 0
-    patterns = []
-
-    # Ascending / descending / symmetrical triangles.
-    if len(highs) >= 3 and len(lows) >= 3:
-        high_span = (max(highs[-3:]) - min(highs[-3:])) / ref
-        low_span = (max(lows[-3:]) - min(lows[-3:])) / ref
-        hs = _trend_slope(highs[-3:])
-        ls = _trend_slope(lows[-3:])
-
-        if direction == "LONG" and high_span <= 0.012 and ls > 0.002:
-            points += 14
-            patterns.append("ascending triangle")
-        elif direction == "SHORT" and low_span <= 0.012 and hs < -0.002:
-            points += 14
-            patterns.append("descending triangle")
-        elif high_span <= 0.020 and low_span <= 0.020 and hs < -0.001 and ls > 0.001:
-            points += 12
-            patterns.append("symmetrical triangle")
-
-        if high_span <= 0.018 and low_span <= 0.018:
-            points += 5
-            patterns.append("compression")
-
-        # Falling/rising wedge.
-        if hs < -0.001 and ls < -0.001 and high_span < 0.025 and low_span < 0.025 and direction == "LONG":
-            points += 10
-            patterns.append("falling wedge")
-        elif hs > 0.001 and ls > 0.001 and high_span < 0.025 and low_span < 0.025 and direction == "SHORT":
-            points += 10
-            patterns.append("rising wedge")
-
-        # Double top / bottom with a real middle reaction.
-        if direction == "SHORT":
-            h1, h2 = highs[-3], highs[-1]
-            middle = min(lows[-3:]) if lows else 0.0
-            if h1 > 0 and abs(h2-h1)/h1 <= 0.009 and middle < min(h1, h2) * 0.985:
-                points += 12
-                patterns.append("double top")
         else:
-            l1, l2 = lows[-3], lows[-1]
-            middle = max(highs[-3:]) if highs else 0.0
-            if l1 > 0 and abs(l2-l1)/l1 <= 0.009 and middle > max(l1, l2) * 1.015:
-                points += 12
-                patterns.append("double bottom")
-
-    # Bull/bear flag or pennant: impulse followed by contraction and quieter volume.
-    if len(recent) >= 30:
-        impulse = abs(recent[-30].close - recent[-18].close) / max(abs(recent[-30].close), 1e-12) * 100
-        old_range = _avg_range(recent[-30:-15])
-        new_range = _avg_range(recent[-15:])
-        old_vol = _avg_volume(recent[-30:-15])
-        new_vol = _avg_volume(recent[-15:])
-        contraction = new_range / old_range if old_range > 0 else 1.0
-        vol_contract = new_vol / old_vol if old_vol > 0 else 1.0
-        if impulse >= 1.0 and contraction <= 0.72:
-            points += 11
-            patterns.append("flag/pennant")
-            if vol_contract <= 0.85:
-                points += 3
-                patterns.append("volume contraction")
-
-    # Rectangle / range breakout preparation.
-    if len(recent) >= 24:
-        box = recent[-24:]
-        box_high = max(c.high for c in box)
-        box_low = min(c.low for c in box)
-        box_width = (box_high - box_low) / ref
-        near_top = sum(1 for c in box if abs(c.high-box_high)/ref <= 0.003)
-        near_bottom = sum(1 for c in box if abs(c.low-box_low)/ref <= 0.003)
-        if box_width <= 0.045 and near_top >= 2 and near_bottom >= 2:
-            points += 8
-            patterns.append("rectangle/range")
-
-    # Live breakout + retest + volume confirmation on 5M.
-    breakout, retest, volume_confirmed = _pattern_breakout_state(candles_5m, direction)
-    if breakout:
-        points += 12
-        patterns.append("breakout")
-    if volume_confirmed and breakout:
-        points += 7
-        patterns.append("breakout volume confirmation")
-    if retest:
-        points += 10
-        patterns.append("breakout + retest")
-
-    if not patterns:
-        return 0, False, ""
-
-    unique_patterns = list(dict.fromkeys(patterns))
-    if len(unique_patterns) >= 2:
-        points += 4
-    if len(unique_patterns) >= 3:
-        points += 4
-
-    return min(points, 40), True, "Паттерн/структура: " + ", ".join(unique_patterns) + "."
-
-
-def pattern_quality_gate(setup: Setup, candles: Dict[str, List[Candle]]) -> Tuple[bool, str]:
-    c5 = [c for c in candles.get("5m", []) if c.confirmed]
-    c15 = [c for c in candles.get("15m", []) if c.confirmed]
-    c1 = [c for c in candles.get("1H", []) if c.confirmed]
-    c4 = [c for c in candles.get("4H", []) if c.confirmed]
-
-    if min(len(c5), len(c15), len(c1), len(c4)) < 30:
-        return False, "insufficient confirmed candles"
-
-    last = c5[-1]
-    avg_vol = _avg_volume(c5[-21:-1])
-    vol_ratio = last.volume / avg_vol if avg_vol > 0 else 0.0
-    body = candle_body_ratio(last)
-
-    # 1H is the setup's primary directional timeframe.
-    # A mismatch here means the setup direction is internally inconsistent.
-    if structure_direction(c1) != setup.direction:
-        return False, "1H structure mismatch"
-
-    # 4H disagreement is NOT a hard rejection.
-    # analyze_symbol() already treats it as a quality penalty. Making it
-    # a second hard gate caused the live scanner to reject virtually every
-    # candidate whenever 4H was counter-trend, despite the strategy allowing
-    # 1H setups with a weaker 4H alignment.
-    structure_4h = structure_direction(c4)
-    if structure_4h != setup.direction:
-        log.info(
-            "QUALITY GATE NOTE | %s | 4H counter-trend: %s vs %s",
-            setup.inst_id,
-            structure_4h,
-            setup.direction,
-        )
-
-    if setup.setup_state == "ACTIVE":
-        if setup.direction == "LONG" and last.close <= setup.level:
-            return False, "breakout not closed above level"
-        if setup.direction == "SHORT" and last.close >= setup.level:
-            return False, "breakout not closed below level"
-        if body < 0.45:
-            return False, "weak breakout body"
-        if vol_ratio < 1.20:
-            return False, "weak breakout volume"
-
-    if setup.setup_state == "READY":
-        distance = abs(pct(setup.current_price, setup.level))
-        if distance > PRE_TRIGGER_DISTANCE_PCT:
-            return False, "READY too far from level"
-        p_score, p_ok, _ = chart_pattern_analysis(c15, c5, setup.direction)
-        if not p_ok or p_score < 12:
-            return False, "pattern evidence too weak"
-
-    return True, "passed"
-
-
-def analyze_symbol_with_patterns(inst_id, ticker, candles):
-    setup = analyze_symbol(inst_id, ticker, candles)
-    if setup is None:
-        return None
-
-    p5, ok, reason = chart_pattern_analysis(
-        candles.get("15m", []), candles.get("5m", []), setup.direction
-    )
-
-    if ok:
-        setup.score = int(clamp(setup.score + p5, 0, 100))
-        setup.reason = setup.reason + " " + reason
-    elif setup.setup_state == "READY":
-        return None
-
-    c5 = [c for c in candles.get("5m", []) if c.confirmed]
-    price_change = 0.0
-    if len(c5) >= 13 and c5[-13].close > 0:
-        price_change = (c5[-1].close - c5[-13].close) / c5[-13].close * 100.0
-
-    oi_value, oi_change = get_open_interest_context(inst_id)
-    funding = get_funding_rate(inst_id)
-    d_points, d_reason = derivatives_context_score(
-        setup.direction, price_change, oi_change, funding
-    )
-    setup.score = int(clamp(setup.score + d_points, 0, 100))
-
-    if oi_value is not None:
-        setup.oi_status = (
-            f"OI {oi_value:,.0f} USD"
-            + (f" | Δ {oi_change:+.2f}%" if oi_change is not None else "")
-        )
-
-    if d_reason:
-        setup.reason += " Деривативный контекст: " + d_reason + "."
-
-    passed, gate_reason = pattern_quality_gate(setup, candles)
-    if not passed:
-        log.info("QUALITY GATE REJECT | %s | %s", inst_id, gate_reason)
-        return None
-
-    return setup
-
-
-# RESULT TRACKING
-# ============================================================
-
-def ensure_result_columns():
-    cols = {
-        "tp1_hit": "INTEGER DEFAULT 0",
-        "tp2_hit": "INTEGER DEFAULT 0",
-        "tp3_hit": "INTEGER DEFAULT 0",
-        "result": "TEXT DEFAULT ''",
-        "closed_at": "REAL",
-        "r_multiple": "REAL DEFAULT 0",
-    }
-    existing = {row[1] for row in db.execute("PRAGMA table_info(signals)").fetchall()}
-    for name, definition in cols.items():
-        if name not in existing:
-            db.execute(f"ALTER TABLE signals ADD COLUMN {name} {definition}")
-    db.commit()
-
-ensure_result_columns()
-
-
-def _row_risk(row):
-    entry = float(row[4])
-    sl = float(row[7])
-    return abs(entry - sl)
-
-
-def _send_result_update(inst_id, direction, result):
-    """Send one public result update. Only this function publishes trade results."""
-    coin = get_coin(inst_id)
-    if result == "TP1":
-        message = f"🟢 *TP1 — {coin}USDT*\n\nПервая цель достигнута. Стоп переносится в безубыток по логике сигнала."
-    elif result == "TP2":
-        message = f"🟢 *TP2 — {coin}USDT*\n\nВторая цель достигнута. Движение развивается по плану."
-    elif result == "TP3":
-        message = f"💎 *TP3 — {coin}USDT*\n\nФинальная цель достигнута. Сделка завершена."
-    elif result == "SL":
-        message = f"🔴 *STOP LOSS — {coin}USDT*\n\nСделка закрыта по стопу. Дисциплина прежде всего."
-    elif result == "BE":
-        message = f"🟡 *BREAK EVEN — {coin}USDT*\n\nСделка закрыта в безубытке."
-    else:
-        return
-    try:
-        bot.send_message(CHANNEL_ID, telegram_html(message), parse_mode="HTML")
+            bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
+        return True
     except Exception:
-        log.exception("RESULT TELEGRAM ERROR | %s | %s", inst_id, result)
+        log.exception("LEVEL SEND FAILED | %s", candidate.inst_id)
+        return False
 
 
-def update_signal_results():
-    rows = db.execute("""
-        SELECT id, inst_id, direction, strategy, level, entry_low, entry_high,
-               sl, tp1, tp2, tp3, score, status, created_at, expires_at,
-               tp1_hit, tp2_hit, tp3_hit, result
-        FROM signals
-        WHERE status IN ('READY','ACTIVE')
-        ORDER BY id ASC
-    """).fetchall()
-
-    for row in rows:
-        sid, inst_id, direction = row[0], row[1], row[2]
-        try:
-            cs = get_candles(inst_id, "5m", 80)
-            if len(cs) < 2:
-                continue
-            c = cs[-1]
-            price = c.close
-        except Exception:
-            continue
-
-        status = row[12]
-        entry_low, entry_high = float(row[5]), float(row[6])
-        sl, tp1, tp2, tp3 = map(float, (row[7], row[8], row[9], row[10]))
-        tp1_hit, tp2_hit, tp3_hit = map(int, (row[15] or 0, row[16] or 0, row[17] or 0))
-
-        # READY -> ACTIVE when price actually reaches the published entry zone.
-        if status == "READY":
-            touched = entry_low <= price <= entry_high
-            if touched:
-                db.execute("UPDATE signals SET status='ACTIVE', activated_at=? WHERE id=?", (now_ts(), sid))
-                status = "ACTIVE"
-            elif now_ts() > float(row[14]):
-                db.execute("UPDATE signals SET status='EXPIRED', result='EXPIRED', closed_at=? WHERE id=?", (now_ts(), sid))
-                continue
-
-        if status != "ACTIVE":
-            continue
-
-        # Conservative intrabar rule: if SL and TP are both touched by the same
-        # candle and the order is ambiguous, SL is counted first.
-        sl_hit = (c.low <= sl) if direction == "LONG" else (c.high >= sl)
-        tp1_now = (c.high >= tp1) if direction == "LONG" else (c.low <= tp1)
-        tp2_now = (c.high >= tp2) if direction == "LONG" else (c.low <= tp2)
-        tp3_now = (c.high >= tp3) if direction == "LONG" else (c.low <= tp3)
-
-        # A result flag is also the de-duplication key. Once a target is marked
-        # hit in SQLite, later scan cycles cannot publish it again.
-        new_tp1 = bool(tp1_now and not tp1_hit)
-        new_tp2 = bool(tp2_now and not tp2_hit)
-        new_tp3 = bool(tp3_now and not tp3_hit)
-
-        if sl_hit and not tp1_hit and not tp2_hit and not tp3_hit and not (new_tp1 or new_tp2 or new_tp3):
-            db.execute("UPDATE signals SET status='CLOSED', result='SL', closed_at=?, r_multiple=-1 WHERE id=? AND status='ACTIVE'", (now_ts(), sid))
-            if db.rowcount:
-                db.commit()
-                _send_result_update(inst_id, direction, "SL")
-            continue
-
-        if new_tp1:
-            db.execute("UPDATE signals SET tp1_hit=1 WHERE id=? AND tp1_hit=0", (sid,))
-            if db.rowcount:
-                tp1_hit = 1
-                db.commit()
-                _send_result_update(inst_id, direction, "TP1")
-        if new_tp2:
-            db.execute("UPDATE signals SET tp2_hit=1 WHERE id=? AND tp2_hit=0", (sid,))
-            if db.rowcount:
-                tp2_hit = 1
-                db.commit()
-                _send_result_update(inst_id, direction, "TP2")
-        if new_tp3:
-            db.execute("UPDATE signals SET tp3_hit=1 WHERE id=? AND tp3_hit=0", (sid,))
-            if db.rowcount:
-                tp3_hit = 1
-                db.commit()
-                _send_result_update(inst_id, direction, "TP3")
-
-        if tp3_hit:
-            db.execute("UPDATE signals SET status='CLOSED', result='TP3', closed_at=?, r_multiple=3 WHERE id=? AND status='ACTIVE'", (now_ts(), sid))
-        elif tp2_hit:
-            db.execute("UPDATE signals SET status='ACTIVE', result='TP2', r_multiple=2 WHERE id=? AND status='ACTIVE'", (sid,))
-        elif tp1_hit:
-            # Do not evaluate BE on the same candle that first hit TP1.
-            # The stop can move to BE only on a later scan/candle.
-            if not new_tp1:
-                be_hit = (c.low <= entry_high) if direction == "LONG" else (c.high >= entry_low)
-                if be_hit:
-                    db.execute("UPDATE signals SET status='CLOSED', result='BE', closed_at=?, r_multiple=0 WHERE id=? AND status='ACTIVE'", (now_ts(), sid))
-                    if db.rowcount:
-                        db.commit()
-                        _send_result_update(inst_id, direction, "BE")
-                        continue
-            db.execute("UPDATE signals SET status='ACTIVE', result='TP1', r_multiple=1 WHERE id=? AND status='ACTIVE'", (sid,))
-
-    db.commit()
-
-
-# ============================================================
-# REPORTS
-# ============================================================
-
-def report_period(start_ts, end_ts, title):
-    rows = db.execute("""
-        SELECT strategy, result, r_multiple, score, status
-        FROM signals
-        WHERE created_at >= ? AND created_at < ?
-    """, (start_ts, end_ts)).fetchall()
-
-    total = len(rows)
-    closed = [r for r in rows if r[1] in ("SL", "BE", "TP3")]
-    sl = sum(1 for r in rows if r[1] == "SL")
-    be = sum(1 for r in rows if r[1] == "BE")
-    tp3 = sum(1 for r in rows if r[1] == "TP3")
-    tp1 = sum(1 for r in rows if r[1] in ("TP1", "TP2", "TP3"))
-    tp2 = sum(1 for r in rows if r[1] in ("TP2", "TP3"))
-    r_sum = sum(float(r[2] or 0) for r in rows)
-    avg_r = (r_sum / len(closed)) if closed else 0.0
-    outcome_rate = ((tp3 + be) / len(closed) * 100.0) if closed else 0.0
-    tp1_rate = (tp1 / total * 100.0) if total else 0.0
-    tp2_rate = (tp2 / total * 100.0) if total else 0.0
-    tp3_rate = (tp3 / total * 100.0) if total else 0.0
-
-    lines = [
-        f"📊 *{title}*",
-        "",
-        f"Сигналов: *{total}*",
-        f"Закрыто: *{len(closed)}*",
-        f"TP1: *{tp1}* | TP2: *{tp2}* | TP3: *{tp3}*",
-        f"SL: *{sl}* | BE: *{be}*",
-        f"TP1 hit rate: *{tp1_rate:.1f}%* | TP2: *{tp2_rate:.1f}%* | TP3: *{tp3_rate:.1f}%*",
-        f"Закрытие без SL (TP3/BE): *{outcome_rate:.1f}%*",
-        f"Суммарно R: *{r_sum:+.2f}R*",
-        f"Средний R закрытых: *{avg_r:+.2f}R*",
-    ]
-
-    strategies = {}
-    for strategy, result, r, score, status in rows:
-        d = strategies.setdefault(strategy, {"n":0,"closed":0,"r":0.0,"tp3":0,"sl":0})
-        d["n"] += 1
-        if result in ("SL", "BE", "TP3"):
-            d["closed"] += 1
-        d["r"] += float(r or 0)
-        d["tp3"] += int(result == "TP3")
-        d["sl"] += int(result == "SL")
-
-    if strategies:
-        lines += ["", "*По стратегиям:"]
-        for strategy, d in sorted(strategies.items(), key=lambda x: x[0]):
-            lines.append(f"• {strategy}: {d['n']} сигналов | {d['tp3']} TP3 | {d['sl']} SL | {d['r']:+.2f}R")
-
-    if not rows:
-        lines += ["", "Нет сигналов за период."]
-
-    return "\n".join(lines)
-
-
-def report_boundaries():
-    n = local_now()
-    day_start = datetime(n.year, n.month, n.day, tzinfo=ZoneInfo(TIMEZONE))
-    next_day = day_start + __import__('datetime').timedelta(days=1)
-    # Calendar week: Monday-Sunday.
-    week_start = day_start - __import__('datetime').timedelta(days=day_start.weekday())
-    next_week = week_start + __import__('datetime').timedelta(days=7)
-    month_start = datetime(n.year, n.month, 1, tzinfo=ZoneInfo(TIMEZONE))
-    if n.month == 12:
-        next_month = datetime(n.year + 1, 1, 1, tzinfo=ZoneInfo(TIMEZONE))
-    else:
-        next_month = datetime(n.year, n.month + 1, 1, tzinfo=ZoneInfo(TIMEZONE))
-    return (
-        day_start.timestamp(), next_day.timestamp(),
-        week_start.timestamp(), next_week.timestamp(),
-        month_start.timestamp(), next_month.timestamp()
-    )
-
-
-def send_reports_once_per_day():
-    n = local_now()
-    if (n.hour, n.minute) < (REPORT_HOUR, REPORT_MINUTE):
-        return
-    key = f"reports_{n.date().isoformat()}"
-    if db.execute("SELECT 1 FROM bot_state WHERE key=?", (key,)).fetchone():
-        return
-
-    ds, de, ws, we, ms, me = report_boundaries()
-    messages = [
-        report_period(ds, de, "ОТЧЁТ ЗА СЕГОДНЯ"),
-        report_period(ws, we, "ОТЧЁТ ЗА НЕДЕЛЮ"),
-        report_period(ms, me, "ОТЧЁТ ЗА МЕСЯЦ"),
-    ]
-    try:
-        for message in messages:
-            bot.send_message(CHANNEL_ID, message)
-        db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)", (key, "1"))
-        db.commit()
-        log.info("REPORTS SENT | %s", n.date())
-    except Exception:
-        log.exception("REPORTS SEND FAILED")
-
-
-# ============================================================
-# MAIN SCANNER
-# ============================================================
-
-def load_candles_for_symbol(inst_id):
+def load_level_candles(inst_id: str) -> Dict[str, List[Candle]]:
     return {
-        "1D": get_candles(inst_id, "1D", 120),
-        "4H": get_candles(inst_id, "4H", 120),
-        "1H": get_candles(inst_id, "1H", 120),
-        "30m": get_candles(inst_id, "30m", 120),
-        "15m": get_candles(inst_id, "15m", 120),
-        "5m": get_candles(inst_id, "5m", 120),
+        "1D": get_candles(inst_id, "1D", 140),
+        "4H": get_candles(inst_id, "4H", 160),
+        "1H": get_candles(inst_id, "1H", 180),
+        "30m": get_candles(inst_id, "30m", 160),
+        "15m": get_candles(inst_id, "15m", 160),
+        "5m": get_candles(inst_id, "5m", 160),
     }
 
 
-def scan_market():
-    """Two-stage scanner: cheap universe ranking -> structure ranking -> deep setups."""
-    global signals_today, last_fast_pass_ts, watchlist, scan_count
-
-    n = local_now()
-    day_key = n.date().isoformat()
-    saved_day = db.execute("SELECT value FROM bot_state WHERE key=?", ("signals_day",)).fetchone()
-    if not saved_day or saved_day[0] != day_key:
-        signals_today = 0
-        db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)", ("signals_day", day_key))
-        db.commit()
-    if signals_today >= MAX_SIGNALS_PER_DAY:
-        return
-
+def scan_levels():
     instruments = get_instruments()
     tickers = get_tickers()
-    fast = []
+    universe = []
     for inst_id, ticker in tickers.items():
         if inst_id not in instruments:
             continue
-        volume = float(ticker.get("vol24h_usd", 0) or 0)
-        if volume < MIN_CANDIDATE_VOLUME_USD:
+        vol = float(ticker.get("vol24h_usd", 0) or 0)
+        if vol < LEVEL_MIN_VOLUME:
             continue
-        fs = fast_market_score(ticker)
-        fast.append((fs, volume, inst_id, ticker))
-    fast.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    fast = fast[:MARKET_RANK_LIMIT] if MARKET_RANK_LIMIT > 0 else fast
-
-    # Structure-ranking pass. Only 1H/15M are loaded here to keep API usage bounded.
-    ranked = []
-    for fs, volume, inst_id, ticker in fast:
+        universe.append((fast_market_score(ticker), vol, inst_id, ticker))
+    universe.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    deep = universe[:LEVEL_DEEP_CANDIDATES] if LEVEL_DEEP_CANDIDATES > 0 else universe
+    all_levels = []
+    for _, _, inst_id, ticker in deep:
         try:
-            c1 = get_candles(inst_id, "1H", 100)
-            c15 = get_candles(inst_id, "15m", 100)
-            ms, why = market_selection_score(ticker, c1, c15)
-            if ms < MIN_MARKET_SCORE:
-                continue
-            ranked.append((ms, fs, volume, inst_id, ticker, why))
+            candles = load_level_candles(inst_id)
+            levels = _build_level_candidates(inst_id, ticker, candles)
+            all_levels.extend(levels)
         except Exception as exc:
-            log.warning("RANK FAILED | %s | %s", inst_id, exc)
-    ranked.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
-    watchlist = ranked[:DEEP_CANDIDATES] if DEEP_CANDIDATES > 0 else ranked
-    last_fast_pass_ts = now_ts()
-    scan_count += 1
-    log.info("MARKET ENGINE | universe=%s | ranked=%s | deep=%s", len(tickers), len(ranked), len(watchlist))
-
-    setups = []
-    for market_score, _, _, inst_id, ticker, why in watchlist:
-        if not can_send_new_signal(inst_id):
+            log.warning("LEVEL ANALYZE FAILED | %s | %s", inst_id, exc)
+    # Diversify: don't let one coin occupy the whole top list.
+    all_levels.sort(key=lambda x: (x.score, -x.distance_pct), reverse=True)
+    final = []
+    per_coin = defaultdict(int)
+    for level in all_levels:
+        if per_coin[level.coin] >= 2:
             continue
-        try:
-            candles = load_candles_for_symbol(inst_id)
-            setup = analyze_symbol_with_patterns(inst_id, ticker, candles)
-            if setup is None:
-                continue
-            setup.market_score = int(round(market_score))
-            # Hard structure veto for position-style setups.
-            s1, _ = structure_score_v5(candles.get("1H", []))
-            if setup.trade_type.startswith("🏦") and s1 < MIN_STRUCTURE_SCORE:
-                log.info("POSITION REJECT | %s | structure=%.1f", inst_id, s1)
-                continue
-            if setup.score >= MIN_SCORE:
-                setup.reason += f" Market rank: {setup.market_score}/100 ({why})."
-                setups.append(setup)
-        except Exception as exc:
-            log.warning("ANALYZE FAILED | %s | %s", inst_id, exc)
+        final.append(level)
+        per_coin[level.coin] += 1
+        if len(final) >= LEVEL_FINAL_COUNT:
+            break
+    log.info("LEVEL SCAN | liquid=%s | deep=%s | levels=%s", len(universe), len(deep), len(final))
+    for level in final:
+        sent = False
+        if level.score >= LEVEL_MIN_SCORE and not _level_recently_sent(level):
+            sent = send_level(level)
+        _save_level(level, sent)
 
-    setups.sort(key=lambda x: (x.score, x.market_score), reverse=True)
-    final_setups = setups[:FINAL_SIGNAL_CANDIDATES] if FINAL_SIGNAL_CANDIDATES > 0 else setups
 
-    for setup in final_setups:
-        if not can_send_new_signal(setup.inst_id):
-            continue
-        photo_id, text_id = send_photo_and_text(setup, setup.setup_state)
-        if photo_id or text_id:
-            save_signal(setup, setup.setup_state)
-            if setup.setup_state == "READY":
-                ready_setups[setup.inst_id] = ActiveReady(
-                    setup=setup,
-                    created_at=now_ts(),
-                    expires_at=now_ts() + READY_TTL_MINUTES * 60,
-                    telegram_message_id=text_id,
-                    photo_message_id=photo_id,
-                )
-            signals_hour.append(now_ts())
-            signals_today += 1
-            if signals_today >= MAX_SIGNALS_PER_DAY:
-                break
+def level_report():
+    rows = db.execute("""
+        SELECT coin, kind, score, distance_pct, status, touches, reactions, timeframes
+        FROM levels ORDER BY created_at DESC LIMIT 20
+    """).fetchall()
+    if not rows:
+        return "<b>LEVEL ENGINE</b>\nПока нет сохранённых уровней."
+    lines = ["<b>LEVEL ENGINE — последние уровни</b>"]
+    for coin, kind, score, dist, status, touches, reactions, tfs in rows:
+        icon = "🟢" if kind == "SUPPORT" else "🔴"
+        lines.append(f"{icon} {coin} {kind} | {score}/100 | {dist:.2f}% | {status} | {tfs}")
+    return "\n".join(lines)
 
 
 def main():
-    log.info("QUANTUM SCALPER V7 STARTED")
+    log.info("QUANTUM LEVEL ENGINE V8 STARTED")
     while True:
         try:
-            send_morning_message()
-            expire_old_ready()
-            update_signal_results()
-            send_reports_once_per_day()
-            scan_market()
+            scan_levels()
         except KeyboardInterrupt:
             log.info("STOPPED")
             break
         except Exception:
-            log.exception("MAIN LOOP ERROR")
-        time.sleep(SCAN_INTERVAL_SECONDS)
+            log.exception("LEVEL ENGINE LOOP ERROR")
+        time.sleep(LEVEL_SCAN_INTERVAL)
 
 
 if __name__ == "__main__":

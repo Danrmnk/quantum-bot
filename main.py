@@ -132,8 +132,16 @@ MIN_SCORE = int(
     )
 )
 
-PATTERN_MIN_SCORE = int(os.getenv("PATTERN_MIN_SCORE", "75"))
-MAX_PATTERN_DISTANCE_PCT = float(os.getenv("MAX_PATTERN_DISTANCE_PCT", "0.80"))
+PATTERN_MIN_SCORE = int(os.getenv("PATTERN_MIN_SCORE", "86"))
+MAX_PATTERN_DISTANCE_PCT = float(os.getenv("MAX_PATTERN_DISTANCE_PCT", "0.45"))
+
+# STRICT 5M SCALPING MARKET FILTERS
+# We only search patterns on instruments that are actually moving.
+MIN_5M_ATR_PCT = float(os.getenv("MIN_5M_ATR_PCT", "0.05"))
+MIN_15M_ATR_PCT = float(os.getenv("MIN_15M_ATR_PCT", "0.12"))
+MIN_1H_RANGE_PCT = float(os.getenv("MIN_1H_RANGE_PCT", "0.80"))
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.20"))
+MIN_24H_VOLUME_USD = max(MIN_24H_VOLUME_USD, float(os.getenv("STRICT_MIN_24H_VOLUME_USD", "50000000")))
 
 # Для особо сильных сетапов можно отправлять независимо
 # от небольшого недостатка одного из вторичных факторов.
@@ -3178,52 +3186,62 @@ def can_send_new_signal(
 # ============================================================
 
 def make_chart(setup: Setup) -> str:
-    """Clean Binance-like candlestick chart with only the detected pattern, entry and SL."""
-    candles = setup.candles_15m[-90:] or setup.candles_5m[-90:]
-    if len(candles) < 10:
-        raise RuntimeError("Not enough candles.")
+    """Professional 5M Binance-like chart. Pattern geometry is drawn on the exact 5M candles used for detection."""
+    candles = setup.candles_5m[-72:]
+    if len(candles) < 40:
+        raise RuntimeError("Not enough 5M candles for chart.")
 
     safe_coin = setup.coin.replace("/", "_").replace("\\", "_")
     path = f"/tmp/quantum_{safe_coin}_{int(time.time()*1000)}.png"
 
-    fig, ax = plt.subplots(figsize=(12, 7), dpi=150)
+    fig, ax = plt.subplots(figsize=(14, 8), dpi=170)
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
-    width = 0.62
+    width = 0.58
 
     for i, candle in enumerate(candles):
         color = "#16a34a" if candle.close >= candle.open else "#dc2626"
-        ax.plot([i, i], [candle.low, candle.high], color=color, linewidth=1.0, zorder=2)
+        ax.plot([i, i], [candle.low, candle.high], color=color, linewidth=1.15, zorder=2)
         body_low = min(candle.open, candle.close)
-        body_height = max(abs(candle.close - candle.open), candle.close * 1e-6)
+        body_height = max(abs(candle.close - candle.open), candle.close * 0.00001)
         ax.add_patch(Rectangle((i-width/2, body_low), width, body_height,
                                facecolor=color, edgecolor=color, linewidth=0.5, zorder=3))
 
-    offset = len(candles) - 90
+    # Pattern lines are stored in the same local index space as the detection candles.
+    # Re-anchor them to the visible 72-candle window.
+    chart_start = max(0, len(setup.candles_5m) - len(candles))
     for x1, y1, x2, y2 in setup.pattern_lines:
-        ax.plot([x1-offset, x2-offset], [y1, y2], color="#2563eb", linewidth=2.0, zorder=4)
+        ax.plot([x1-chart_start, x2-chart_start], [y1, y2],
+                color="#2563eb", linewidth=2.8, solid_capstyle="round", zorder=5)
 
-    # Entry is a thin line, not a wide band.
     entry = (setup.entry_low + setup.entry_high) / 2.0
-    ax.axhline(entry, color="#2563eb", linewidth=2.0, linestyle="-", zorder=4)
-    ax.axhline(setup.sl, color="#dc2626", linewidth=1.8, linestyle="--", zorder=4)
+    ax.axhline(entry, color="#2563eb", linewidth=2.2, linestyle="-", zorder=4)
+    ax.axhline(setup.sl, color="#dc2626", linewidth=2.0, linestyle="--", zorder=4)
 
-    last_x = len(candles) - 1
-    ax.annotate(f"ВХОД {fmt_price(entry)}", (last_x, entry), xytext=(-115, 12),
-                textcoords="offset points", color="#1d4ed8", fontsize=10, fontweight="bold")
-    ax.annotate(f"СТОП {fmt_price(setup.sl)}", (last_x, setup.sl), xytext=(-115, -18),
-                textcoords="offset points", color="#b91c1c", fontsize=10, fontweight="bold")
+    # Labels sit at the right edge but stay inside the plot.
+    right_x = len(candles) - 1
+    ax.text(right_x - 0.5, entry, f"  ВХОД {fmt_price(entry)}",
+            va="bottom", ha="right", color="#1d4ed8", fontsize=11, fontweight="bold",
+            bbox=dict(facecolor="white", edgecolor="none", alpha=0.82, pad=1.5), zorder=7)
+    ax.text(right_x - 0.5, setup.sl, f"  СТОП {fmt_price(setup.sl)}",
+            va="top", ha="right", color="#b91c1c", fontsize=11, fontweight="bold",
+            bbox=dict(facecolor="white", edgecolor="none", alpha=0.82, pad=1.5), zorder=7)
 
-    ax.set_title(f"{setup.coin}USDT · {setup.pattern_name} · {setup.direction}",
-                 fontsize=16, fontweight="bold", color="#111827", pad=12)
-    ax.set_xlim(max(0, len(candles)-75), len(candles)+2)
+    ax.set_title(f"{setup.coin}USDT · {setup.pattern_name} · {setup.direction} · 5M",
+                 fontsize=18, fontweight="bold", color="#111827", pad=14)
+    ax.text(0.012, 0.965, f"Паттерн: {setup.pattern_name} · Таймфрейм: 5M",
+            transform=ax.transAxes, va="top", fontsize=12, color="#111827", fontweight="bold")
+
+    ax.set_xlim(-1, len(candles) + 1)
+    ymin = min(min(c.low for c in candles), setup.sl)
+    ymax = max(max(c.high for c in candles), entry)
+    pad = max((ymax-ymin)*0.08, entry*0.0008)
+    ax.set_ylim(ymin-pad, ymax+pad)
     ax.grid(axis="y", alpha=0.14, color="#9ca3af", linewidth=0.7)
     ax.tick_params(axis="x", colors="#6b7280", labelbottom=False)
-    ax.tick_params(axis="y", colors="#6b7280")
+    ax.tick_params(axis="y", colors="#6b7280", labelsize=10)
     for spine in ax.spines.values():
         spine.set_color("#d1d5db")
-    ax.text(0.01, 0.98, f"Паттерн: {setup.pattern_name}", transform=ax.transAxes,
-            va="top", fontsize=11, color="#111827", fontweight="bold")
     plt.tight_layout()
     fig.savefig(path, facecolor="white", bbox_inches="tight")
     plt.close(fig)
@@ -3273,7 +3291,7 @@ def send_photo_and_text(
 
         caption = (
             f"🔥 *{setup.coin}USDT — {setup.direction}*\n"
-            f"📐 {setup.pattern_name}"
+            f"📐 {setup.pattern_name} · 5M"
         )
 
         with open(
@@ -3500,8 +3518,9 @@ PATTERN_NAMES = {
 
 
 def _pattern_pivots(candles):
-    hs = pivot_highs(candles, left=2, right=2)[-8:]
-    ls = pivot_lows(candles, left=2, right=2)[-8:]
+    # 5M needs stronger pivots; 3/3 filters out single-candle noise.
+    hs = pivot_highs(candles, left=3, right=3)[-8:]
+    ls = pivot_lows(candles, left=3, right=3)[-8:]
     return hs, ls
 
 
@@ -3512,7 +3531,8 @@ def _near(a, b, tol=0.012):
 def _line(points):
     if len(points) < 2:
         return None
-    (x1,y1),(x2,y2)=points[-2],points[-1]
+    # Draw the full structural line through the first and last pivot.
+    (x1,y1),(x2,y2)=points[0],points[-1]
     return (x1,y1,x2,y2)
 
 
@@ -3671,65 +3691,92 @@ def detect_chart_pattern(candles):
 
 
 def analyze_symbol_with_patterns(inst_id, ticker, candles):
-    pattern=detect_chart_pattern(candles.get("15m", []))
+    """5M-first pattern engine with strict market-activity filters."""
+    c5 = [c for c in candles.get("5m", []) if c.confirmed]
+    c15 = [c for c in candles.get("15m", []) if c.confirmed]
+    c1h = [c for c in candles.get("1H", []) if c.confirmed]
+    c4h = [c for c in candles.get("4H", []) if c.confirmed]
+    if len(c5) < 80 or len(c15) < 40 or len(c1h) < 24:
+        return None
+
+    # PATTERN IS FOUND ON 5M — not 15M.
+    pattern = detect_chart_pattern(c5[-120:])
     if not pattern or pattern["score"] < PATTERN_MIN_SCORE:
         return None
-    c5=[c for c in candles.get("5m",[]) if c.confirmed]
-    c15=candles.get("15m",[])
-    if len(c5)<35 or len(c15)<55:
+
+    current = float(ticker.get("last", 0) or c5[-1].close)
+    if current <= 0:
         return None
-    current=float(ticker.get("last",0) or c5[-1].close)
-    if current<=0:
+
+    atr5 = atr(c5, 14)
+    atr15 = atr(c15, 14)
+    if atr5 <= 0 or atr15 <= 0:
         return None
-    atr_value=atr(c5,14)
-    if atr_value<=0:
+    atr5_pct = atr5 / current * 100.0
+    atr15_pct = atr15 / current * 100.0
+    if atr5_pct < MIN_5M_ATR_PCT or atr15_pct < MIN_15M_ATR_PCT:
         return None
-    atr_pct=atr_value/current*100
-    if atr_pct < 0.025 or atr_pct > 3.0:
+
+    # The coin must have made a meaningful move recently. This removes flat/illiquid-looking setups.
+    h1 = c1h[-12:]
+    range_1h_pct = (max(x.high for x in h1) - min(x.low for x in h1)) / current * 100.0
+    if range_1h_pct < MIN_1H_RANGE_PCT:
         return None
-    avg_vol=sum(x.volume for x in c5[-21:-1])/20
-    v_ratio=c5[-1].volume/avg_vol if avg_vol>0 else 0
-    # Require activity, but allow pre-breakout patterns to be early.
-    if v_ratio < 1.05:
+
+    avg_vol = sum(x.volume for x in c5[-21:-1]) / 20
+    v_ratio = c5[-1].volume / avg_vol if avg_vol > 0 else 0.0
+    if v_ratio < MIN_VOLUME_RATIO:
         return None
-    entry=(pattern["entry_low"]+pattern["entry_high"])/2
-    if abs(entry-current)/current*100.0 > MAX_PATTERN_DISTANCE_PCT:
+
+    entry = (pattern["entry_low"] + pattern["entry_high"]) / 2.0
+    if abs(entry-current) / current * 100.0 > MAX_PATTERN_DISTANCE_PCT:
         return None
-    # Risk must be <= 1% price distance. Stop sits beyond the nearest pattern extreme.
-    recent=c15[-45:]
-    if pattern["direction"]=="LONG":
-        structural=min(x.low for x in recent)
-        sl=min(structural, entry-atr_value*1.2)
-        if sl>=entry:
+
+    # The 15M structure may confirm the setup, but it is never allowed to override the 5M pattern direction.
+    structure_15m = structure_direction(c15[-60:]) if len(c15) >= 30 else "NEUTRAL"
+    if structure_15m != "NEUTRAL" and structure_15m != pattern["direction"]:
+        return None
+
+    # Stop is based on the actual 5M pattern area, not a distant 15M/1H extreme.
+    recent = c5[-60:]
+    if pattern["direction"] == "LONG":
+        structural = min(x.low for x in recent)
+        sl = min(structural, entry - atr5 * 1.15)
+        if sl >= entry:
             return None
-        risk_pct=(entry-sl)/entry*100
-        if risk_pct>1.0:
-            return None
+        risk_pct = (entry-sl) / entry * 100.0
     else:
-        structural=max(x.high for x in recent)
-        sl=max(structural, entry+atr_value*1.2)
-        if sl<=entry:
+        structural = max(x.high for x in recent)
+        sl = max(structural, entry + atr5 * 1.15)
+        if sl <= entry:
             return None
-        risk_pct=(sl-entry)/entry*100
-        if risk_pct>1.0:
-            return None
-    risk=abs(entry-sl)
-    if risk<=0:
+        risk_pct = (sl-entry) / entry * 100.0
+    if risk_pct > 1.0:
         return None
-    if pattern["direction"]=="LONG":
-        tp1=entry+risk; tp2=entry+2*risk; tp3=entry+3*risk
+
+    risk = abs(entry-sl)
+    if risk <= 0:
+        return None
+    if pattern["direction"] == "LONG":
+        tp1, tp2, tp3 = entry+risk, entry+2*risk, entry+3*risk
     else:
-        tp1=entry-risk; tp2=entry-2*risk; tp3=entry-3*risk
-    vol24=float(ticker.get("vol24h_usd",0) or 0)
+        tp1, tp2, tp3 = entry-risk, entry-2*risk, entry-3*risk
+
+    vol24 = float(ticker.get("vol24h_usd", 0) or 0)
     if vol24 < MIN_24H_VOLUME_USD:
         return None
-    return Setup(inst_id=inst_id, coin=get_coin(inst_id), direction=pattern["direction"],
-                 strategy=pattern["name"], level=pattern["trigger"], level_strength=pattern["score"],
-                 level_tf="15m", current_price=current, entry_low=pattern["entry_low"], entry_high=pattern["entry_high"],
-                 sl=sl, tp1=tp1,tp2=tp2,tp3=tp3, score=pattern["score"], liquidity="GOOD" if vol24>=100e6 else "NORMAL",
-                 volume_grade=grade_volume(v_ratio), oi_status="AVAILABLE", reason=f"Паттерн подтверждён геометрией свечей. Точка входа подготовлена заранее.",
-                 volume_24h=vol24, breakout_volume_ratio=v_ratio, atr_pct=atr_pct, setup_state="READY", candles_5m=c5[-90:],
-                 candles_15m=c15[-90:], pattern_name=pattern["name"], pattern_score=pattern["score"], pattern_lines=pattern["lines"])
+
+    return Setup(
+        inst_id=inst_id, coin=get_coin(inst_id), direction=pattern["direction"],
+        strategy=pattern["name"], level=pattern["trigger"], level_strength=pattern["score"],
+        level_tf="5m", current_price=current, entry_low=pattern["entry_low"], entry_high=pattern["entry_high"],
+        sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, score=pattern["score"],
+        liquidity="GOOD" if vol24 >= 100e6 else "NORMAL", volume_grade=grade_volume(v_ratio),
+        oi_status="AVAILABLE", reason="Паттерн найден на 5M и подтверждён активностью рынка.",
+        volume_24h=vol24, breakout_volume_ratio=v_ratio, atr_pct=atr5_pct, setup_state="READY",
+        candles_5m=c5[-120:], candles_15m=c15[-60:], pattern_name=pattern["name"],
+        pattern_score=pattern["score"], pattern_lines=pattern["lines"]
+    )
 
 
 # ============================================================
@@ -3916,8 +3963,13 @@ def scan_market():
         candidates.append((fast_market_score(ticker), volume, inst_id, ticker))
 
     # Broad liquidity pool first. Pattern engine decides what is interesting now.
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    candidates = candidates[:MAX_CANDIDATES]
+    # Rank by actual trading activity first, not raw 24H turnover alone.
+    ranked = []
+    for _, volume, inst_id, ticker in candidates:
+        activity = fast_market_score(ticker)
+        ranked.append((activity, volume, inst_id, ticker))
+    ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    candidates = ranked[:MAX_CANDIDATES]
 
     setups = []
     for _, _, inst_id, ticker in candidates:

@@ -3564,27 +3564,72 @@ def detect_chart_pattern(candles):
             if abs(close-neck)/close*100 <= MAX_PATTERN_DISTANCE_PCT:
                 candidates.append(("inverse_head_shoulders","LONG",84,neck,[_line([(l3[0][0],l3[0][1]),(l3[1][0],l3[1][1])]),_line([(l3[1][0],l3[1][1]),(l3[2][0],l3[2][1])])]))
 
-    # Last three highs/lows: triangles and wedges.
+    # Triangles / wedges: require real multi-touch geometry.
+    # IMPORTANT: a descending triangle is NOT "any falling highs + almost-flat lows".
+    # We require a horizontal support with repeated touches AND falling highs.
+    # Conversely, an ascending triangle requires repeated horizontal resistance AND rising lows.
     hh=hs[-3:]; ll=ls[-3:]
     if len(hh)==3 and len(ll)==3:
+        high_vals=[x[1] for x in hh]
+        low_vals=[x[1] for x in ll]
+        high_span=max(high_vals)-min(high_vals)
+        low_span=max(low_vals)-min(low_vals)
+        high_ref=max(sum(high_vals)/len(high_vals), 1e-12)
+        low_ref=max(sum(low_vals)/len(low_vals), 1e-12)
+
         high_slope=(hh[-1][1]-hh[0][1])/max(hh[-1][0]-hh[0][0],1)
         low_slope=(ll[-1][1]-ll[0][1])/max(ll[-1][0]-ll[0][0],1)
-        ref=close
-        high_flat=abs(high_slope)*max(hh[-1][0]-hh[0][0],1)/ref <= .012
-        low_flat=abs(low_slope)*max(ll[-1][0]-ll[0][0],1)/ref <= .012
-        if high_flat and low_slope>0:
-            candidates.append(("ascending_triangle","LONG",82,max(x[1] for x in hh),[_line([(x[0],x[1]) for x in hh]),_line([(x[0],x[1]) for x in ll])]))
-        if low_flat and high_slope<0:
-            candidates.append(("descending_triangle","SHORT",82,min(x[1] for x in ll),[_line([(x[0],x[1]) for x in hh]),_line([(x[0],x[1]) for x in ll])]))
+
+        # Horizontal boundary: all three pivots must stay inside a tight band.
+        resistance_flat=(high_span/high_ref) <= 0.0045
+        support_flat=(low_span/low_ref) <= 0.0045
+
+        # Directional boundary must have meaningful displacement, not numerical noise.
+        rising_lows=(ll[-1][1] > ll[0][1]*(1+0.0020))
+        falling_highs=(hh[-1][1] < hh[0][1]*(1-0.0020))
+
+        resistance=max(high_vals)
+        support=min(low_vals)
+        dist_res=abs(resistance-close)/close*100.0
+        dist_sup=abs(close-support)/close*100.0
+
+        # ASCENDING TRIANGLE = flat resistance + clearly rising lows.
+        # For a pre-breakout signal, price must be close to resistance.
+        if resistance_flat and rising_lows and dist_res <= MAX_PATTERN_DISTANCE_PCT:
+            # Last two lows must also confirm the staircase, not just the first/last point.
+            if ll[-1][1] >= ll[-2][1]*(1+0.0010):
+                conf=88
+                if dist_res <= 0.20:
+                    conf += 5
+                candidates.append((
+                    "ascending_triangle","LONG",min(conf,99),resistance,
+                    [_line([(x[0],x[1]) for x in hh]),_line([(x[0],x[1]) for x in ll])]
+                ))
+
+        # DESCENDING TRIANGLE = flat support + clearly falling highs.
+        # Price must be close to support; otherwise it is not a short setup.
+        if support_flat and falling_highs and dist_sup <= MAX_PATTERN_DISTANCE_PCT:
+            if hh[-1][1] <= hh[-2][1]*(1-0.0010):
+                conf=88
+                if dist_sup <= 0.20:
+                    conf += 5
+                candidates.append((
+                    "descending_triangle","SHORT",min(conf,99),support,
+                    [_line([(x[0],x[1]) for x in hh]),_line([(x[0],x[1]) for x in ll])]
+                ))
+
+        # Pennants require genuinely converging boundaries plus a preceding impulse.
         if high_slope<0 and low_slope>0:
             impulse = (c[-18].close - c[-30].open) / max(c[-30].open, 1e-12) * 100 if len(c) >= 30 else 0.0
             if impulse > 1.0:
                 candidates.append(("bull_pennant","LONG",79,max(x[1] for x in hh),[_line([(x[0],x[1]) for x in hh]),_line([(x[0],x[1]) for x in ll])]))
             elif impulse < -1.0:
                 candidates.append(("bear_pennant","SHORT",79,min(x[1] for x in ll),[_line([(x[0],x[1]) for x in hh]),_line([(x[0],x[1]) for x in ll])]))
-        if high_slope<0 and low_slope<0:
+
+        # Wedges: both boundaries slope in the same direction.
+        if high_slope<0 and low_slope<0 and abs(high_slope)>0 and abs(low_slope)>0:
             candidates.append(("falling_wedge","LONG",80,max(x[1] for x in hh),[_line([(x[0],x[1]) for x in hh]),_line([(x[0],x[1]) for x in ll])]))
-        if high_slope>0 and low_slope>0:
+        if high_slope>0 and low_slope>0 and abs(high_slope)>0 and abs(low_slope)>0:
             candidates.append(("rising_wedge","SHORT",80,min(x[1] for x in ll),[_line([(x[0],x[1]) for x in hh]),_line([(x[0],x[1]) for x in ll])]))
 
     # Flag: strong impulse followed by a tight counter-trend channel.

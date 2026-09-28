@@ -3591,6 +3591,27 @@ class QualityCandidate:
     points: List[Tuple[float, float, str]]
 
 
+def _move_pct(candles: List[Candle], n: int) -> float:
+    if len(candles) <= n:
+        return 0.0
+    base = candles[-n - 1].close
+    if base <= 0:
+        return 0.0
+    return abs(candles[-1].close - base) / base * 100.0
+
+
+def _range_pct(candles: List[Candle], n: int) -> float:
+    if len(candles) < n:
+        return 0.0
+    x = candles[-n:]
+    lo = min(c.low for c in x)
+    hi = max(c.high for c in x)
+    last = x[-1].close
+    if last <= 0:
+        return 0.0
+    return (hi - lo) / last * 100.0
+
+
 def _ema_last(candles: List[Candle], period: int) -> float:
     if len(candles) < period:
         return 0.0

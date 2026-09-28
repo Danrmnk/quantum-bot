@@ -1082,6 +1082,50 @@ def get_open_interest(
     return None
 
 
+def get_orderbook_imbalance(inst_id: str, depth: int = 10) -> Optional[float]:
+    """Soft order book imbalance from top-of-book snapshot.
+
+    Returns value in [-1, 1]:
+      > 0 → more bids (support pressure)
+      < 0 → more asks (resistance pressure)
+    None if request failed.
+    This is only a soft confirmation, never the main signal logic.
+    """
+    try:
+        payload = okx_get(
+            "/api/v5/market/books",
+            {
+                "instId": inst_id,
+                "sz": str(min(max(depth, 5), 25)),
+            },
+        )
+        data = payload.get("data", [])
+        if not data:
+            return None
+        book = data[0]
+        bids = book.get("bids", []) or []
+        asks = book.get("asks", []) or []
+        bid_vol = 0.0
+        ask_vol = 0.0
+        for row in bids[:depth]:
+            try:
+                bid_vol += float(row[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+        for row in asks[:depth]:
+            try:
+                ask_vol += float(row[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+        total = bid_vol + ask_vol
+        if total <= 0:
+            return None
+        return (bid_vol - ask_vol) / total
+    except Exception as exc:
+        log.debug("ORDERBOOK FAILED | %s | %s", inst_id, exc)
+        return None
+
+
 # ============================================================
 # INDICATORS
 # ============================================================
@@ -3813,6 +3857,23 @@ def build_quality_setup(inst_id: str, ticker: dict, candles: Dict[str, List[Cand
             if direction == "SHORT" and rs > 0.5:
                 return None
 
+    # Soft order book imbalance (bonus only; hard reject only if strongly against)
+    book_imb = get_orderbook_imbalance(inst_id, depth=10)
+    book_note = "n/a"
+    if book_imb is not None:
+        book_note = f"{book_imb:+.2f}"
+        if direction == "LONG":
+            if book_imb >= 0.12:
+                score += 3
+            elif book_imb <= -0.28:
+                # strongly opposite pressure — skip
+                return None
+        else:
+            if book_imb <= -0.12:
+                score += 3
+            elif book_imb >= 0.28:
+                return None
+
     score = int(clamp(score, 0, 98))
     if score < PATTERN_MIN_SCORE:
         return None
@@ -3824,7 +3885,7 @@ def build_quality_setup(inst_id: str, ticker: dict, candles: Dict[str, List[Cand
 
     reason = (
         f"{setup_name}: {direction} | 4H={s4h} 1H={s1h} | "
-        f"откат {pullback_pct:.2f}% | объём x{v_ratio:.2f}"
+        f"откат {pullback_pct:.2f}% | объём x{v_ratio:.2f} | book {book_note}"
     )
 
     # chart helpers
@@ -4135,21 +4196,25 @@ def scan_market():
     broad = broad[:FAST_CANDIDATE_POOL]
 
     setups = []
+    analyzed = 0
+    errors = 0
     for _, _, inst_id, ticker in broad:
         if not can_send_new_signal(inst_id):
             continue
         try:
+            analyzed += 1
             candles = load_candles_for_symbol(inst_id)
             setup = analyze_symbol_with_patterns(inst_id, ticker, candles)
             if setup is not None and setup.score >= PATTERN_MIN_SCORE:
                 setups.append(setup)
         except Exception as exc:
-            log.warning("PATTERN ANALYZE FAILED | %s | %s", inst_id, exc)
+            errors += 1
+            log.warning("ANALYZE FAILED | %s | %s", inst_id, exc)
 
     setups.sort(key=lambda x: x.score, reverse=True)
     log.info(
-        "QUALITY V3 | market=%d | liquid_pool=%d | quality_setups=%d",
-        len(tickers), len(broad), len(setups)
+        "QUALITY V3 | market=%d | pool=%d | analyzed=%d | setups=%d | errors=%d | sent_today=%d",
+        len(tickers), len(broad), analyzed, len(setups), errors, signals_today
     )
 
     for setup in setups:

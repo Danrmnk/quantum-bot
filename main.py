@@ -103,37 +103,37 @@ MIN_CANDIDATE_VOLUME_USD = float(os.getenv("MIN_CANDIDATE_VOLUME_USD", "10000000
 # SCORE
 # ============================================================
 
-MIN_SCORE = int(os.getenv("MIN_SCORE", "86"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "80"))
 
 # Quality filters for Trend + Pullback + Trigger
-MIN_15M_ATR_PCT = float(os.getenv("MIN_15M_ATR_PCT", "0.35"))
-MIN_5M_VOLUME_SURGE = float(os.getenv("MIN_5M_VOLUME_SURGE", "1.45"))
-MIN_ACTIVE_VOLUME_SURGE = float(os.getenv("MIN_ACTIVE_VOLUME_SURGE", "1.55"))
-MIN_RELATIVE_STRENGTH = float(os.getenv("MIN_RELATIVE_STRENGTH", "0.10"))
-MIN_FAST_VOLUME_RATIO = float(os.getenv("MIN_FAST_VOLUME_RATIO", "0.90"))
-MIN_FAST_15M_ATR_PCT = float(os.getenv("MIN_FAST_15M_ATR_PCT", "0.35"))
-MIN_LEVEL_STRENGTH = int(os.getenv("MIN_LEVEL_STRENGTH", "50"))
-MIN_5M_ATR_PCT = float(os.getenv("MIN_5M_ATR_PCT", "0.10"))
-MIN_1H_MOVE_PCT = float(os.getenv("MIN_1H_MOVE_PCT", "0.60"))
-MIN_15M_MOVE_PCT = float(os.getenv("MIN_15M_MOVE_PCT", "0.25"))
-MIN_PATTERN_VOLUME_RATIO = float(os.getenv("MIN_PATTERN_VOLUME_RATIO", "1.45"))
-MIN_5M_RANGE_PCT = float(os.getenv("MIN_5M_RANGE_PCT", "0.55"))
-MIN_15M_RANGE_PCT = float(os.getenv("MIN_15M_RANGE_PCT", "0.90"))
-PATTERN_MAX_ENTRY_DISTANCE_PCT = float(os.getenv("PATTERN_MAX_ENTRY_DISTANCE_PCT", "0.50"))
-PATTERN_MIN_SCORE = int(os.getenv("PATTERN_MIN_SCORE", "86"))
+MIN_15M_ATR_PCT = float(os.getenv("MIN_15M_ATR_PCT", "0.28"))
+MIN_5M_VOLUME_SURGE = float(os.getenv("MIN_5M_VOLUME_SURGE", "1.25"))
+MIN_ACTIVE_VOLUME_SURGE = float(os.getenv("MIN_ACTIVE_VOLUME_SURGE", "1.35"))
+MIN_RELATIVE_STRENGTH = float(os.getenv("MIN_RELATIVE_STRENGTH", "0.05"))
+MIN_FAST_VOLUME_RATIO = float(os.getenv("MIN_FAST_VOLUME_RATIO", "0.85"))
+MIN_FAST_15M_ATR_PCT = float(os.getenv("MIN_FAST_15M_ATR_PCT", "0.28"))
+MIN_LEVEL_STRENGTH = int(os.getenv("MIN_LEVEL_STRENGTH", "45"))
+MIN_5M_ATR_PCT = float(os.getenv("MIN_5M_ATR_PCT", "0.08"))
+MIN_1H_MOVE_PCT = float(os.getenv("MIN_1H_MOVE_PCT", "0.40"))
+MIN_15M_MOVE_PCT = float(os.getenv("MIN_15M_MOVE_PCT", "0.18"))
+MIN_PATTERN_VOLUME_RATIO = float(os.getenv("MIN_PATTERN_VOLUME_RATIO", "1.25"))
+MIN_5M_RANGE_PCT = float(os.getenv("MIN_5M_RANGE_PCT", "0.45"))
+MIN_15M_RANGE_PCT = float(os.getenv("MIN_15M_RANGE_PCT", "0.75"))
+PATTERN_MAX_ENTRY_DISTANCE_PCT = float(os.getenv("PATTERN_MAX_ENTRY_DISTANCE_PCT", "0.70"))
+PATTERN_MIN_SCORE = int(os.getenv("PATTERN_MIN_SCORE", "80"))
 PATTERN_PIVOT_LEFT = int(os.getenv("PATTERN_PIVOT_LEFT", "3"))
 PATTERN_PIVOT_RIGHT = int(os.getenv("PATTERN_PIVOT_RIGHT", "3"))
 
 # Risk / RR for quality setups
-MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "0.85"))
-MIN_RR = float(os.getenv("MIN_RR", "1.8"))
+MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "1.10"))
+MIN_RR = float(os.getenv("MIN_RR", "1.5"))
 
 # Pullback constraints
-MAX_PULLBACK_PCT = float(os.getenv("MAX_PULLBACK_PCT", "3.5"))
-MIN_PULLBACK_PCT = float(os.getenv("MIN_PULLBACK_PCT", "0.35"))
-MAX_ENTRY_DISTANCE_FROM_ZONE_PCT = float(os.getenv("MAX_ENTRY_DISTANCE_FROM_ZONE_PCT", "0.55"))
+MAX_PULLBACK_PCT = float(os.getenv("MAX_PULLBACK_PCT", "4.5"))
+MIN_PULLBACK_PCT = float(os.getenv("MIN_PULLBACK_PCT", "0.20"))
+MAX_ENTRY_DISTANCE_FROM_ZONE_PCT = float(os.getenv("MAX_ENTRY_DISTANCE_FROM_ZONE_PCT", "0.85"))
 
-ELITE_SCORE = int(os.getenv("ELITE_SCORE", "92"))
+ELITE_SCORE = int(os.getenv("ELITE_SCORE", "90"))
 
 
 # ============================================================
@@ -3668,7 +3668,7 @@ def _pullback_ok(c1h: List[Candle], c15: List[Candle], direction: str) -> Tuple[
         recent_low = min(c.low for c in c15[-16:])
         pullback = (c15[-1].close - recent_low) / max(recent_low, 1e-12) * 100
 
-    if impulse < 0.8:
+    if impulse < 0.55:
         return False, pullback, "weak impulse"
     if pullback < MIN_PULLBACK_PCT:
         return False, pullback, "no pullback"
@@ -3682,7 +3682,7 @@ def _trigger_5m(c5: List[Candle], direction: str) -> Tuple[bool, float, str]:
     if len(c5) < 25:
         return False, 0.0, "history"
     cur = c5[-1]
-    prev = c5[-8:-1]
+    prev = c5[-10:-1]
     body = candle_body_ratio(cur)
     vr = volume_ratio(c5, 20)
     if vr < MIN_PATTERN_VOLUME_RATIO:
@@ -3690,15 +3690,15 @@ def _trigger_5m(c5: List[Candle], direction: str) -> Tuple[bool, float, str]:
 
     if direction == "LONG":
         prev_high = max(c.high for c in prev)
-        bullish = cur.close > cur.open and cur.close >= prev_high
+        bullish = cur.close > cur.open and cur.close >= prev_high * 0.998
         close_pos = (cur.close - cur.low) / max(cur.high - cur.low, 1e-12)
-        if bullish and body >= 0.50 and close_pos >= 0.65:
+        if bullish and body >= 0.42 and close_pos >= 0.55:
             return True, vr, "long trigger"
     else:
         prev_low = min(c.low for c in prev)
-        bearish = cur.close < cur.open and cur.close <= prev_low
+        bearish = cur.close < cur.open and cur.close <= prev_low * 1.002
         close_pos = (cur.high - cur.close) / max(cur.high - cur.low, 1e-12)
-        if bearish and body >= 0.50 and close_pos >= 0.65:
+        if bearish and body >= 0.42 and close_pos >= 0.55:
             return True, vr, "short trigger"
     return False, vr, "no trigger"
 
@@ -3753,8 +3753,12 @@ def quality_tradeability(ticker: dict, c5: List[Candle], c15: List[Candle], c1h:
     if a5 > 2.5 or a15 > 3.2:
         return False, "atr high"
 
-    if _move_pct(c1h, 12) < MIN_1H_MOVE_PCT:
-        return False, "1h quiet"
+    # 1H movement filter (inline — no external helper dependency)
+    if len(c1h) > 12:
+        base = c1h[-13].close
+        move1h = abs(c1h[-1].close - base) / base * 100.0 if base > 0 else 0.0
+        if move1h < MIN_1H_MOVE_PCT:
+            return False, "1h quiet"
     return True, "ok"
 
 
@@ -3772,28 +3776,35 @@ def build_quality_setup(inst_id: str, ticker: dict, candles: Dict[str, List[Cand
         log.debug("QUALITY REJECT | %s | %s", inst_id, why)
         return None
 
-    # --- HTF direction (strict) ---
+    # --- HTF direction ---
     s1h = structure_direction(c1h)
     s4h = structure_direction(c4h)
+    e20_1h = _ema_last(c1h, 20)
+    e50_1h = _ema_last(c1h, 50)
+    price_1h = c1h[-1].close
+
+    # If structure neutral, fall back to EMA bias
     if s1h == "NEUTRAL":
-        return None
+        if e20_1h > e50_1h and price_1h > e50_1h:
+            s1h = "LONG"
+        elif e20_1h < e50_1h and price_1h < e50_1h:
+            s1h = "SHORT"
+        else:
+            return None
+
     if s4h not in ("NEUTRAL", s1h):
         return None
     direction = s1h
 
-    # EMA alignment on 1H as extra confirmation
-    e20_1h = _ema_last(c1h, 20)
-    e50_1h = _ema_last(c1h, 50)
-    price_1h = c1h[-1].close
-    if direction == "LONG" and not (e20_1h > e50_1h and price_1h > e50_1h):
+    # EMA soft confirmation (not both conditions required)
+    if direction == "LONG" and price_1h < e50_1h * 0.992 and e20_1h < e50_1h:
         return None
-    if direction == "SHORT" and not (e20_1h < e50_1h and price_1h < e50_1h):
+    if direction == "SHORT" and price_1h > e50_1h * 1.008 and e20_1h > e50_1h:
         return None
 
     # --- Pullback ---
     pb_ok, pullback_pct, pb_why = _pullback_ok(c1h, c15, direction)
     if not pb_ok:
-        log.debug("PULLBACK REJECT | %s | %s", inst_id, pb_why)
         return None
 
     # --- Zone ---
@@ -3878,22 +3889,21 @@ def build_quality_setup(inst_id: str, ticker: dict, candles: Dict[str, List[Cand
             if direction == "SHORT" and rs > 0.5:
                 return None
 
-    # Soft order book imbalance (bonus only; hard reject only if strongly against)
+    # Soft order book imbalance — only score adjustment, never hard reject
     book_imb = get_orderbook_imbalance(inst_id, depth=10)
     book_note = "n/a"
     if book_imb is not None:
         book_note = f"{book_imb:+.2f}"
         if direction == "LONG":
-            if book_imb >= 0.12:
+            if book_imb >= 0.10:
                 score += 3
-            elif book_imb <= -0.28:
-                # strongly opposite pressure — skip
-                return None
+            elif book_imb <= -0.20:
+                score -= 2
         else:
-            if book_imb <= -0.12:
+            if book_imb <= -0.10:
                 score += 3
-            elif book_imb >= 0.28:
-                return None
+            elif book_imb >= 0.20:
+                score -= 2
 
     score = int(clamp(score, 0, 98))
     if score < PATTERN_MIN_SCORE:

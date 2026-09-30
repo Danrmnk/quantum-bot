@@ -41,7 +41,8 @@ TOP_LOSERS = int(os.getenv("TOP_LOSERS", "10"))
 MIN_24H_VOLUME_USD = float(os.getenv("MIN_24H_VOLUME_USD", "60000000"))
 
 # Первый разворот должен быть ранним, а не после большого отката.
-MIN_EXTREME_MOVE_PCT = float(os.getenv("MIN_EXTREME_MOVE_PCT", "15"))
+MIN_GAINER_24H_PCT = float(os.getenv("MIN_GAINER_24H_PCT", "30"))
+MIN_LOSER_24H_PCT = float(os.getenv("MIN_LOSER_24H_PCT", "-30"))
 MIN_INITIAL_REVERSAL_PCT = float(os.getenv("MIN_INITIAL_REVERSAL_PCT", "0.45"))
 MAX_INITIAL_REVERSAL_PCT = float(os.getenv("MAX_INITIAL_REVERSAL_PCT", "4.5"))
 MIN_5M_RANGE_PCT = float(os.getenv("MIN_5M_RANGE_PCT", "0.65"))
@@ -329,144 +330,152 @@ def volume_ratio(candles: List[Candle], n: int = 20) -> float:
 # REVERSAL ENGINE
 # ============================================================
 
-def build_reversal_setup(inst_id: str, ticker: dict, candles: Dict[str, List[Candle]]) -> Optional[Setup]:
-    c5 = [c for c in candles.get("5m", []) if c.confirmed]
+def build_reversal_setup(inst_id: str, ticker: dict, candles: Dict[str, List[Candle]], side: str) -> Optional[Setup]:
+    # Берём и текущую 5M свечу: для reversal важно поймать начало движения,
+    # а не ждать закрытия свечи через несколько минут.
+    c5 = candles.get("5m", [])
     c15 = [c for c in candles.get("15m", []) if c.confirmed]
     if len(c5) < 40 or len(c15) < 20:
         return None
 
-    change24 = float(ticker.get("change24h_pct", 0) or 0)
     last = c5[-1].close
     if last <= 0:
         return None
 
-    is_gainer = change24 >= MIN_EXTREME_MOVE_PCT
-    is_loser = change24 <= -MIN_EXTREME_MOVE_PCT
-    if not (is_gainer or is_loser):
+    if side not in ("SHORT", "LONG"):
         return None
 
     look = c5[-min(LOOKBACK_5M, len(c5)):]
     a5 = atr(c5, 14)
-    ar = avg_range(c5, 20)
-    if a5 <= 0 or ar <= 0:
+    if a5 <= 0:
         return None
 
-    recent_ranges = [(c.high - c.low) / max(c.close, 1e-12) * 100 for c in look[-8:]]
-    if max(recent_ranges) < MIN_5M_RANGE_PCT:
+    # Для раннего входа экстремум ищем до текущей свечи.
+    history = look[:-1]
+    if len(history) < 8:
         return None
 
-    # Последний объём должен показывать, что разворот происходит сейчас.
+    extreme_i = (max(range(len(history)), key=lambda i: history[i].high)
+                 if side == "SHORT" else
+                 min(range(len(history)), key=lambda i: history[i].low))
+    extreme = history[extreme_i].high if side == "SHORT" else history[extreme_i].low
+
+    # Экстремум должен быть сформирован не на самой последней свече.
+    if extreme_i >= len(history) - 2:
+        return None
+
+    post = history[extreme_i + 1:]
+    if len(post) < 2:
+        return None
+
+    current = c5[-1]
+    prev = c5[-2]
+    body = abs(current.close - current.open)
+    current_range_pct = (current.high - current.low) / max(current.close, 1e-12) * 100
+
+    # Сильная свеча / активность сейчас. Объём текущей свечи может быть ещё
+    # незакрытым, поэтому используем минимум либо текущий объём, либо предыдущую свечу.
     vratio = volume_ratio(c5, 20)
-    if vratio < MIN_VOLUME_RATIO:
+    prev_vratio = volume_ratio(c5[:-1], 20) if len(c5) > 22 else 0.0
+    active_volume = max(vratio, prev_vratio)
+    if current_range_pct < MIN_5M_RANGE_PCT and body < a5 * 0.75:
+        return None
+    if active_volume < MIN_VOLUME_RATIO and body < a5 * 1.25:
         return None
 
-    extreme_i = (max(range(len(look)), key=lambda i: look[i].high)
-                 if is_gainer else min(range(len(look)), key=lambda i: look[i].low))
-    extreme = look[extreme_i].high if is_gainer else look[extreme_i].low
-    if extreme_i >= len(look) - 2:
-        return None
-
-    post = look[extreme_i + 1:]
-    if len(post) < 3:
-        return None
-
-    last_c = look[-1]
-    prev_c = look[-2]
-    body = abs(last_c.close - last_c.open)
-
-    if is_gainer:
+    if side == "SHORT":
         reversal_pct = (extreme - last) / extreme * 100
         if not (MIN_INITIAL_REVERSAL_PCT <= reversal_pct <= MAX_INITIAL_REVERSAL_PCT):
             return None
-        reaction_low = min(c.low for c in post[:-1])
-        bearish = last_c.close < last_c.open and prev_c.close <= prev_c.open
-        trigger = last_c.close < reaction_low or (bearish and body >= a5 * MIN_BODY_ATR)
+
+        # Первый медвежий импульс: красная свеча + пробой минимума
+        # предыдущей свечи либо достаточно большой bearish-body.
+        bearish = current.close < current.open
+        trigger = (bearish and current.close < prev.low) or (bearish and body >= a5 * 0.90)
         if not trigger:
             return None
 
-        local_high = max(c.high for c in look[-6:])
-        sl = local_high + a5 * 0.12
+        local_high = max(c.high for c in post[-6:] + [current])
+        sl = max(local_high, extreme) + a5 * 0.08
         risk = sl - last
         risk_pct = risk / last * 100
         if risk <= 0 or risk_pct < MIN_RISK_PCT or risk_pct > MAX_RISK_PCT:
             return None
 
-        support5 = min(c.low for c in c5[-24:])
+        support5 = min(c.low for c in c5[-24:-1])
         support15 = min(c.low for c in c15[-20:])
-        support = support5 if support5 < last else support15
-        room_pct = (last - support) / last * 100 if support < last else 0.0
-        if room_pct < MIN_ROOM_PCT:
-            support = support15
-            room_pct = (last - support) / last * 100 if support < last else 0.0
+        support_candidates = [x for x in (support5, support15) if x < last]
+        if not support_candidates:
+            return None
+        support = max(support_candidates)
+        room_pct = (last - support) / last * 100
         if room_pct < MIN_ROOM_PCT:
             return None
 
-        tp1 = max(last - risk * 2.0, last * (1 - min(4.0, room_pct * 0.35) / 100))
-        tp2 = max(last - risk * 3.5, last * (1 - min(8.0, room_pct * 0.70) / 100))
+        tp1 = last - min(risk * 2.0, last * min(4.0, room_pct * 0.35) / 100)
+        tp2 = last - min(risk * 3.5, last * min(8.0, room_pct * 0.70) / 100)
         tp3 = support
         if not (tp3 < tp2 < tp1 < last):
             return None
 
         strategy = "TOP GAINER · ПЕРВЫЙ РАЗВОРОТ"
         direction = "SHORT"
-        reason_score = 84
-        if change24 >= 50: reason_score += 5
-        if change24 >= 100: reason_score += 3
-        if max(recent_ranges) >= 1.5: reason_score += 3
+        reason_score = 82
+        if abs(float(ticker.get("change24h_pct", 0) or 0)) >= 50: reason_score += 5
         if reversal_pct <= 2.5: reason_score += 3
-        if vratio >= 1.5: reason_score += 3
+        if active_volume >= 1.5: reason_score += 3
+        if body >= a5: reason_score += 3
         score = min(98, reason_score)
         extreme_label = "EXTREME HIGH"
         trigger_label = "FIRST BEARISH BREAK"
         level = support
+
     else:
         reversal_pct = (last - extreme) / extreme * 100
         if not (MIN_INITIAL_REVERSAL_PCT <= reversal_pct <= MAX_INITIAL_REVERSAL_PCT):
             return None
-        reaction_high = max(c.high for c in post[:-1])
-        bullish = last_c.close > last_c.open and prev_c.close >= prev_c.open
-        trigger = last_c.close > reaction_high or (bullish and body >= a5 * MIN_BODY_ATR)
+
+        bullish = current.close > current.open
+        trigger = (bullish and current.close > prev.high) or (bullish and body >= a5 * 0.90)
         if not trigger:
             return None
 
-        local_low = min(c.low for c in look[-6:])
-        sl = local_low - a5 * 0.12
+        local_low = min(c.low for c in post[-6:] + [current])
+        sl = min(local_low, extreme) - a5 * 0.08
         risk = last - sl
         risk_pct = risk / last * 100
         if risk <= 0 or risk_pct < MIN_RISK_PCT or risk_pct > MAX_RISK_PCT:
             return None
 
-        resistance5 = max(c.high for c in c5[-24:])
+        resistance5 = max(c.high for c in c5[-24:-1])
         resistance15 = max(c.high for c in c15[-20:])
-        resistance = resistance5 if resistance5 > last else resistance15
-        room_pct = (resistance - last) / last * 100 if resistance > last else 0.0
-        if room_pct < MIN_ROOM_PCT:
-            resistance = resistance15
-            room_pct = (resistance - last) / last * 100 if resistance > last else 0.0
+        resistance_candidates = [x for x in (resistance5, resistance15) if x > last]
+        if not resistance_candidates:
+            return None
+        resistance = min(resistance_candidates)
+        room_pct = (resistance - last) / last * 100
         if room_pct < MIN_ROOM_PCT:
             return None
 
-        tp1 = min(last + risk * 2.0, last * (1 + min(4.0, room_pct * 0.35) / 100))
-        tp2 = min(last + risk * 3.5, last * (1 + min(8.0, room_pct * 0.70) / 100))
+        tp1 = last + min(risk * 2.0, last * min(4.0, room_pct * 0.35) / 100)
+        tp2 = last + min(risk * 3.5, last * min(8.0, room_pct * 0.70) / 100)
         tp3 = resistance
         if not (last < tp1 < tp2 < tp3):
             return None
 
         strategy = "TOP LOSER · ПЕРВЫЙ ОТСКОК"
         direction = "LONG"
-        reason_score = 84
-        if change24 <= -50: reason_score += 5
-        if change24 <= -100: reason_score += 3
-        if max(recent_ranges) >= 1.5: reason_score += 3
+        reason_score = 82
+        if abs(float(ticker.get("change24h_pct", 0) or 0)) >= 50: reason_score += 5
         if reversal_pct <= 2.5: reason_score += 3
-        if vratio >= 1.5: reason_score += 3
+        if active_volume >= 1.5: reason_score += 3
+        if body >= a5: reason_score += 3
         score = min(98, reason_score)
         extreme_label = "EXTREME LOW"
         trigger_label = "FIRST BULLISH BREAK"
         level = resistance
 
     chart_c = c5[-100:]
-    # Индексы переводятся относительно 100 свечей, которые рисует график.
     offset = max(0, len(c5) - 100)
     extreme_global = max(0, len(c5) - len(look) + extreme_i)
     trigger_global = len(c5) - 1
@@ -475,36 +484,18 @@ def build_reversal_setup(inst_id: str, ticker: dict, candles: Dict[str, List[Can
     level_x = max(0, len(chart_c) - 28)
 
     lines = [(level_x, level, len(chart_c) - 1, level, "level")]
-    points = [
-        (extreme_x, extreme, extreme_label),
-        (trigger_x, last, trigger_label),
-    ]
+    points = [(extreme_x, extreme, extreme_label), (trigger_x, last, trigger_label)]
 
     return Setup(
-        inst_id=inst_id,
-        coin=get_coin(inst_id),
-        direction=direction,
-        strategy=strategy,
-        current_price=last,
-        extreme_price=extreme,
-        level=level,
-        entry_low=last * 0.9994,
-        entry_high=last * 1.0004,
-        sl=sl,
-        tp1=tp1,
-        tp2=tp2,
-        tp3=tp3,
-        score=score,
-        change24=change24,
-        volume_ratio=vratio,
-        risk_pct=risk_pct,
-        room_pct=room_pct,
+        inst_id=inst_id, coin=get_coin(inst_id), direction=direction, strategy=strategy,
+        current_price=last, extreme_price=extreme, level=level,
+        entry_low=last * 0.9994, entry_high=last * 1.0004,
+        sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, score=score,
+        change24=float(ticker.get("change24h_pct", 0) or 0),
+        volume_ratio=active_volume, risk_pct=risk_pct, room_pct=room_pct,
         volume_24h=float(ticker.get("vol24h_usd", 0) or 0),
-        candles_5m=c5[-100:],
-        extreme_index=extreme_x,
-        trigger_index=trigger_x,
-        pattern_lines=lines,
-        pattern_points=points,
+        candles_5m=c5[-100:], extreme_index=extreme_x, trigger_index=trigger_x,
+        pattern_lines=lines, pattern_points=points,
     )
 
 # ============================================================
@@ -783,17 +774,17 @@ def scan_market() -> None:
 
     gainers = sorted(liquid, key=lambda x: float(x[1].get("change24h_pct", 0)), reverse=True)[:TOP_GAINERS]
     losers = sorted(liquid, key=lambda x: float(x[1].get("change24h_pct", 0)))[:TOP_LOSERS]
-    candidates = dict(gainers + losers)
+    candidates = [(inst_id, ticker, "SHORT") for inst_id, ticker in gainers] + [(inst_id, ticker, "LONG") for inst_id, ticker in losers]
 
     log.info("TOP MOVERS | gainers=%s losers=%s unique=%s", TOP_GAINERS, TOP_LOSERS, len(candidates))
 
     setups = []
-    for inst_id, ticker in candidates.items():
+    for inst_id, ticker, side in candidates:
         if not can_send_new_signal(inst_id):
             continue
         try:
             candles = load_candles_for_symbol(inst_id)
-            setup = build_reversal_setup(inst_id, ticker, candles)
+            setup = build_reversal_setup(inst_id, ticker, candles, side)
             if setup:
                 setups.append(setup)
         except Exception as exc:
@@ -815,7 +806,10 @@ def scan_market() -> None:
 
 def main() -> None:
     log.info("REVERSAL SCALPER V1 STARTED")
-    log.info("TOP GAINERS=%s | TOP LOSERS=%s | MAX RISK=%.2f%%", TOP_GAINERS, TOP_LOSERS, MAX_RISK_PCT)
+    log.info(
+        "TOP GAINERS=%s (>=%.1f%%) | TOP LOSERS=%s (<=%.1f%%) | MAX RISK=%.2f%%",
+        TOP_GAINERS, MIN_GAINER_24H_PCT, TOP_LOSERS, MIN_LOSER_24H_PCT, MAX_RISK_PCT,
+    )
     while True:
         try:
             update_signal_results()

@@ -327,6 +327,69 @@ bot = telebot.TeleBot(
 )
 
 
+@bot.callback_query_handler(func=lambda call: bool(call.data) and call.data.startswith("qvote:"))
+def handle_signal_vote(call):
+    vote = call.data.split(":", 1)[1]
+    labels = {
+        "fire": "🔥 Сильный",
+        "good": "👍 Норм",
+        "weak": "👎 Слабый",
+        "miss": "❌ Мимо",
+    }
+    if vote not in labels or not call.message:
+        try:
+            bot.answer_callback_query(call.id)
+        except Exception:
+            pass
+        return
+
+    message_id = int(call.message.message_id)
+    user = call.from_user
+    user_id = int(user.id)
+    username = (user.username or user.first_name or "").strip()
+    try:
+        db.execute(
+            """
+            INSERT INTO signal_votes(message_id,user_id,username,vote,created_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(message_id,user_id) DO UPDATE SET
+                username=excluded.username,
+                vote=excluded.vote,
+                created_at=excluded.created_at
+            """,
+            (message_id, user_id, username, vote, now_ts())
+        )
+        db.commit()
+
+        counts = {k: 0 for k in labels}
+        for row in db.execute(
+            "SELECT vote, COUNT(*) FROM signal_votes WHERE message_id=? GROUP BY vote",
+            (message_id,)
+        ).fetchall():
+            if row[0] in counts:
+                counts[row[0]] = int(row[1])
+
+        markup = telebot.types.InlineKeyboardMarkup(row_width=4)
+        markup.add(
+            telebot.types.InlineKeyboardButton(f"🔥 {counts['fire']}", callback_data="qvote:fire"),
+            telebot.types.InlineKeyboardButton(f"👍 {counts['good']}", callback_data="qvote:good"),
+            telebot.types.InlineKeyboardButton(f"👎 {counts['weak']}", callback_data="qvote:weak"),
+            telebot.types.InlineKeyboardButton(f"❌ {counts['miss']}", callback_data="qvote:miss"),
+        )
+        try:
+            bot.edit_message_reply_markup(CHANNEL_ID, message_id, reply_markup=markup)
+        except Exception:
+            log.exception("VOTE MARKUP UPDATE FAILED | message=%s", message_id)
+
+        bot.answer_callback_query(call.id, f"Оценка: {labels[vote]}")
+    except Exception:
+        log.exception("SIGNAL VOTE FAILED | message=%s", message_id)
+        try:
+            bot.answer_callback_query(call.id, "Не удалось сохранить оценку")
+        except Exception:
+            pass
+
+
 # ============================================================
 # HTTP
 # ============================================================
@@ -373,6 +436,18 @@ db.execute("""
 CREATE TABLE IF NOT EXISTS bot_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+)
+""")
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS signal_votes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    username TEXT DEFAULT '',
+    vote TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(message_id, user_id)
 )
 """)
 
@@ -938,6 +1013,7 @@ def get_tickers() -> Dict[str, dict]:
                 "vol24h": vol_24h,
                 "vol_ccy_24h": vol_ccy_24h,
                 "vol24h_usd": turnover,
+                "change24h_pct": ((last - open24h) / open24h * 100.0) if open24h > 0 else 0.0,
                 "ts": ts,
             }
 
@@ -3450,6 +3526,17 @@ def build_signal_text(setup: Setup, state: str = "READY") -> str:
             f"👍 🔥 🚀 📈 📉")
 
 
+def reaction_markup() -> telebot.types.InlineKeyboardMarkup:
+    markup = telebot.types.InlineKeyboardMarkup(row_width=4)
+    markup.add(
+        telebot.types.InlineKeyboardButton("🔥 Сильный", callback_data="qvote:fire"),
+        telebot.types.InlineKeyboardButton("👍 Норм", callback_data="qvote:good"),
+        telebot.types.InlineKeyboardButton("👎 Слабый", callback_data="qvote:weak"),
+        telebot.types.InlineKeyboardButton("❌ Мимо", callback_data="qvote:miss"),
+    )
+    return markup
+
+
 def send_photo_and_text(setup: Setup, state: str = "READY") -> Tuple[Optional[int], Optional[int]]:
     chart_path = None
     try:
@@ -3458,7 +3545,8 @@ def send_photo_and_text(setup: Setup, state: str = "READY") -> Tuple[Optional[in
         with open(chart_path, "rb") as photo:
             sent = bot.send_photo(
                 CHANNEL_ID, photo, caption=caption,
-                parse_mode="HTML", show_caption_above_media=True
+                parse_mode="HTML", show_caption_above_media=True,
+                reply_markup=reaction_markup()
             )
         log.info("TELEGRAM SENT | %s | %s | %s", setup.coin, setup.direction, getattr(setup, "pattern_name", setup.strategy))
         return sent.message_id, sent.message_id
@@ -3950,7 +4038,11 @@ def build_top_mover_reversal_setup(inst_id: str, ticker: dict, candles: Dict[str
         tp2 = entry * (1.0 + TOP_MOVER_TP2_PCT / 100.0)
         tp3 = entry * (1.0 + TOP_MOVER_TP3_PCT / 100.0)
         room_reference = max(c.high for c in c5[-72:])
-        enough_room = room_reference >= tp2
+        # Не требуем, чтобы TP2 уже существовал в истории: после сильного dump
+        # это часто делает хороший LONG невозможным. Проверяем только, что до TP2
+        # нет очевидного ближайшего сопротивления, перекрывающего вход.
+        resistance = max(c.high for c in history[-18:]) if len(history) >= 18 else max(c.high for c in history)
+        enough_room = resistance < tp2 or ((resistance - entry) / max(entry, 1e-12) * 100.0) <= 2.0
     else:
         local_high = max(c.high for c in history[max(0, extreme_i-2):] + [current])
         sl = max(extreme, local_high) + atr5 * 0.12
@@ -3960,7 +4052,8 @@ def build_top_mover_reversal_setup(inst_id: str, ticker: dict, candles: Dict[str
         tp2 = entry * (1.0 - TOP_MOVER_TP2_PCT / 100.0)
         tp3 = entry * (1.0 - TOP_MOVER_TP3_PCT / 100.0)
         room_reference = min(c.low for c in c5[-72:])
-        enough_room = room_reference <= tp2
+        support = min(c.low for c in history[-18:]) if len(history) >= 18 else min(c.low for c in history)
+        enough_room = support > tp2 or ((entry - support) / max(entry, 1e-12) * 100.0) <= 2.0
 
     if risk_pct < TOP_MOVER_MIN_RISK_PCT or risk_pct > TOP_MOVER_MAX_RISK_PCT:
         return None
@@ -4267,7 +4360,6 @@ def main():
     log.info("QUANTUM PATTERN ENGINE V2 STARTED")
     while True:
         try:
-            send_morning_message()
             expire_old_ready()
             update_signal_results()
             send_weekly_report_once()

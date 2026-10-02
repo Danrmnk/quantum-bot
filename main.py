@@ -1,11 +1,9 @@
 import os
-import html
-import re
 import time
 import logging
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict, Tuple
 
@@ -19,28 +17,37 @@ from matplotlib.patches import Rectangle
 
 
 # ============================================================
-# QUANTUM SCALPER V5 PATTERN
+# QUANTUM SCALPER V4
 #
 # OKX PUBLIC MARKET DATA
 #
-# PATTERN-FIRST ARCHITECTURE:
+# V4 ARCHITECTURE:
 #
 # ALL USDT SWAPS
 #       ↓
-# LIQUIDITY / ACTIVE-MARKET FILTER
+# FAST MARKET FILTER
 #       ↓
-# 5M PATTERN ENGINE
+# ACTIVITY / VOLUME / VOLATILITY
 #       ↓
-# PATTERN DETERMINES LONG / SHORT
+# MULTI-TIMEFRAME LEVEL ENGINE
 #       ↓
-# 15M CONFIRMATION ONLY
+# LEVEL CLUSTERS
 #       ↓
-# ENTRY / STRUCTURAL SL <= 1%
+# 1H / 4H STRUCTURE
 #       ↓
-# ROOM-TO-MOVE FILTER
+# 15M / 30M SETUP
 #       ↓
-# 5M CHART + TELEGRAM
-#
+# 5M TRIGGER / PRE-TRIGGER
+#       ↓
+# VOLUME / OI / ATR
+#       ↓
+# QUANTUM SCORE
+#       ↓
+# READY
+#       ↓
+# ACTIVE
+#       ↓
+# TELEGRAM
 #
 # НЕ ТОРГУЕТ.
 # Только анализирует рынок и публикует сигналы.
@@ -77,40 +84,30 @@ TIMEZONE = os.getenv(
 # ============================================================
 
 # Минимальный приблизительный 24H оборот.
-MIN_24H_VOLUME_USD = float(
-    os.getenv(
-        "MIN_24H_VOLUME_USD",
-        "60000000"
-    )
-)
+MIN_24H_VOLUME_USD = float(os.getenv("MIN_24H_VOLUME_USD", "100000000"))
 
-# Ограничение глубокой обработки.
-# 0 = без искусственного лимита: после фильтра $60M+
-# бот анализирует ВСЕ доступные ликвидные USDT-инструменты.
-# Переменные оставлены для совместимости с окружением.
+# Максимум монет для глубокой обработки.
+# В отличие от V3 это НЕ означает:
+# "берём только эти монеты и забываем остальные".
+#
+# Сначала рынок проходит быстрый фильтр,
+# затем наиболее интересные кандидаты анализируются глубже.
 MAX_SYMBOLS = int(
     os.getenv(
         "MAX_SYMBOLS",
-        "0"
+        "80"
     )
 )
 
-# Ограничение кандидатов после быстрого фильтра.
-# 0 = без ограничения.
-MAX_CANDIDATES = int(
-    os.getenv(
-        "MAX_CANDIDATES",
-        "0"
-    )
-)
+# Максимум кандидатов после первого быстрого фильтра.
+MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "30"))
+
+# Широкий первый пул: сначала дешёвый 15M-скрининг,
+# затем только лучшие кандидаты проходят полный MTF-анализ.
+FAST_CANDIDATE_POOL = int(os.getenv("FAST_CANDIDATE_POOL", "80"))
 
 # Если объём ниже этого уровня — монета не рассматривается.
-MIN_CANDIDATE_VOLUME_USD = float(
-    os.getenv(
-        "MIN_CANDIDATE_VOLUME_USD",
-        "60000000"
-    )
-)
+MIN_CANDIDATE_VOLUME_USD = float(os.getenv("MIN_CANDIDATE_VOLUME_USD", "100000000"))
 
 
 # ============================================================
@@ -120,9 +117,50 @@ MIN_CANDIDATE_VOLUME_USD = float(
 MIN_SCORE = int(
     os.getenv(
         "MIN_SCORE",
-        "78"
+        "84"
     )
 )
+
+# Дополнительные фильтры качества сигнала. Они не заменяют score,
+# а отсекают сетапы, где отсутствует ключевое подтверждение.
+MIN_15M_ATR_PCT = float(os.getenv("MIN_15M_ATR_PCT", "0.45"))
+MIN_5M_VOLUME_SURGE = float(os.getenv("MIN_5M_VOLUME_SURGE", "1.20"))
+MIN_ACTIVE_VOLUME_SURGE = float(os.getenv("MIN_ACTIVE_VOLUME_SURGE", "1.50"))
+MIN_RELATIVE_STRENGTH = float(os.getenv("MIN_RELATIVE_STRENGTH", "0.15"))
+MIN_FAST_VOLUME_RATIO = float(os.getenv("MIN_FAST_VOLUME_RATIO", "0.85"))
+MIN_FAST_15M_ATR_PCT = float(os.getenv("MIN_FAST_15M_ATR_PCT", "0.45"))
+MIN_LEVEL_STRENGTH = int(os.getenv("MIN_LEVEL_STRENGTH", "48"))
+MIN_5M_ATR_PCT = float(os.getenv("MIN_5M_ATR_PCT", "0.12"))
+MIN_1H_MOVE_PCT = float(os.getenv("MIN_1H_MOVE_PCT", "0.80"))
+MIN_15M_MOVE_PCT = float(os.getenv("MIN_15M_MOVE_PCT", "0.35"))
+MIN_PATTERN_VOLUME_RATIO = float(os.getenv("MIN_PATTERN_VOLUME_RATIO", "1.25"))
+MIN_5M_RANGE_PCT = float(os.getenv("MIN_5M_RANGE_PCT", "0.70"))
+MIN_15M_RANGE_PCT = float(os.getenv("MIN_15M_RANGE_PCT", "1.20"))
+PATTERN_MAX_ENTRY_DISTANCE_PCT = float(os.getenv("PATTERN_MAX_ENTRY_DISTANCE_PCT", "0.60"))
+PATTERN_MIN_SCORE = int(os.getenv("PATTERN_MIN_SCORE", "78"))
+PATTERN_PIVOT_LEFT = int(os.getenv("PATTERN_PIVOT_LEFT", "3"))
+PATTERN_PIVOT_RIGHT = int(os.getenv("PATTERN_PIVOT_RIGHT", "3"))
+
+# ============================================================
+# TOP MOVERS REVERSAL — отдельная стратегия
+# ============================================================
+TOP_MOVER_ENABLED = os.getenv("TOP_MOVER_ENABLED", "true").lower() == "true"
+TOP_MOVER_GAINER_COUNT = int(os.getenv("TOP_MOVER_GAINER_COUNT", "15"))
+TOP_MOVER_LOSER_COUNT = int(os.getenv("TOP_MOVER_LOSER_COUNT", "10"))
+TOP_MOVER_MIN_GAIN_PCT = float(os.getenv("TOP_MOVER_MIN_GAIN_PCT", "30.0"))
+TOP_MOVER_MIN_LOSS_PCT = float(os.getenv("TOP_MOVER_MIN_LOSS_PCT", "-30.0"))
+TOP_MOVER_MIN_PRIOR_MOVE_PCT = float(os.getenv("TOP_MOVER_MIN_PRIOR_MOVE_PCT", "12.0"))
+TOP_MOVER_MIN_REVERSAL_PCT = float(os.getenv("TOP_MOVER_MIN_REVERSAL_PCT", "0.45"))
+TOP_MOVER_MAX_REVERSAL_PCT = float(os.getenv("TOP_MOVER_MAX_REVERSAL_PCT", "3.5"))
+TOP_MOVER_MIN_VOLUME_RATIO = float(os.getenv("TOP_MOVER_MIN_VOLUME_RATIO", "1.30"))
+TOP_MOVER_MIN_BODY_ATR = float(os.getenv("TOP_MOVER_MIN_BODY_ATR", "0.90"))
+TOP_MOVER_MAX_RISK_PCT = float(os.getenv("TOP_MOVER_MAX_RISK_PCT", "1.0"))
+TOP_MOVER_MIN_RISK_PCT = float(os.getenv("TOP_MOVER_MIN_RISK_PCT", "0.15"))
+TOP_MOVER_TP1_PCT = float(os.getenv("TOP_MOVER_TP1_PCT", "5.0"))
+TOP_MOVER_TP2_PCT = float(os.getenv("TOP_MOVER_TP2_PCT", "7.5"))
+TOP_MOVER_TP3_PCT = float(os.getenv("TOP_MOVER_TP3_PCT", "10.0"))
+TOP_MOVER_LOOKBACK_5M = int(os.getenv("TOP_MOVER_LOOKBACK_5M", "36"))
+
 
 # Для особо сильных сетапов можно отправлять независимо
 # от небольшого недостатка одного из вторичных факторов.
@@ -175,14 +213,14 @@ PRE_TRIGGER_DISTANCE_PCT = float(
 MAX_SIGNALS_PER_HOUR = int(
     os.getenv(
         "MAX_SIGNALS_PER_HOUR",
-        "3"
+        "8"
     )
 )
 
 MAX_SIGNALS_PER_DAY = int(
     os.getenv(
         "MAX_SIGNALS_PER_DAY",
-        "12"
+        "40"
     )
 )
 
@@ -191,10 +229,12 @@ MAX_SIGNALS_PER_DAY = int(
 # SCANNER
 # ============================================================
 
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "20"))
-FAST_PASS_SECONDS = int(os.getenv("FAST_PASS_SECONDS", "60"))
-DEEP_CANDIDATES = int(os.getenv("DEEP_CANDIDATES", "40"))
-FINAL_SIGNAL_CANDIDATES = int(os.getenv("FINAL_SIGNAL_CANDIDATES", "10"))
+SCAN_INTERVAL_SECONDS = int(
+    os.getenv(
+        "SCAN_INTERVAL_SECONDS",
+        "20"
+    )
+)
 
 HTTP_TIMEOUT = int(
     os.getenv(
@@ -283,7 +323,7 @@ log = logging.getLogger(
 
 bot = telebot.TeleBot(
     TELEGRAM_TOKEN,
-    parse_mode="HTML"
+    parse_mode="Markdown"
 )
 
 
@@ -336,53 +376,7 @@ CREATE TABLE IF NOT EXISTS bot_state (
 )
 """)
 
-db.execute("""
-CREATE TABLE IF NOT EXISTS market_stats (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    inst_id TEXT NOT NULL,
-    direction TEXT NOT NULL,
-    strategy TEXT NOT NULL,
-    pattern TEXT NOT NULL DEFAULT '',
-    volume_ratio REAL DEFAULT 0,
-    oi_change_pct REAL,
-    funding_rate REAL,
-    result TEXT DEFAULT '',
-    r_multiple REAL DEFAULT 0,
-    created_at REAL NOT NULL
-)
-""")
-
 db.commit()
-
-
-# ============================================================
-# DATABASE MIGRATIONS
-# ============================================================
-
-def ensure_column(table: str, column: str, definition: str):
-    cols = {
-        row[1]
-        for row in db.execute(f"PRAGMA table_info({table})").fetchall()
-    }
-    if column not in cols:
-        db.execute(
-            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
-        )
-        db.commit()
-
-
-# Result tracking / exactly-once public notification state.
-for _column, _definition in (
-    ("tp1_hit", "INTEGER NOT NULL DEFAULT 0"),
-    ("tp2_hit", "INTEGER NOT NULL DEFAULT 0"),
-    ("tp3_hit", "INTEGER NOT NULL DEFAULT 0"),
-    ("result", "TEXT"),
-    ("result_r", "REAL"),
-    ("closed_at", "REAL"),
-    ("be_hit", "INTEGER NOT NULL DEFAULT 0"),
-    ("result_notified", "INTEGER NOT NULL DEFAULT 0"),
-):
-    ensure_column("signals", _column, _definition)
 
 
 # ============================================================
@@ -483,8 +477,6 @@ ready_setups: Dict[
 signals_hour: List[float] = []
 
 last_scan_ts = 0.0
-last_fast_pass_ts = 0.0
-watchlist = []
 
 scan_count = 0
 
@@ -1124,64 +1116,6 @@ def get_open_interest(
         )
 
     return None
-
-
-# ============================================================
-# DERIVATIVES CONTEXT
-# ============================================================
-
-oi_cache: Dict[str, Tuple[float, float]] = {}
-
-
-def get_open_interest_context(inst_id: str) -> Tuple[Optional[float], Optional[float]]:
-    current = get_open_interest(inst_id)
-    if current is None:
-        return None, None
-    ts = now_ts()
-    previous = oi_cache.get(inst_id)
-    oi_cache[inst_id] = (ts, current)
-    if previous is None:
-        return current, None
-    prev_ts, prev_value = previous
-    if ts - prev_ts < 120 or prev_value <= 0:
-        return current, None
-    return current, (current - prev_value) / prev_value * 100.0
-
-
-def get_funding_rate(inst_id: str) -> Optional[float]:
-    try:
-        payload = okx_get("/api/v5/public/funding-rate", {"instId": inst_id})
-        data = payload.get("data", [])
-        if not data:
-            return None
-        value = data[0].get("fundingRate")
-        return float(value) if value not in (None, "") else None
-    except Exception as exc:
-        log.warning("FUNDING FAILED | %s | %s", inst_id, exc)
-        return None
-
-
-def derivatives_context_score(direction, price_change_pct, oi_change_pct, funding_rate):
-    points = 0
-    parts = []
-    if oi_change_pct is not None:
-        if direction == "LONG" and price_change_pct > 0 and oi_change_pct > 0:
-            points += 5
-            parts.append("цена↑ + OI↑")
-        elif direction == "SHORT" and price_change_pct < 0 and oi_change_pct > 0:
-            points += 5
-            parts.append("цена↓ + OI↑")
-        elif oi_change_pct < 0:
-            points += 1
-            parts.append("OI снижается")
-    if funding_rate is not None:
-        if abs(funding_rate) >= 0.0008:
-            points -= 3
-            parts.append("экстремальный funding")
-        elif abs(funding_rate) <= 0.0002:
-            points += 2
-            parts.append("умеренный funding")
-    return int(clamp(points, -3, 7)), ", ".join(parts)
 
 
 # ============================================================
@@ -2130,9 +2064,21 @@ def momentum_analysis(
         if body >= 0.55:
             score += 5
 
+        # Сильная breakout-свеча должна закрываться у своего экстремума.
+        candle_range = max(current.high - current.low, 1e-12)
+        close_position = (current.close - current.low) / candle_range
+        if close_position >= 0.70:
+            score += 3
+
+        vol_ratio = volume_ratio(candles, 20)
+        if vol_ratio >= MIN_ACTIVE_VOLUME_SURGE:
+            score += 4
+
         valid = (
             e9 > e21
             and current.close > previous_high
+            and body >= 0.55
+            and close_position >= 0.70
         )
 
     else:
@@ -2155,9 +2101,20 @@ def momentum_analysis(
         if body >= 0.55:
             score += 5
 
+        candle_range = max(current.high - current.low, 1e-12)
+        close_position = (current.high - current.close) / candle_range
+        if close_position >= 0.70:
+            score += 3
+
+        vol_ratio = volume_ratio(candles, 20)
+        if vol_ratio >= MIN_ACTIVE_VOLUME_SURGE:
+            score += 4
+
         valid = (
             e9 < e21
             and current.close < previous_low
+            and body >= 0.55
+            and close_position >= 0.70
         )
 
     if not valid:
@@ -2189,83 +2146,63 @@ def pre_trigger_analysis(
     candles_5m: List[Candle],
     direction: str
 ) -> Tuple[int, bool, str]:
-
-    if not candles_5m:
+    if len(candles_5m) < 12:
         return 0, False, ""
 
-    distance = abs(
-        pct(
-            current,
-            level.price
-        )
-    )
-
+    distance = abs(pct(current, level.price))
     if distance > PRE_TRIGGER_DISTANCE_PCT:
         return 0, False, ""
 
-    recent = candles_5m[-8:]
+    recent = candles_5m[-12:]
+    closes = [c.close for c in recent]
+    ranges = [c.high - c.low for c in recent if c.high > c.low]
+    if not ranges:
+        return 0, False, ""
+
+    # PRE должен быть именно подготовкой к пробою, а не просто близостью к уровню.
+    old_range = sum(ranges[:6]) / max(len(ranges[:6]), 1)
+    new_range = sum(ranges[6:]) / max(len(ranges[6:]), 1)
+    compressed = old_range > 0 and new_range / old_range <= 0.82
 
     if direction == "LONG":
-
-        # Цена должна подходить к сопротивлению,
-        # а не удаляться от него.
-        closes = [
-            c.close
-            for c in recent
-        ]
-
-        approaching = (
-            closes[-1]
-            >= closes[0]
+        highs = [c.high for c in recent]
+        lows = [c.low for c in recent]
+        approaching = closes[-1] > closes[0]
+        higher_lows = lows[-1] > lows[-3] > lows[-5]
+        resistance_pressure = highs[-1] >= highs[-4]
+        touches = sum(
+            1 for c in recent
+            if abs(pct(c.high, level.price)) <= 0.20
         )
-
-        if not approaching:
+        if not (approaching and higher_lows and resistance_pressure and compressed and touches >= 2):
             return 0, False, ""
-
-        score = 12
-
-        if distance <= 0.20:
-            score += 5
-
-        if distance <= 0.10:
-            score += 3
-
-        return (
-            score,
-            True,
-            "Цена заранее подошла к сильной зоне "
-            "и формирует подготовку к пробою."
-        )
-
     else:
-
-        closes = [
-            c.close
-            for c in recent
-        ]
-
-        approaching = (
-            closes[-1]
-            <= closes[0]
+        highs = [c.high for c in recent]
+        lows = [c.low for c in recent]
+        approaching = closes[-1] < closes[0]
+        lower_highs = highs[-1] < highs[-3] < highs[-5]
+        support_pressure = lows[-1] <= lows[-4]
+        touches = sum(
+            1 for c in recent
+            if abs(pct(c.low, level.price)) <= 0.20
         )
-
-        if not approaching:
+        if not (approaching and lower_highs and support_pressure and compressed and touches >= 2):
             return 0, False, ""
 
-        score = 12
+    score = 14
+    if distance <= 0.20:
+        score += 4
+    if distance <= 0.10:
+        score += 3
+    score += 4  # compression
+    if touches >= 3:
+        score += 3
 
-        if distance <= 0.20:
-            score += 5
-
-        if distance <= 0.10:
-            score += 3
-
-        return (
-            score,
-            True,
-            "Цена заранее подошла к сильной зоне "
-            "и формирует подготовку к пробою."
-        )
+    return (
+        min(score, 28),
+        True,
+        "Цена сжимается у сильной зоны и делает повторные тесты перед возможным пробоем."
+    )
 
 
 # ============================================================
@@ -2483,6 +2420,96 @@ def activity_score(
 # FAST MARKET RANKING
 # ============================================================
 
+# BTC-контекст загружается один раз за проход сканера,
+# а не отдельным HTTP-запросом для каждой монеты.
+BTC_15M_CONTEXT: List[Candle] = []
+
+def fast_candidate_score(
+    candles_15m: List[Candle],
+    btc_candles: List[Candle]
+) -> Tuple[float, str, float, float, float]:
+    """Дешёвый 15M-скрининг до полного MTF анализа.
+
+    Возвращает: score, direction, ATR%, volume_ratio, relative_strength.
+    Здесь нет требований к конкретному уровню: задача этапа — не пропустить
+    хорошую монету из-за того, что она не попала в первые N по 24H обороту.
+    """
+    if len(candles_15m) < 30:
+        return 0.0, "NEUTRAL", 0.0, 0.0, 0.0
+
+    current = candles_15m[-1].close
+    if current <= 0:
+        return 0.0, "NEUTRAL", 0.0, 0.0, 0.0
+
+    atr15 = atr(candles_15m, 14)
+    atr15_pct = (atr15 / current * 100.0) if atr15 > 0 else 0.0
+    if atr15_pct < MIN_FAST_15M_ATR_PCT or atr15_pct > 3.0:
+        return 0.0, "NEUTRAL", atr15_pct, 0.0, 0.0
+
+    direction = structure_direction(candles_15m)
+    if direction == "NEUTRAL":
+        # Не выбрасываем сразу: сильное сжатие может быть до нового импульса.
+        closes = [c.close for c in candles_15m[-20:]]
+        direction = "LONG" if closes[-1] > closes[0] else "SHORT" if closes[-1] < closes[0] else "NEUTRAL"
+
+    v_ratio = volume_ratio(candles_15m, 20)
+
+    rs = 0.0
+    if len(btc_candles) >= 20:
+        btc_base = btc_candles[-20].open
+        coin_base = candles_15m[-20].open
+        if btc_base > 0 and coin_base > 0:
+            btc_perf = (btc_candles[-1].close - btc_base) / btc_base * 100.0
+            coin_perf = (candles_15m[-1].close - coin_base) / coin_base * 100.0
+            rs = coin_perf - btc_perf
+
+    score = 0.0
+
+    # Ликвидность/волатильность уже учитываются в основном ticker score,
+    # здесь оцениваем именно текущее состояние.
+    if atr15_pct >= 0.60:
+        score += 12
+    elif atr15_pct >= 0.45:
+        score += 8
+
+    if v_ratio >= 1.50:
+        score += 15
+    elif v_ratio >= 1.20:
+        score += 11
+    elif v_ratio >= MIN_FAST_VOLUME_RATIO:
+        score += 5
+
+    if direction == "LONG" and rs >= 0.80:
+        score += 15
+    elif direction == "LONG" and rs >= 0.40:
+        score += 11
+    elif direction == "LONG" and rs >= 0.15:
+        score += 7
+    elif direction == "SHORT" and rs <= -0.80:
+        score += 15
+    elif direction == "SHORT" and rs <= -0.40:
+        score += 11
+    elif direction == "SHORT" and rs <= -0.15:
+        score += 7
+
+    # Сжатие + направленное давление получают приоритет.
+    recent = candles_15m[-12:]
+    old = candles_15m[-24:-12]
+    if recent and old:
+        recent_range = sum(c.high - c.low for c in recent) / len(recent)
+        old_range = sum(c.high - c.low for c in old) / len(old)
+        if old_range > 0 and recent_range / old_range <= 0.78:
+            score += 10
+
+        highs = [c.high for c in recent]
+        lows = [c.low for c in recent]
+        if direction == "LONG" and lows[-1] > lows[0]:
+            score += 6
+        if direction == "SHORT" and highs[-1] < highs[0]:
+            score += 6
+
+    return min(score, 50.0), direction, atr15_pct, v_ratio, rs
+
 def fast_market_score(
     ticker: dict
 ) -> float:
@@ -2570,246 +2597,675 @@ def fast_market_score(
 # ANALYZE SYMBOL
 # ============================================================
 
-# ============================================================
-# PATTERN-FIRST ENGINE
-# ============================================================
+def analyze_symbol(
+    inst_id: str,
+    ticker: dict,
+    candles: Dict[str, List[Candle]]
+) -> Optional[Setup]:
 
-def _confirmed(candles):
-    return [c for c in candles if c.confirmed]
+    current = float(
+        ticker.get(
+            "last",
+            0
+        )
+        or 0
+    )
 
+    if current <= 0:
+        return None
 
-def _near(a, b, tolerance):
-    return abs(a - b) / max(abs(b), 1e-12) <= tolerance
+    c1h = candles.get(
+        "1H",
+        []
+    )
 
+    c4h = candles.get(
+        "4H",
+        []
+    )
 
-def _avg(values):
-    return sum(values) / len(values) if values else 0.0
+    c30 = candles.get(
+        "30m",
+        []
+    )
 
+    c15 = candles.get(
+        "15m",
+        []
+    )
 
-def _pattern_activity(c5):
-    if len(c5) < 30:
-        return 0.0, 0.0
-    atrp = atr_pct(c5[-40:])
-    vr = volume_ratio(c5, 20)
-    return atrp, vr
+    c5 = candles.get(
+        "5m",
+        []
+    )
 
+    confirmed_5m = [
+        c
+        for c in c5
+        if c.confirmed
+    ]
 
-def _room_to_move(c5, direction, entry, sl):
-    risk = abs(entry - sl)
-    if risk <= 0:
-        return False, 0.0
-    look = c5[-60:-2] if len(c5) > 62 else c5[:-2]
-    if not look:
-        return False, 0.0
-    if direction == "LONG":
-        resistance = max(c.high for c in look)
-        room = (resistance - entry) / entry * 100.0
+    if len(c1h) < 60:
+        return None
+
+    if len(c4h) < 50:
+        return None
+
+    if len(c15) < 50:
+        return None
+
+    if len(confirmed_5m) < 35:
+        return None
+
+    # --------------------------------------------------------
+    # 1H + 4H STRUCTURE
+    # --------------------------------------------------------
+
+    structure_1h = structure_direction(
+        c1h
+    )
+
+    structure_4h = structure_direction(
+        c4h
+    )
+
+    if structure_1h == "NEUTRAL":
+        return None
+
+    direction = structure_1h
+
+    # Направление старшего TF — обязательный фильтр.
+    # Сигналы против 4H здесь не компенсируются score.
+    higher_tf_alignment = (
+        structure_4h == direction
+    )
+
+    if not higher_tf_alignment:
+        return None
+
+    score = 0
+
+    score += 15
+
+    if higher_tf_alignment:
+        score += 12
+
     else:
-        support = min(c.low for c in look)
-        room = (entry - support) / entry * 100.0
-    return room >= max(0.55, risk / entry * 100.0 * 1.4), room
+        score -= 5
 
+    score += structure_strength(
+        c1h,
+        direction
+    )
 
-def detect_pattern_first(c5, c15):
-    """5M decides the setup and direction. 15M only confirms context."""
-    if len(c5) < 60 or len(c15) < 40:
+    score += structure_strength(
+        c4h,
+        direction
+    ) // 2
+
+    # --------------------------------------------------------
+    # LEVELS
+    # --------------------------------------------------------
+
+    level_data = {
+        "1D": candles.get(
+            "1D",
+            []
+        ),
+        "4H": c4h,
+        "1H": c1h,
+        "30m": c30,
+        "15m": c15,
+        "5m": confirmed_5m,
+    }
+
+    levels = build_levels(
+        current,
+        direction,
+        level_data
+    )
+
+    clusters = cluster_levels(
+        levels,
+        current
+    )
+
+    level = best_level(
+        clusters,
+        current
+    )
+
+    if level is None:
         return None
 
-    c5 = c5[-100:]
-    c15 = c15[-80:]
-    last = c5[-1]
-    prev = c5[-2]
-    price = last.close
-    atr5 = atr(c5, 14)
-    if atr5 <= 0 or price <= 0:
-        return None
-    atrp, vr = _pattern_activity(c5)
-    # Reject dead markets using the coin's own recent volatility/activity.
-    if atrp < 0.08 or atrp > 3.0:
+    # Слабый уровень не может быть компенсирован другими баллами.
+    if level.strength < MIN_LEVEL_STRENGTH:
         return None
 
-    highs = pivot_highs(c5, 2, 2)
-    lows = pivot_lows(c5, 2, 2)
-    if len(highs) < 3 or len(lows) < 3:
+    # Не берём слишком далёкие уровни.
+    if level.distance_pct > 1.20:
         return None
 
-    candidates = []
+    # Сильный кластер.
+    score += int(
+        clamp(
+            level.strength * 0.35,
+            5,
+            25
+        )
+    )
 
-    # ---------- ASCENDING TRIANGLE ----------
-    hh = highs[-4:]
-    ll = lows[-4:]
-    if len(hh) >= 3 and len(ll) >= 3:
-        resistance = _avg([x[1] for x in hh[-3:]])
-        high_dev = max(abs(x[1] - resistance) / resistance for x in hh[-3:])
-        rising_lows = all(ll[i][1] > ll[i-1][1] * 1.0015 for i in range(1, len(ll)))
-        span = (resistance - min(x[1] for x in ll[-3:])) / price * 100.0
-        touches = sum(_near(x[1], resistance, 0.0045) for x in hh[-4:])
-        near = abs(price - resistance) / price * 100.0 <= 0.45
-        impulse = max(c.high for c in c5[-35:-12]) - min(c.low for c in c5[-35:-12])
-        if high_dev <= 0.006 and rising_lows and touches >= 3 and 0.35 <= span <= 4.5 and impulse / price >= 0.012 and near:
-            candidates.append({"name":"ВОСХОДЯЩИЙ ТРЕУГОЛЬ", "direction":"LONG", "level":resistance, "sl_base":min(x[1] for x in ll[-3:]), "score":82, "reason":f"5M: горизонтальное сопротивление с {touches} касаниями + последовательный рост минимумов."})
+    # Несколько старших TF.
+    higher_tfs = sum(
+        1
+        for tf in level.timeframes
+        if tf in (
+            "1D",
+            "4H",
+            "1H"
+        )
+    )
 
-        support = _avg([x[1] for x in ll[-3:]])
-        low_dev = max(abs(x[1] - support) / support for x in ll[-3:])
-        falling_highs = all(hh[i][1] < hh[i-1][1] * 0.9985 for i in range(1, len(hh)))
-        touches_s = sum(_near(x[1], support, 0.0045) for x in ll[-4:])
-        near_s = abs(price - support) / price * 100.0 <= 0.45
-        if low_dev <= 0.006 and falling_highs and touches_s >= 3 and 0.35 <= span <= 4.5 and near_s and impulse / price >= 0.012:
-            candidates.append({"name":"НИСХОДЯЩИЙ ТРЕУГОЛЬ", "direction":"SHORT", "level":support, "sl_base":max(x[1] for x in hh[-3:]), "score":82, "reason":f"5M: горизонтальная поддержка с {touches_s} касаниями + последовательное снижение максимумов."})
+    if higher_tfs >= 2:
+        score += 8
 
-    # ---------- DOUBLE TOP / BOTTOM ----------
-    if len(highs) >= 3 and len(lows) >= 3:
-        h1i,h1 = highs[-3]; h2i,h2 = highs[-1]
-        valley_candidates=[x for x in lows if h1i < x[0] < h2i]
-        if valley_candidates:
-            valley_i,valley=min(valley_candidates,key=lambda x:x[1])
-            peak_tol=abs(h2-h1)/max(h1,h2)*100
-            depth=(min(h1,h2)-valley)/price*100
-            neckline=valley
-            broke = last.close < neckline and prev.close >= neckline
-            retest = prev.high >= neckline*0.998 and last.close < neckline*0.999
-            near_neck=abs(price-neckline)/price*100<=0.35
-            if peak_tol <= 0.65 and depth >= 0.45 and (broke or retest) and near_neck:
-                candidates.append({"name":"ДВОЙНАЯ ВЕРШИНА", "direction":"SHORT", "level":neckline, "sl_base":max(h1,h2), "score":86 if (broke or retest) else 80, "reason":"5M: две сопоставимые вершины, выраженная впадина и подтверждение пробоем шеи."})
+    if higher_tfs >= 3:
+        score += 5
 
-        l1i,l1 = lows[-3]; l2i,l2 = lows[-1]
-        peak_candidates=[x for x in highs if l1i < x[0] < l2i]
-        if peak_candidates:
-            peak_i,peak=max(peak_candidates,key=lambda x:x[1])
-            low_tol=abs(l2-l1)/max(l1,l2)*100
-            depth=(peak-max(l1,l2))/price*100
-            broke = last.close > peak and prev.close <= peak
-            retest = prev.low <= peak*1.002 and last.close > peak*1.001
-            near_peak=abs(price-peak)/price*100<=0.35
-            if low_tol <= 0.65 and depth >= 0.45 and (broke or retest) and near_peak:
-                candidates.append({"name":"ДВОЙНОЕ ДНО", "direction":"LONG", "level":peak, "sl_base":min(l1,l2), "score":86 if (broke or retest) else 80, "reason":"5M: два сопоставимых минимума, выраженная вершина и подтверждение пробоем шеи."})
+    # --------------------------------------------------------
+    # ATR
+    # --------------------------------------------------------
 
-    # ---------- BREAKOUT + RETEST ----------
-    look = c5[-30:-2]
-    if len(look) >= 20:
-        resistance=max(c.high for c in look)
-        support=min(c.low for c in look)
-        if prev.close > resistance and last.low <= resistance*1.0025 and last.close > resistance and vr >= 1.15:
-            candidates.append({"name":"ПРОБОЙ + РЕТЕСТ", "direction":"LONG", "level":resistance, "sl_base":min(c.low for c in c5[-8:]), "score":90, "reason":"5M: закрытие выше локального сопротивления + ретест уровня с удержанием."})
-        if prev.close < support and last.high >= support*0.9975 and last.close < support and vr >= 1.15:
-            candidates.append({"name":"ПРОБОЙ + РЕТЕСТ", "direction":"SHORT", "level":support, "sl_base":max(c.high for c in c5[-8:]), "score":90, "reason":"5M: закрытие ниже локальной поддержки + ретест уровня с удержанием."})
+    atr_value = atr(
+        confirmed_5m,
+        14
+    )
 
-    # ---------- FLAGS ----------
-    if len(c5) >= 45:
-        impulse=c5[-45:-25]
-        flag=c5[-25:]
-        imp_move=(impulse[-1].close-impulse[0].close)/impulse[0].close*100
-        flag_range=(max(c.high for c in flag)-min(c.low for c in flag))/price*100
-        flag_move=(flag[-1].close-flag[0].close)/flag[0].close*100
-        if imp_move >= 2.0 and flag_range <= max(1.8, abs(imp_move)*0.65) and flag_move <= 0.4 and last.close >= max(c.high for c in flag[:-2])*0.995:
-            level=max(c.high for c in flag[:-2])
-            candidates.append({"name":"БЫЧИЙ ФЛАГ", "direction":"LONG", "level":level, "sl_base":min(c.low for c in flag), "score":80, "reason":"5M: сильный импульс вверх + компактная коррекция с выходом к верхней границе."})
-        if imp_move <= -2.0 and flag_range <= max(1.8, abs(imp_move)*0.65) and flag_move >= -0.4 and last.close <= min(c.low for c in flag[:-2])*1.005:
-            level=min(c.low for c in flag[:-2])
-            candidates.append({"name":"МЕДВЕЖИЙ ФЛАГ", "direction":"SHORT", "level":level, "sl_base":max(c.high for c in flag), "score":80, "reason":"5M: сильный импульс вниз + компактная коррекция с выходом к нижней границе."})
-
-    if not candidates:
+    if atr_value <= 0:
         return None
 
-    # 15M is confirmation only; it never creates the direction.
-    c15_last=c15[-1]
-    c15_ema=ema([c.close for c in c15[-40:]],20)[-1]
-    def confirm(d):
-        if d=="LONG":
-            return c15_last.close >= c15_ema*0.997
-        return c15_last.close <= c15_ema*1.003
+    volatility_pct = (
+        atr_value
+        / current
+        * 100.0
+    )
 
-    confirmed=[x for x in candidates if confirm(x["direction"])]
-    if not confirmed:
-        return None
-    confirmed.sort(key=lambda x:x["score"], reverse=True)
-    return confirmed[0]
-
-
-def analyze_symbol(inst_id: str, ticker: dict, candles: Dict[str, List[Candle]]) -> Optional[Setup]:
-    current=float(ticker.get("last",0) or 0)
-    if current<=0:
-        return None
-    c5=_confirmed(candles.get("5m",[]))
-    c15=_confirmed(candles.get("15m",[]))
-    if len(c5)<70 or len(c15)<40:
+    if volatility_pct < 0.025:
         return None
 
-    pat=detect_pattern_first(c5,c15)
-    if not pat:
+    if volatility_pct > 3.0:
         return None
-    direction=pat["direction"]
 
-    volume_24h=float(ticker.get("vol24h_usd",0) or 0)
+    # 15M volatility regime: не торгуем слишком мёртвые инструменты.
+    atr15 = atr(c15, 14)
+    atr15_pct = (atr15 / current * 100.0) if atr15 > 0 else 0.0
+    if atr15_pct < MIN_15M_ATR_PCT:
+        return None
+
+    # 15M структура не должна противоречить направлению 1H.
+    structure_15m = structure_direction(c15)
+    if structure_15m not in ("NEUTRAL", direction):
+        return None
+
+    # Относительная сила к BTC. Это фильтр направления, а не самостоятельный сигнал.
+    btc_candles = BTC_15M_CONTEXT
+    if len(btc_candles) >= 20 and len(c15) >= 20:
+        btc_base = btc_candles[-20].open
+        coin_base = c15[-20].open
+        btc_perf = ((btc_candles[-1].close - btc_base) / btc_base * 100.0) if btc_base > 0 else 0.0
+        coin_perf = ((c15[-1].close - coin_base) / coin_base * 100.0) if coin_base > 0 else 0.0
+        relative_strength = coin_perf - btc_perf
+        if direction == "LONG" and relative_strength < MIN_RELATIVE_STRENGTH:
+            return None
+        if direction == "SHORT" and relative_strength > -MIN_RELATIVE_STRENGTH:
+            return None
+    else:
+        relative_strength = 0.0
+
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
+
+    activity_points, v_ratio = (
+        activity_score(
+            confirmed_5m,
+            ticker
+        )
+    )
+
+    score += activity_points
+
+    # Для любого сетапа нужен хотя бы умеренный всплеск объёма.
+    if v_ratio < MIN_5M_VOLUME_SURGE:
+        return None
+
+    # Для уже произошедшего breakout нужен более сильный объём.
+    # READY-сетапы допускают меньший объём, потому что импульс ещё не обязан начаться.
+
+    # --------------------------------------------------------
+    # LEVEL REACTION
+    # --------------------------------------------------------
+
+    reaction_points, reaction_ok = (
+        level_reaction(
+            confirmed_5m,
+            level.price,
+            direction
+        )
+    )
+
+    if reaction_ok:
+        score += reaction_points
+
+    # --------------------------------------------------------
+    # STRATEGIES
+    # --------------------------------------------------------
+
+    current_candle = confirmed_5m[-1]
+    previous = confirmed_5m[-2]
+
+    strategies = []
+
+    # 1. Actual breakout.
+    breakout_points, breakout_ok, breakout_reason = (
+        breakout_analysis(
+            current,
+            level,
+            previous,
+            current_candle,
+            direction
+        )
+    )
+
+    if breakout_ok:
+
+        strategies.append(
+            (
+                "Horizontal Level Breakout",
+                breakout_points,
+                breakout_reason,
+                "ACTIVE"
+            )
+        )
+
+    # 2. Compression.
+    compression_points, compression_ok, compression_reason = (
+        compression_analysis(
+            c15,
+            direction
+        )
+    )
+
+    if compression_ok:
+
+        strategies.append(
+            (
+                "Trendline Compression Breakout",
+                compression_points,
+                compression_reason,
+                "READY"
+            )
+        )
+
+    # 3. Momentum.
+    momentum_points, momentum_ok, momentum_reason = (
+        momentum_analysis(
+            confirmed_5m,
+            direction
+        )
+    )
+
+    if momentum_ok:
+
+        strategies.append(
+            (
+                "Momentum Breakout",
+                momentum_points,
+                momentum_reason,
+                "ACTIVE"
+            )
+        )
+
+    # 4. Pre-trigger.
+    pre_points, pre_ok, pre_reason = (
+        pre_trigger_analysis(
+            current,
+            level,
+            confirmed_5m,
+            direction
+        )
+    )
+
+    if pre_ok:
+
+        strategies.append(
+            (
+                "Pre-Breakout Level Setup",
+                pre_points,
+                pre_reason,
+                "READY"
+            )
+        )
+
+    if not strategies:
+        return None
+
+    strategies.sort(
+        key=lambda item: item[1],
+        reverse=True
+    )
+
+    strategy, strategy_points, reason, setup_state = (
+        strategies[0]
+    )
+
+    score += strategy_points
+
+    if setup_state == "ACTIVE" and v_ratio < MIN_ACTIVE_VOLUME_SURGE:
+        return None
+
+    # Не догоняем уже чрезмерно растянутую breakout-свечу.
+    current_atr = atr(confirmed_5m, 14)
+    if setup_state == "ACTIVE" and current_atr > 0:
+        candle_range = current_candle.high - current_candle.low
+        if candle_range > current_atr * 2.0:
+            return None
+
+    # --------------------------------------------------------
+    # MULTI-STRATEGY BONUS
+    # --------------------------------------------------------
+
+    if len(strategies) >= 2:
+        score += 5
+
+    if len(strategies) >= 3:
+        score += 5
+
+    # --------------------------------------------------------
+    # LIQUIDITY
+    # --------------------------------------------------------
+
+    volume_24h = float(
+        ticker.get(
+            "vol24h_usd",
+            0
+        )
+        or 0
+    )
+
     if volume_24h < MIN_CANDIDATE_VOLUME_USD:
         return None
-    atr_value=atr(c5,14)
-    volatility_pct=atr_value/current*100.0 if atr_value>0 else 0
-    vr=volume_ratio(c5,20)
-    if volatility_pct<0.08 or volatility_pct>3.0:
+
+    if volume_24h >= 1_000_000_000:
+
+        liquidity = "HIGH"
+        score += 6
+
+    elif volume_24h >= 500_000_000:
+
+        liquidity = "HIGH"
+        score += 5
+
+    elif volume_24h >= 250_000_000:
+
+        liquidity = "GOOD"
+        score += 4
+
+    elif volume_24h >= 100_000_000:
+
+        liquidity = "GOOD"
+        score += 3
+
+    else:
+
+        liquidity = "MEDIUM"
+        score += 1
+
+    # --------------------------------------------------------
+    # OI
+    # --------------------------------------------------------
+
+    oi_value = get_open_interest(
+        inst_id
+    )
+
+    if oi_value is not None:
+
+        oi_status = "AVAILABLE"
+        score += 3
+
+    else:
+
+        oi_status = "N/A"
+
+    # --------------------------------------------------------
+    # DISTANCE / CHASE
+    # --------------------------------------------------------
+
+    if level.distance_pct > 0.75:
         return None
 
-    # Structural stop from the pattern, not an arbitrary 15M extreme.
-    buffer=max(atr_value*0.25, current*0.0008)
-    if direction=="LONG":
-        sl=pat["sl_base"]-buffer
-        entry_low=min(current,pat["level"])*0.999
-        entry_high=max(current,pat["level"])*1.001
-        if sl>=current:
+    # После пробоя не берём сильно убежавшую цену.
+    if direction == "LONG":
+
+        if current > (
+            level.price
+            * (
+                1
+                + MAX_CHASE_PCT / 100.0
+            )
+        ):
+
             return None
+
     else:
-        sl=pat["sl_base"]+buffer
-        entry_low=min(current,pat["level"])*0.999
-        entry_high=max(current,pat["level"])*1.001
-        if sl<=current:
+
+        if current < (
+            level.price
+            * (
+                1
+                - MAX_CHASE_PCT / 100.0
+            )
+        ):
+
             return None
 
-    risk_pct=abs(current-sl)/current*100.0
-    # Hard requirement: account risk geometry <=1% price distance.
-    if risk_pct>1.0:
-        return None
-    if risk_pct<0.10:
-        return None
+    # --------------------------------------------------------
+    # ENTRY ZONE
+    # --------------------------------------------------------
 
-    room_ok,room_pct=_room_to_move(c5,direction,current,sl)
-    if not room_ok:
-        return None
+    zone_pct = clamp(
+        volatility_pct * 0.40,
+        0.08,
+        0.30
+    )
 
-    # Do not chase: READY is preferred while price is close to the pattern level.
-    distance=abs(current-pat["level"])/current*100.0
-    if distance>0.65:
-        return None
-    state="ACTIVE" if pat["name"]=="ПРОБОЙ + РЕТЕСТ" else "READY"
+    if direction == "LONG":
 
-    # Targets are R-multiples and therefore consistent with the <=1% stop geometry.
-    risk=abs(current-sl)
-    if direction=="LONG":
-        tp1=current+risk*1.0; tp2=current+risk*1.8; tp3=current+risk*2.7
+        entry_low = (
+            level.price
+            * (
+                1
+                - zone_pct / 100.0
+            )
+        )
+
+        entry_high = (
+            level.price
+            * (
+                1
+                + zone_pct / 100.0
+            )
+        )
+
     else:
-        tp1=current-risk*1.0; tp2=current-risk*1.8; tp3=current-risk*2.7
 
-    if direction=="LONG":
-        liq="HIGH" if volume_24h>=500_000_000 else "GOOD" if volume_24h>=100_000_000 else "MEDIUM"
+        entry_low = (
+            level.price
+            * (
+                1
+                - zone_pct / 100.0
+            )
+        )
+
+        entry_high = (
+            level.price
+            * (
+                1
+                + zone_pct / 100.0
+            )
+        )
+
+    # --------------------------------------------------------
+    # STRUCTURAL STOP
+    # --------------------------------------------------------
+
+    recent_15 = c15[-24:]
+
+    if len(recent_15) < 12:
+        return None
+
+    if direction == "LONG":
+
+        structural_low = min(
+            c.low
+            for c in recent_15
+        )
+
+        # Для long SL ниже структуры.
+        sl = (
+            structural_low
+            - atr_value * 0.30
+        )
+
+        if sl >= current:
+            return None
+
+        risk = (
+            current
+            - sl
+        )
+
     else:
-        liq="HIGH" if volume_24h>=500_000_000 else "GOOD" if volume_24h>=100_000_000 else "MEDIUM"
 
-    oi_value=get_open_interest(inst_id)
-    oi_status="AVAILABLE" if oi_value is not None else "N/A"
-    score=int(clamp(pat["score"] + (8 if vr>=1.5 else 4 if vr>=1.2 else 0) + (5 if volatility_pct>=0.12 else 0) + (5 if room_pct>=1.0 else 0),0,100))
+        structural_high = max(
+            c.high
+            for c in recent_15
+        )
+
+        sl = (
+            structural_high
+            + atr_value * 0.30
+        )
+
+        if sl <= current:
+            return None
+
+        risk = (
+            sl
+            - current
+        )
+
+    if risk <= 0:
+        return None
+
+    risk_pct = (
+        risk
+        / current
+        * 100.0
+    )
+
+    if risk_pct < 0.15:
+        risk_pct = 0.15
+
+    if risk_pct > 2.20:
+        return None
+
+    # --------------------------------------------------------
+    # TAKE PROFITS
+    # --------------------------------------------------------
+
+    # TP строим от текущего риска.
+    # Это сохраняет знакомую нам лестницу.
+    if direction == "LONG":
+
+        tp1 = current + risk * 1.0
+        tp2 = current + risk * 2.0
+        tp3 = current + risk * 3.0
+
+    else:
+
+        tp1 = current - risk * 1.0
+        tp2 = current - risk * 2.0
+        tp3 = current - risk * 3.0
+
+    # --------------------------------------------------------
+    # FINAL SCORE
+    # --------------------------------------------------------
+
+    score = int(
+        clamp(
+            score,
+            0,
+            100
+        )
+    )
+
+    if score < MIN_SCORE:
+        return None
+
+    # --------------------------------------------------------
+    # REASON
+    # --------------------------------------------------------
+
+    tf_text = ", ".join(
+        level.timeframes
+    )
+
+    cluster_reason = (
+        f"Ключевой кластер уровня "
+        f"подтверждён таймфреймами: {tf_text}. "
+        f"Сила зоны: {level.strength}/100."
+    )
+
+    full_reason = (
+        f"{reason} "
+        f"{cluster_reason}"
+    )
 
     return Setup(
-        inst_id=inst_id, coin=get_coin(inst_id), direction=direction,
-        strategy=pat["name"], level=pat["level"], level_strength=90,
-        level_tf="5M", current_price=current, entry_low=entry_low,
-        entry_high=entry_high, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
-        score=score, liquidity=liq, volume_grade=grade_volume(vr),
+        inst_id=inst_id,
+        coin=get_coin(inst_id),
+        direction=direction,
+        strategy=strategy,
+        level=level.price,
+        level_strength=level.strength,
+        level_tf=tf_text,
+        current_price=current,
+        entry_low=entry_low,
+        entry_high=entry_high,
+        sl=sl,
+        tp1=tp1,
+        tp2=tp2,
+        tp3=tp3,
+        score=score,
+        liquidity=liquidity,
+        volume_grade=grade_volume(
+            v_ratio
+        ),
         oi_status=oi_status,
-        reason=pat["reason"]+f" 15M подтверждение: структура не против сигнала. ATR={volatility_pct:.2f}%, room={room_pct:.2f}%, volume={vr:.2f}x.",
-        volume_24h=volume_24h, breakout_volume_ratio=vr,
-        atr_pct=volatility_pct, setup_state=state, candles_5m=c5,
+        reason=full_reason,
+        volume_24h=volume_24h,
+        breakout_volume_ratio=v_ratio,
+        atr_pct=volatility_pct,
+        setup_state=setup_state,
+        candles_5m=confirmed_5m[-80:]
     )
 
 
+# ============================================================
+# SIGNAL CONTROL
+# ============================================================
 
 def can_send_new_signal(
     inst_id: str
@@ -2886,404 +3342,135 @@ def can_send_new_signal(
 # CHART
 # ============================================================
 
-def make_chart(
-    setup: Setup
-) -> str:
+def make_chart(setup: Setup) -> str:
+    """Clean 5M candlestick chart with only the detected pattern and trade levels."""
+    candles = setup.candles_5m[-72:]
+    if len(candles) < 30:
+        raise RuntimeError("Not enough 5M candles for chart.")
 
-    candles = setup.candles_5m[
-        -70:
-    ]
+    path = f"/tmp/quantum_{setup.coin}_{int(time.time()*1000)}.png"
+    fig, ax = plt.subplots(figsize=(14, 8), dpi=160)
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
 
-    if len(candles) < 10:
-        raise RuntimeError(
-            "Not enough candles."
-        )
+    width = 0.58
+    for i, c in enumerate(candles):
+        up = c.close >= c.open
+        color = "#16a34a" if up else "#dc2626"
+        ax.vlines(i, c.low, c.high, color=color, linewidth=1.15, zorder=2)
+        body_low = min(c.open, c.close)
+        body_h = max(abs(c.close-c.open), c.close*0.000015)
+        ax.add_patch(Rectangle((i-width/2, body_low), width, body_h,
+                               facecolor=color, edgecolor=color, linewidth=0.6, zorder=3))
 
-    safe_coin = (
-        setup.coin
-        .replace(
-            "/",
-            "_"
-        )
-        .replace(
-            "\\",
-            "_"
-        )
-    )
+    # Pattern geometry.
+    lines = getattr(setup, "pattern_lines", [])
+    for line in lines:
+        x1, y1, x2, y2, kind = line
+        style = "-" if kind == "trend" else "--"
+        color = "#2563eb" if kind == "trend" else "#111827"
+        ax.plot([x1, x2], [y1, y2], color=color, linewidth=2.4, linestyle=style, zorder=4)
 
-    path = (
-        f"/tmp/quantum_"
-        f"{safe_coin}_"
-        f"{int(time.time() * 1000)}.png"
-    )
+    for px, py, label in getattr(setup, "pattern_points", []):
+        ax.scatter([px], [py], s=34, color="#111827", zorder=5)
+        ax.annotate(label, (px, py), xytext=(0, 9), textcoords="offset points",
+                    ha="center", fontsize=9, fontweight="bold", color="#111827")
 
-    fig, ax = plt.subplots(
-        figsize=(
-            12,
-            7
-        ),
-        dpi=140
-    )
+    entry = (setup.entry_low + setup.entry_high) / 2
+    ax.axhline(entry, color="#2563eb", linewidth=2.3, zorder=4)
+    ax.axhline(setup.sl, color="#dc2626", linewidth=2.0, linestyle="--", zorder=4)
+    ax.axhline(setup.tp1, color="#16a34a", linewidth=1.2, linestyle=":", zorder=4)
+    ax.axhline(setup.tp2, color="#16a34a", linewidth=1.5, linestyle=":", zorder=4)
+    ax.axhline(setup.tp3, color="#16a34a", linewidth=1.8, linestyle="--", zorder=4)
+    ax.text(len(candles)-1, entry, f"  ВХОД {fmt_price(entry)}", va="bottom",
+            ha="right", color="#1d4ed8", fontsize=11, fontweight="bold")
+    ax.text(len(candles)-1, setup.sl, f"  СТОП {fmt_price(setup.sl)}", va="bottom",
+            ha="right", color="#b91c1c", fontsize=11, fontweight="bold")
+    ax.text(len(candles)-1, setup.tp1, f"  TP1 {fmt_price(setup.tp1)}", va="bottom", ha="right", color="#15803d", fontsize=9, fontweight="bold")
+    ax.text(len(candles)-1, setup.tp2, f"  TP2 {fmt_price(setup.tp2)}", va="bottom", ha="right", color="#15803d", fontsize=9, fontweight="bold")
+    ax.text(len(candles)-1, setup.tp3, f"  TP3 {fmt_price(setup.tp3)}", va="bottom", ha="right", color="#15803d", fontsize=10, fontweight="bold")
 
-    fig.patch.set_facecolor(
-        "#0b1020"
-    )
+    ax.set_title(f"{setup.coin}USDT · {getattr(setup, 'pattern_name', setup.strategy)} · {setup.direction} · 5M",
+                 fontsize=19, fontweight="bold", color="#111827", pad=14)
+    ax.text(0.01, 0.98, f"Паттерн: {getattr(setup, 'pattern_name', setup.strategy)}",
+            transform=ax.transAxes, va="top", fontsize=12, fontweight="bold", color="#111827")
 
-    ax.set_facecolor(
-        "#0b1020"
-    )
-
-    width = 0.65
-
-    for i, candle in enumerate(
-        candles
-    ):
-
-        color = (
-            "#16c784"
-            if candle.close >= candle.open
-            else "#ea3943"
-        )
-
-        ax.plot(
-            [i, i],
-            [
-                candle.low,
-                candle.high
-            ],
-            color=color,
-            linewidth=1.0
-        )
-
-        body_low = min(
-            candle.open,
-            candle.close
-        )
-
-        body_height = abs(
-            candle.close
-            - candle.open
-        )
-
-        if body_height == 0:
-
-            body_height = (
-                candle.close
-                * 0.00001
-            )
-
-        rect = Rectangle(
-            (
-                i - width / 2,
-                body_low
-            ),
-            width,
-            body_height,
-            facecolor=color,
-            edgecolor=color,
-            linewidth=0.5
-        )
-
-        ax.add_patch(
-            rect
-        )
-
-    # PATTERN LEVEL
-    ax.axhline(
-        setup.level,
-        color="#f5c542",
-        linewidth=2.2,
-        linestyle="--",
-        label="PATTERN LEVEL"
-    )
-
-    # Draw the actual 5M swing structure so the signal can be visually checked.
-    ph = pivot_highs(candles, 2, 2)[-4:]
-    pl = pivot_lows(candles, 2, 2)[-4:]
-    if ph:
-        xs=[i for i,_ in ph]; ys=[v for _,v in ph]; ax.plot(xs,ys,linestyle="--",linewidth=1.4,label="SWING HIGHS")
-    if pl:
-        xs=[i for i,_ in pl]; ys=[v for _,v in pl]; ax.plot(xs,ys,linestyle="--",linewidth=1.4,label="SWING LOWS")
-
-    # ENTRY
-    ax.axhspan(
-        setup.entry_low,
-        setup.entry_high,
-        color="#00aaff",
-        alpha=0.10
-    )
-
-    # SL
-    ax.axhline(
-        setup.sl,
-        color="#ff3b30",
-        linewidth=1.7,
-        linestyle="-.",
-        label="SL"
-    )
-
-    # TP
-    for tp in (
-        setup.tp1,
-        setup.tp2,
-        setup.tp3
-    ):
-
-        ax.axhline(
-            tp,
-            color="#ffd166",
-            linewidth=1.2
-        )
-
-    last_x = len(candles) - 1
-
-    ax.text(
-        last_x,
-        setup.level,
-        " LEVEL",
-        color="#f5c542",
-        va="bottom",
-        fontsize=10,
-        fontweight="bold"
-    )
-
-    ax.text(
-        last_x,
-        setup.sl,
-        " SL",
-        color="#ff3b30",
-        va="bottom",
-        fontsize=10,
-        fontweight="bold"
-    )
-
-    ax.text(
-        last_x,
-        setup.tp1,
-        " TP1",
-        color="#ffd166",
-        va="bottom",
-        fontsize=9
-    )
-
-    ax.text(
-        last_x,
-        setup.tp2,
-        " TP2",
-        color="#ffd166",
-        va="bottom",
-        fontsize=9
-    )
-
-    ax.text(
-        last_x,
-        setup.tp3,
-        " TP3",
-        color="#ffd166",
-        va="bottom",
-        fontsize=9
-    )
-
-    ax.set_title(
-        (
-            f"{setup.coin}USDT | "
-            f"{setup.direction} | "
-            f"{setup.strategy}\n"
-            f"5M trigger"
-        ),
-        color="white",
-        fontsize=15,
-        fontweight="bold",
-        pad=15
-    )
-
-    ax.grid(
-        alpha=0.12,
-        color="white"
-    )
-
-    ax.tick_params(
-        colors="#9ca3af"
-    )
-
+    ax.grid(True, alpha=0.16, color="#94a3b8")
+    ax.tick_params(colors="#475569", labelsize=9)
     for spine in ax.spines.values():
-        spine.set_color(
-            "#29334d"
-        )
-
-    ax.legend(
-        facecolor="#111827",
-        labelcolor="white",
-        loc="upper left"
-    )
-
+        spine.set_color("#cbd5e1")
+    ax.set_xlim(-1, len(candles))
     plt.tight_layout()
-
-    fig.savefig(
-        path,
-        facecolor=fig.get_facecolor(),
-        bbox_inches="tight"
-    )
-
-    plt.close(
-        fig
-    )
-
+    fig.savefig(path, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
     return path
 
-
-# ============================================================
-# TELEGRAM HTML SAFETY
-# ============================================================
-
-def telegram_html(message: str) -> str:
-    """
-    Convert the bot's legacy Markdown-like markup to Telegram HTML.
-    Dynamic market values are escaped so coin/strategy names cannot
-    break Telegram entity parsing.
-    """
-    if not message:
-        return ""
-
-    # Escape first, then restore only our intentional formatting tokens.
-    s = html.escape(str(message), quote=False)
-
-    # Bold
-    s = re.sub(r"\*([^*\n]+)\*", r"<b>\1</b>", s)
-
-    # Inline code
-    s = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", s)
-
-    # Telegram/HTML accepts ordinary emoji and text.
-    return s
 
 # ============================================================
 # TELEGRAM SIGNAL
 # ============================================================
 
 def build_signal_text(setup: Setup, state: str = "READY") -> str:
-    risk=abs(setup.current_price-setup.sl)/setup.current_price*100.0
-    vol_m=setup.volume_24h/1_000_000
-    state_line="🟡 Ждём вход в рабочую зону" if state=="READY" else "🟢 Пробой и ретест подтверждены"
-    return (
-        f"🔥 *{setup.coin}USDT — {setup.direction}*\n"
-        f"📐 *Паттерн:* `{setup.strategy}` · *5M*\n"
-        f"{state_line}\n\n"
-        f"💰 Вход: `{fmt_price(setup.entry_low)}` – `{fmt_price(setup.entry_high)}`\n"
-        f"🛑 SL: `{fmt_price(setup.sl)}` · риск до SL: `−{risk:.2f}%`\n"
-        f"🎯 TP1: `{fmt_price(setup.tp1)}` · TP2: `{fmt_price(setup.tp2)}` · TP3: `{fmt_price(setup.tp3)}`\n\n"
-        f"🧠 *Почему:* {setup.reason}\n\n"
-        f"💧 Оборот 24H: `${vol_m:,.1f}M` · Volume: `{setup.breakout_volume_ratio:.2f}x` · ATR: `{setup.atr_pct:.2f}%`\n"
-        f"⚡ OI: `{setup.oi_status}`\n\n"
-        f"⚠️ *Риск на одну сделку — НЕ БОЛЕЕ 1% от депозита.*\n"
-        f"⚠️ Не догоняйте цену и не увеличивайте риск.\n"
-        f"👍 🔥 🚀 📈 📉"
-    )
+    entry=(setup.entry_low+setup.entry_high)/2.0
+    if setup.strategy=="TOP MOVERS REVERSAL":
+        headline="🔺 TOP LOSER → LONG" if setup.direction=="LONG" else "🔻 TOP GAINER → SHORT"
+        action=("После сильного падения сформирован первый подтверждённый отскок вверх." if setup.direction=="LONG" else "После сильного роста сформирован первый подтверждённый разворот вниз.")
+        rr2=abs(setup.tp2-entry)/max(abs(entry-setup.sl),1e-12)
+        return (f"<b>{headline}</b>\n<b>{setup.coin}USDT</b> · 5M\n\n"
+                f"🧭 <b>Сетап:</b> <code>{setup.pattern_name}</code>\n"
+                f"📈 <b>Движение 24H:</b> <code>{setup.change24:+.1f}%</code>\n"
+                f"⚡ <b>Сейчас:</b> первый подтверждённый импульс разворота · объём <code>x{setup.breakout_volume_ratio:.2f}</code>\n\n"
+                f"📝 <b>Что произошло:</b> {action}\n"
+                f"🧠 <b>Логика:</b> {setup.reason}\n\n"
+                f"🎯 <b>Вход:</b> <code>{fmt_price(entry)}</code>\n"
+                f"🛑 <b>Стоп:</b> <code>{fmt_price(setup.sl)}</code> · риск <code>{abs(entry-setup.sl)/entry*100:.2f}%</code>\n"
+                f"🎯 <b>TP1:</b> <code>{fmt_price(setup.tp1)}</code> · {TOP_MOVER_TP1_PCT:.1f}%\n"
+                f"🎯 <b>TP2:</b> <code>{fmt_price(setup.tp2)}</code> · {TOP_MOVER_TP2_PCT:.1f}%\n"
+                f"🎯 <b>TP3:</b> <code>{fmt_price(setup.tp3)}</code> · {TOP_MOVER_TP3_PCT:.1f}%\n"
+                f"📊 <b>RR до TP2:</b> <code>1:{rr2:.1f}</code>\n"
+                f"💧 <b>Оборот 24H:</b> <code>${setup.volume_24h/1_000_000:,.1f}M</code> · Volume <code>x{setup.breakout_volume_ratio:.2f}</code>\n\n"
+                f"⚠️ <b>РИСКИ</b>\n"
+                f"• Риск на одну сделку — <b>не более 1% депозита</b>.\n"
+                f"• Стоп обязателен. Не догоняйте цену.\n"
+                f"• Если цена уже ушла далеко от зоны входа — пропускайте вход.\n"
+                f"• Разворотная стратегия может давать ложные пробои и резкие выбросы цены.\n\n"
+                f"👍 🔥 🚀 📈 📉")
 
+    risk_pct=abs(entry-setup.sl)/entry*100.0 if entry>0 else 0.0
+    pattern=getattr(setup,"pattern_name",setup.strategy)
+    return (f"🔥 <b>{setup.coin}USDT — {setup.direction}</b>\n\n"
+            f"📐 <b>Паттерн:</b> <code>{pattern}</code>\n\n"
+            f"💰 <b>Точка входа:</b> <code>{fmt_price(entry)}</code>\n"
+            f"🛑 <b>Стоп-лосс:</b> <code>{fmt_price(setup.sl)}</code>\n"
+            f"📊 <b>Таймфрейм:</b> <code>5M</code>\n\n"
+            f"⚠️ <b>ВНИМАТЕЛЬНО ПРОВЕРЯЙТЕ СДЕЛКУ ПЕРЕД ВХОДОМ.</b>\n"
+            f"📌 Соблюдайте правила управления риском.\n"
+            f"🛑 <b>Риск на одну сделку — НЕ БОЛЕЕ 1% от депозита.</b>\n"
+            f"⚠️ Не увеличивайте риск и не догоняйте цену.\n\n"
+            f"👍 🔥 🚀 📈 📉")
 
-# ============================================================
-# TELEGRAM REACTION
-# ============================================================
-
-def add_signal_reactions(message_id: Optional[int]):
-    if not message_id:
-        return
-    try:
-        reaction_type = getattr(telebot.types, "ReactionTypeEmoji", None)
-        if reaction_type is None:
-            return
-        bot.set_message_reaction(
-            CHANNEL_ID,
-            message_id,
-            reaction=[reaction_type("🔥")]
-        )
-    except Exception as exc:
-        log.debug("REACTION NOT SET | %s", exc)
-
-
-# ============================================================
-# SEND PHOTO + TEXT
-# ============================================================
 
 def send_photo_and_text(setup: Setup, state: str = "READY") -> Tuple[Optional[int], Optional[int]]:
-    chart_path=None
+    chart_path = None
     try:
-        chart_path=make_chart(setup)
-        text=build_signal_text(setup,state)
-        with open(chart_path,"rb") as photo:
-            sent=bot.send_photo(CHANNEL_ID,photo,caption=telegram_html(text),parse_mode="HTML",show_caption_above_media=True)
-        add_signal_reactions(sent.message_id)
+        chart_path = make_chart(setup)
+        caption = build_signal_text(setup, state)
+        with open(chart_path, "rb") as photo:
+            sent = bot.send_photo(
+                CHANNEL_ID, photo, caption=caption,
+                parse_mode="HTML", show_caption_above_media=True
+            )
+        log.info("TELEGRAM SENT | %s | %s | %s", setup.coin, setup.direction, getattr(setup, "pattern_name", setup.strategy))
         return sent.message_id, sent.message_id
     except Exception as exc:
-        log.exception("TELEGRAM SEND FAILED | %s | %s",setup.inst_id,exc)
-        return None,None
+        log.exception("TELEGRAM SEND FAILED | %s | %s", setup.inst_id, exc)
+        return None, None
     finally:
         if chart_path:
-            try: os.remove(chart_path)
-            except OSError: pass
-
-
-# ============================================================
-# MORNING MESSAGE
-# ============================================================
-
-def send_morning_message():
-
-    global last_morning_date
-
-    if not MORNING_ENABLED:
-        return
-
-    current = local_now()
-
-    if (
-        current.hour != MORNING_HOUR
-        or current.minute != MORNING_MINUTE
-    ):
-        return
-
-    today = current.date()
-
-    if last_morning_date == today:
-        return
-
-    message = (
-        "🌅 *ДОБРОЕ УТРО, РЕБЯТА!*\n\n"
-
-        "QUANTUM SCALPER V5 PATTERN начинает новый "
-        "торговый день.\n\n"
-
-        "🔎 Ищем рынок широко.\n"
-        "📍 Проверяем уровни на нескольких ТФ.\n"
-        "🧠 Ищем сильные зоны.\n"
-        "🟡 Сигнал даём заранее.\n"
-        "🚫 Не догоняем движение.\n"
-        "🛑 Не увеличиваем риск.\n\n"
-
-        "*Качество важнее количества.*\n\n"
-
-        "Всем продуктивного торгового дня! 🚀"
-    )
-
-    try:
-
-        bot.send_message(
-            CHANNEL_ID,
-            message,
-            parse_mode="HTML"
-        )
-
-        last_morning_date = today
-
-        log.info(
-            "MORNING MESSAGE SENT"
-        )
-
-    except Exception:
-
-        log.exception(
-            "MORNING MESSAGE FAILED"
-        )
+            try:
+                os.remove(chart_path)
+            except OSError:
+                pass
 
 
 # ============================================================
@@ -3379,233 +3566,445 @@ def expire_old_ready():
             inst_id
         )
 
-        # Expiration is tracked internally, but no public Telegram message is sent.
-        # Public channel updates are reserved for TP1/TP2/TP3 or SL.
+        try:
+
+            bot.send_message(
+                CHANNEL_ID,
+                (
+                    f"🔴 *SETUP EXPIRED — "
+                    f"{setup.coin}USDT*\n\n"
+                    f"Цена не дала своевременного "
+                    f"подтверждения.\n"
+                    f"*Рынок не догоняем.*"
+                ),
+                parse_mode="Markdown"
+            )
+
+        except Exception:
+
+            log.exception(
+                "EXPIRATION TELEGRAM ERROR"
+            )
 
 
 
 # ============================================================
-# PATTERN FILTER / SETUP SELECTION
+# ============================================================
+# QUANTUM PATTERN ENGINE V2
+# 5M is the source of truth. 15M only confirms market context.
+# ============================================================
+
+@dataclass
+class PatternCandidate:
+    name: str
+    direction: str
+    level: float
+    entry: float
+    sl: float
+    score: int
+    reason: str
+    lines: List[Tuple[float, float, float, float, str]]
+    points: List[Tuple[float, float, str]]
 
 
-def _pivot_series(candles, highs=True):
-    vals = pivot_highs(candles) if highs else pivot_lows(candles)
-    return [v for _, v in vals[-6:]]
+def _pct_distance(a: float, b: float) -> float:
+    return abs(a-b) / max(abs(b), 1e-12) * 100.0
 
 
-def _avg_range(candles):
-    if not candles:
+def _range_pct(candles: List[Candle], n: int) -> float:
+    if len(candles) < n:
         return 0.0
-    return sum(max(c.high - c.low, 0.0) for c in candles) / len(candles)
+    x = candles[-n:]
+    lo = min(c.low for c in x)
+    hi = max(c.high for c in x)
+    return (hi-lo) / max(x[-1].close, 1e-12) * 100.0
 
 
-def _avg_volume(candles):
-    if not candles:
+def _move_pct(candles: List[Candle], n: int) -> float:
+    if len(candles) <= n:
         return 0.0
-    return sum(max(c.volume, 0.0) for c in candles) / len(candles)
+    return abs(candles[-1].close - candles[-n-1].close) / max(candles[-n-1].close, 1e-12) * 100.0
 
 
-def _trend_slope(values):
+def _avg_volume(candles: List[Candle], n: int) -> float:
+    if len(candles) < n:
+        return 0.0
+    vals = [c.quote_volume for c in candles[-n:] if c.quote_volume > 0]
+    return sum(vals)/len(vals) if vals else 0.0
+
+
+def _trend_slope(values: List[float]) -> float:
     if len(values) < 2:
         return 0.0
-    return (values[-1] - values[0]) / max(abs(values[0]), 1e-12)
+    return (values[-1]-values[0]) / max(abs(values[0]), 1e-12) * 100.0
 
 
-def _pattern_breakout_state(candles, direction, lookback=24):
-    if len(candles) < lookback + 2:
-        return False, False, False
-    prior = candles[-lookback-1:-1]
-    last = candles[-1]
-    prev = candles[-2]
-    avg_vol = _avg_volume(prior[-20:])
+def _cluster_level(values: List[float], tolerance_pct: float = 0.20):
+    if not values:
+        return None, 0
+    clusters = []
+    for v in values:
+        placed = False
+        for group in clusters:
+            center = sum(group)/len(group)
+            if _pct_distance(v, center) <= tolerance_pct:
+                group.append(v); placed = True; break
+        if not placed:
+            clusters.append([v])
+    group = max(clusters, key=len)
+    return sum(group)/len(group), len(group)
+
+
+def _build_triangle(c5: List[Candle], direction: str) -> Optional[PatternCandidate]:
+    if len(c5) < 60:
+        return None
+    recent = c5[-72:]
+    highs = pivot_highs(recent, PATTERN_PIVOT_LEFT, PATTERN_PIVOT_RIGHT)
+    lows = pivot_lows(recent, PATTERN_PIVOT_LEFT, PATTERN_PIVOT_RIGHT)
+    if len(highs) < 3 or len(lows) < 3:
+        return None
+    hs = highs[-5:]
+    ls = lows[-5:]
+    resistance, hn = _cluster_level([v for _,v in hs], 0.22)
+    support, ln = _cluster_level([v for _,v in ls], 0.22)
+    price = recent[-1].close
+    atr5 = atr(recent, 14)
+    if atr5 <= 0:
+        return None
     if direction == "LONG":
-        boundary = max(c.high for c in prior)
-        breakout = last.close > boundary and prev.close <= boundary
-        retest = (
-            (last.low <= boundary * 1.0015 and last.close > boundary)
-            or (prev.low <= boundary * 1.0015 and last.close > boundary)
-        )
+        rising = len(ls) >= 3 and all(ls[i][1] > ls[i-1][1] for i in range(1,len(ls)))
+        near = resistance is not None and 0 <= (resistance-price)/price*100 <= PATTERN_MAX_ENTRY_DISTANCE_PCT
+        compression = support is not None and resistance > support and (resistance-support)/price*100 <= 2.5
+        if not (rising and hn >= 2 and near and compression):
+            return None
+        last_low = ls[-1][1]
+        sl = last_low - atr5*0.45
+        entry = price
+        lines=[(hs[-3][0],resistance,hs[-1][0],resistance,"level"),
+               (ls[-3][0],ls[-3][1],ls[-1][0],last_low,"trend")]
+        points=[(x,v,"R") for x,v in hs[-3:]] + [(x,v,"L") for x,v in ls[-3:]]
+        score = 70 + min(12, (hn-2)*4) + min(10, (len(ls)-3)*3)
+        return PatternCandidate("ВОСХОДЯЩИЙ ТРЕУГОЛЬНИК","LONG",resistance,entry,sl,min(score,96),
+                                "горизонтальное сопротивление + последовательное повышение минимумов",lines,points)
     else:
-        boundary = min(c.low for c in prior)
-        breakout = last.close < boundary and prev.close >= boundary
-        retest = (
-            (last.high >= boundary * 0.9985 and last.close < boundary)
-            or (prev.high >= boundary * 0.9985 and last.close < boundary)
-        )
-    volume_confirmed = avg_vol > 0 and last.volume >= avg_vol * 1.35
-    return breakout, retest, volume_confirmed
+        falling = len(hs) >= 3 and all(hs[i][1] < hs[i-1][1] for i in range(1,len(hs)))
+        near = support is not None and 0 <= (price-support)/price*100 <= PATTERN_MAX_ENTRY_DISTANCE_PCT
+        compression = resistance is not None and resistance > support and (resistance-support)/price*100 <= 2.5
+        if not (falling and ln >= 2 and near and compression):
+            return None
+        last_high = hs[-1][1]
+        sl = last_high + atr5*0.45
+        entry = price
+        lines=[(ls[-3][0],support,ls[-1][0],support,"level"),
+               (hs[-3][0],hs[-3][1],hs[-1][0],last_high,"trend")]
+        points=[(x,v,"S") for x,v in ls[-3:]] + [(x,v,"H") for x,v in hs[-3:]]
+        score = 70 + min(12, (ln-2)*4) + min(10, (len(hs)-3)*3)
+        return PatternCandidate("НИСХОДЯЩИЙ ТРЕУГОЛЬНИК","SHORT",support,entry,sl,min(score,96),
+                                "горизонтальная поддержка + последовательное снижение максимумов",lines,points)
 
 
-def chart_pattern_analysis(candles_15m, candles_5m, direction):
-    """Rule-based chart pattern/confluence engine.
-
-    Pattern names are backed by price/volume geometry; the names themselves are
-    never used as a trigger. This is an additional quality layer over V4.
-    """
-    if len(candles_15m) < 60:
-        return 0, False, ""
-
-    recent = candles_15m[-48:]
-    highs = _pivot_series(recent, True)
-    lows = _pivot_series(recent, False)
-    ref = max(recent[-1].close, 1e-12)
-    points = 0
-    patterns = []
-
-    # Ascending / descending / symmetrical triangles.
-    if len(highs) >= 3 and len(lows) >= 3:
-        high_span = (max(highs[-3:]) - min(highs[-3:])) / ref
-        low_span = (max(lows[-3:]) - min(lows[-3:])) / ref
-        hs = _trend_slope(highs[-3:])
-        ls = _trend_slope(lows[-3:])
-
-        if direction == "LONG" and high_span <= 0.012 and ls > 0.002:
-            points += 14
-            patterns.append("ascending triangle")
-        elif direction == "SHORT" and low_span <= 0.012 and hs < -0.002:
-            points += 14
-            patterns.append("descending triangle")
-        elif high_span <= 0.020 and low_span <= 0.020 and hs < -0.001 and ls > 0.001:
-            points += 12
-            patterns.append("symmetrical triangle")
-
-        if high_span <= 0.018 and low_span <= 0.018:
-            points += 5
-            patterns.append("compression")
-
-        # Falling/rising wedge.
-        if hs < -0.001 and ls < -0.001 and high_span < 0.025 and low_span < 0.025 and direction == "LONG":
-            points += 10
-            patterns.append("falling wedge")
-        elif hs > 0.001 and ls > 0.001 and high_span < 0.025 and low_span < 0.025 and direction == "SHORT":
-            points += 10
-            patterns.append("rising wedge")
-
-        # Double top / bottom with a real middle reaction.
-        if direction == "SHORT":
-            h1, h2 = highs[-3], highs[-1]
-            middle = min(lows[-3:]) if lows else 0.0
-            if h1 > 0 and abs(h2-h1)/h1 <= 0.009 and middle < min(h1, h2) * 0.985:
-                points += 12
-                patterns.append("double top")
-        else:
-            l1, l2 = lows[-3], lows[-1]
-            middle = max(highs[-3:]) if highs else 0.0
-            if l1 > 0 and abs(l2-l1)/l1 <= 0.009 and middle > max(l1, l2) * 1.015:
-                points += 12
-                patterns.append("double bottom")
-
-    # Bull/bear flag or pennant: impulse followed by contraction and quieter volume.
-    if len(recent) >= 30:
-        impulse = abs(recent[-30].close - recent[-18].close) / max(abs(recent[-30].close), 1e-12) * 100
-        old_range = _avg_range(recent[-30:-15])
-        new_range = _avg_range(recent[-15:])
-        old_vol = _avg_volume(recent[-30:-15])
-        new_vol = _avg_volume(recent[-15:])
-        contraction = new_range / old_range if old_range > 0 else 1.0
-        vol_contract = new_vol / old_vol if old_vol > 0 else 1.0
-        if impulse >= 1.0 and contraction <= 0.72:
-            points += 11
-            patterns.append("flag/pennant")
-            if vol_contract <= 0.85:
-                points += 3
-                patterns.append("volume contraction")
-
-    # Rectangle / range breakout preparation.
-    if len(recent) >= 24:
-        box = recent[-24:]
-        box_high = max(c.high for c in box)
-        box_low = min(c.low for c in box)
-        box_width = (box_high - box_low) / ref
-        near_top = sum(1 for c in box if abs(c.high-box_high)/ref <= 0.003)
-        near_bottom = sum(1 for c in box if abs(c.low-box_low)/ref <= 0.003)
-        if box_width <= 0.045 and near_top >= 2 and near_bottom >= 2:
-            points += 8
-            patterns.append("rectangle/range")
-
-    # Live breakout + retest + volume confirmation on 5M.
-    breakout, retest, volume_confirmed = _pattern_breakout_state(candles_5m, direction)
-    if breakout:
-        points += 12
-        patterns.append("breakout")
-    if volume_confirmed and breakout:
-        points += 7
-        patterns.append("breakout volume confirmation")
-    if retest:
-        points += 10
-        patterns.append("breakout + retest")
-
-    if not patterns:
-        return 0, False, ""
-
-    unique_patterns = list(dict.fromkeys(patterns))
-    if len(unique_patterns) >= 2:
-        points += 4
-    if len(unique_patterns) >= 3:
-        points += 4
-
-    return min(points, 40), True, "Паттерн/структура: " + ", ".join(unique_patterns) + "."
+def _build_double(c5: List[Candle], direction: str) -> Optional[PatternCandidate]:
+    recent=c5[-80:]
+    hs=pivot_highs(recent,PATTERN_PIVOT_LEFT,PATTERN_PIVOT_RIGHT)
+    ls=pivot_lows(recent,PATTERN_PIVOT_LEFT,PATTERN_PIVOT_RIGHT)
+    price=recent[-1].close
+    atr5=atr(recent,14)
+    if atr5<=0:
+        return None
+    if direction=="SHORT" and len(hs)>=2:
+        a,b=hs[-2],hs[-1]
+        if b[0]-a[0] < 8 or _pct_distance(a[1],b[1])>0.28:
+            return None
+        valley=min(c.low for c in recent[a[0]:b[0]+1])
+        depth=(min(a[1],b[1])-valley)/max(price,1e-12)*100
+        if depth<0.35 or price>max(a[1],b[1]) or price < valley*0.995:
+            return None
+        sl=max(a[1],b[1])+atr5*0.35
+        lines=[(a[0],a[1],b[0],b[1],"trend"),(a[0],valley,b[0],valley,"level")]
+        points=[(a[0],a[1],"1"),(b[0],b[1],"2")]
+        score=min(96,78+min(10,int(depth*8)))
+        return PatternCandidate("ДВОЙНАЯ ВЕРШИНА","SHORT",valley,price,sl,score,
+                                "две близкие вершины с выраженной впадиной и сформированной neckline",lines,points)
+    if direction=="LONG" and len(ls)>=2:
+        a,b=ls[-2],ls[-1]
+        if b[0]-a[0] < 8 or _pct_distance(a[1],b[1])>0.28:
+            return None
+        peak=max(c.high for c in recent[a[0]:b[0]+1])
+        depth=(peak-max(a[1],b[1]))/max(price,1e-12)*100
+        if depth<0.35 or price<min(a[1],b[1]) or price > peak*1.005:
+            return None
+        sl=min(a[1],b[1])-atr5*0.35
+        lines=[(a[0],a[1],b[0],b[1],"trend"),(a[0],peak,b[0],peak,"level")]
+        points=[(a[0],a[1],"1"),(b[0],b[1],"2")]
+        score=min(96,78+min(10,int(depth*8)))
+        return PatternCandidate("ДВОЙНОЕ ДНО","LONG",peak,price,sl,score,
+                                "два близких основания с выраженной вершиной между ними и сформированной neckline",lines,points)
+    return None
 
 
-def pattern_quality_gate(setup: Setup, candles: Dict[str, List[Candle]]) -> Tuple[bool, str]:
+def _build_flag(c5: List[Candle], direction: str) -> Optional[PatternCandidate]:
+    if len(c5)<50: return None
+    r=c5[-50:]
+    impulse_start=r[-34].close
+    impulse_end=r[-18].close
+    impulse=(impulse_end-impulse_start)/max(impulse_start,1e-12)*100
+    if direction=="SHORT": impulse=-impulse
+    if impulse<1.2: return None
+    cons=r[-18:]
+    hi=max(c.high for c in cons); lo=min(c.low for c in cons); price=r[-1].close
+    width=(hi-lo)/max(price,1e-12)*100
+    old_range=sum(c.high-c.low for c in r[-34:-18])/16
+    new_range=sum(c.high-c.low for c in cons)/18
+    if old_range<=0 or new_range/old_range>0.72 or width>1.6: return None
+    slope=_trend_slope([c.close for c in cons])
+    if direction=="LONG" and slope>=0.25: return None
+    if direction=="SHORT" and slope<=-0.25: return None
+    atr5=atr(r,14)
+    entry=price
+    sl=(lo-atr5*0.4) if direction=="LONG" else (hi+atr5*0.4)
+    if direction=="LONG":
+        line=(0,0,0,0,"trend")
+    else: line=(0,0,0,0,"trend")
+    # Use regression-like boundary lines from endpoints.
+    lines=[(32, r[32].high, 49, hi, "trend"),(32,r[32].low,49,lo,"trend")]
+    pts=[(32,r[32].high,"F"),(49,hi,"B")]
+    return PatternCandidate("БЫЧИЙ ФЛАГ" if direction=="LONG" else "МЕДВЕЖИЙ ФЛАГ",direction,
+                            hi if direction=="LONG" else lo,entry,sl,min(94,80+int(min(10,impulse*3))),
+                            "импульс + сжатая коррекция перед продолжением",lines,pts)
+
+
+def _build_breakout_retest(c5: List[Candle], direction: str) -> Optional[PatternCandidate]:
+    r=c5[-72:]
+    if len(r)<50: return None
+    atr5=atr(r,14)
+    if atr5<=0: return None
+    hs=pivot_highs(r[:-8],PATTERN_PIVOT_LEFT,PATTERN_PIVOT_RIGHT)
+    ls=pivot_lows(r[:-8],PATTERN_PIVOT_LEFT,PATTERN_PIVOT_RIGHT)
+    price=r[-1].close
+    if direction=="LONG" and hs:
+        level=max(v for _,v in hs[-6:])
+        crossed=any(c.close>level+atr5*0.15 for c in r[-10:-2])
+        retest=min(abs(c.low-level) for c in r[-5:]) / max(level,1e-12)*100
+        holding=price>=level
+        if crossed and retest<=0.25 and holding and price-level<=price*0.006:
+            sl=min(c.low for c in r[-8:])-atr5*0.35
+            x1=next((i for i,c in enumerate(r) if c.close>level+atr5*0.15), len(r)-5)
+            return PatternCandidate("ПРОБОЙ И РЕТЕСТ","LONG",level,price,sl,88,
+                                    "закрепление выше сопротивления и аккуратный ретест уровня",[(x1,level,len(r)-1,level,"level")],[(x1,level,"BREAK"),(len(r)-1,price,"RETEST")])
+    if direction=="SHORT" and ls:
+        level=min(v for _,v in ls[-6:])
+        crossed=any(c.close<level-atr5*0.15 for c in r[-10:-2])
+        retest=min(abs(c.high-level) for c in r[-5:]) / max(level,1e-12)*100
+        holding=price<=level
+        if crossed and retest<=0.25 and holding and level-price<=price*0.006:
+            sl=max(c.high for c in r[-8:])+atr5*0.35
+            x1=next((i for i,c in enumerate(r) if c.close<level-atr5*0.15), len(r)-5)
+            return PatternCandidate("ПРОБОЙ И РЕТЕСТ","SHORT",level,price,sl,88,
+                                    "закрепление ниже поддержки и аккуратный ретест уровня",[(x1,level,len(r)-1,level,"level")],[(x1,level,"BREAK"),(len(r)-1,price,"RETEST")])
+    return None
+
+
+def pattern_candidates(c5: List[Candle]) -> List[PatternCandidate]:
+    out=[]
+    for direction in ("LONG","SHORT"):
+        for fn in (_build_triangle,_build_double,_build_flag,_build_breakout_retest):
+            try:
+                c=fn(c5,direction)
+                if c: out.append(c)
+            except Exception as exc:
+                log.debug("PATTERN DETECTOR ERROR | %s | %s", fn.__name__, exc)
+    return out
+
+
+def tradeability_filter(ticker: dict, c5: List[Candle], c15: List[Candle], c1h: List[Candle]) -> Tuple[bool, str]:
+    volume=float(ticker.get("vol24h_usd",0) or 0)
+    if volume < MIN_CANDIDATE_VOLUME_USD: return False,"24H volume"
+    if len(c5)<60 or len(c15)<40 or len(c1h)<30: return False,"history"
+    a5=atr_pct(c5); a15=atr_pct(c15)
+    if a5<MIN_5M_ATR_PCT: return False,"5M ATR"
+    if a15<MIN_15M_ATR_PCT: return False,"15M ATR"
+    if _move_pct(c1h,12)<MIN_1H_MOVE_PCT: return False,"1H movement"
+    if _move_pct(c15,8)<MIN_15M_MOVE_PCT: return False,"15M movement"
+    vr=volume_ratio(c5,20)
+    if vr<MIN_PATTERN_VOLUME_RATIO: return False,"5M volume"
+    if _range_pct(c5,24)<MIN_5M_RANGE_PCT: return False,"5M range"
+    if _range_pct(c15,16)<MIN_15M_RANGE_PCT: return False,"15M range"
+    return True,"OK"
+
+
+def build_pattern_setup(inst_id: str, ticker: dict, candles: Dict[str,List[Candle]]) -> Optional[Setup]:
+    c5=[c for c in candles.get("5m",[]) if c.confirmed]
+    c15=[c for c in candles.get("15m",[]) if c.confirmed]
+    c1h=[c for c in candles.get("1H",[]) if c.confirmed]
+    if not c5 or not c15 or not c1h: return None
+    ok, why=tradeability_filter(ticker,c5,c15,c1h)
+    if not ok:
+        log.debug("TRADEABILITY REJECT | %s | %s",inst_id,why)
+        return None
+    candidates=pattern_candidates(c5)
+    if not candidates: return None
+    current=c5[-1].close
+    valid=[]
+    for p in candidates:
+        if p.score<PATTERN_MIN_SCORE: continue
+        risk=abs(p.entry-p.sl)/max(p.entry,1e-12)*100
+        if risk<=0 or risk>1.0: continue
+        distance=_pct_distance(p.entry,p.level)
+        if p.name in ("ВОСХОДЯЩИЙ ТРЕУГОЛЬНИК","НИСХОДЯЩИЙ ТРЕУГОЛЬНИК") and distance>PATTERN_MAX_ENTRY_DISTANCE_PCT: continue
+        # 15M context must not strongly oppose the 5M pattern.
+        move15=(c15[-1].close-c15[-9].close)/max(c15[-9].close,1e-12)*100 if len(c15)>=9 else 0
+        if p.direction=="LONG" and move15 < -0.90: continue
+        if p.direction=="SHORT" and move15 > 0.90: continue
+        valid.append(p)
+    if not valid: return None
+    p=max(valid,key=lambda x:x.score)
+    risk=abs(p.entry-p.sl)
+    tp1=p.entry+risk if p.direction=="LONG" else p.entry-risk
+    tp2=p.entry+risk*2 if p.direction=="LONG" else p.entry-risk*2
+    tp3=p.entry+risk*3 if p.direction=="LONG" else p.entry-risk*3
+    volume=float(ticker.get("vol24h_usd",0) or 0)
+    setup=Setup(inst_id=inst_id,coin=get_coin(inst_id),direction=p.direction,strategy=p.name,
+                level=p.level,level_strength=90,level_tf="5M",current_price=current,
+                entry_low=p.entry*0.9995,entry_high=p.entry*1.0005,sl=p.sl,tp1=tp1,tp2=tp2,tp3=tp3,
+                score=p.score,liquidity="GOOD",volume_grade="HIGH",oi_status="NOT USED",
+                reason=p.reason,volume_24h=volume,breakout_volume_ratio=volume_ratio(c5,20),
+                atr_pct=atr_pct(c5),setup_state="READY",candles_5m=c5[-100:])
+    setup.pattern_name=p.name
+    # Remap pattern x-coordinates to the last 100 candles.
+    offset=max(0,len(c5)-100)
+    setup.pattern_lines=[(x-offset,y,x2-offset,y2,k) for x,y,x2,y2,k in p.lines if x>=offset and x2>=offset]
+    setup.pattern_points=[(x-offset,y,l) for x,y,l in p.points if x>=offset]
+    return setup
+
+
+def build_top_mover_reversal_setup(inst_id: str, ticker: dict, candles: Dict[str,List[Candle]]) -> Optional[Setup]:
+    """TOP GAINER -> first confirmed bearish reversal; TOP LOSER -> first confirmed bullish rebound."""
+    if not TOP_MOVER_ENABLED:
+        return None
+
     c5 = [c for c in candles.get("5m", []) if c.confirmed]
     c15 = [c for c in candles.get("15m", []) if c.confirmed]
-    c1 = [c for c in candles.get("1H", []) if c.confirmed]
-    c4 = [c for c in candles.get("4H", []) if c.confirmed]
+    if len(c5) < 50 or len(c15) < 20:
+        return None
 
-    if min(len(c5), len(c15), len(c1), len(c4)) < 30:
-        return False, "insufficient confirmed candles"
+    change24 = float(ticker.get("change24h_pct", 0) or 0)
+    if change24 >= TOP_MOVER_MIN_GAIN_PCT:
+        direction = "SHORT"
+    elif change24 <= TOP_MOVER_MIN_LOSS_PCT:
+        direction = "LONG"
+    else:
+        return None
 
-    last = c5[-1]
-    avg_vol = _avg_volume(c5[-21:-1])
-    vol_ratio = last.volume / avg_vol if avg_vol > 0 else 0.0
-    body = candle_body_ratio(last)
+    look = c5[-min(TOP_MOVER_LOOKBACK_5M, len(c5)):]
+    history = look[:-1]
+    current = c5[-1]
+    prev = c5[-2]
+    atr5 = atr(c5, 14)
+    if atr5 <= 0 or len(history) < 12:
+        return None
 
-    # 1H is the setup's primary directional timeframe.
-    # A mismatch here means the setup direction is internally inconsistent.
-    if structure_direction(c1) != setup.direction:
-        return False, "1H structure mismatch"
+    if direction == "LONG":
+        extreme_i = min(range(len(history)), key=lambda i: history[i].low)
+        extreme = history[extreme_i].low
+        if extreme_i < 6 or extreme_i > len(history) - 3:
+            return None
+        pre_high = max(c.high for c in history[:extreme_i])
+        prior_move_pct = (pre_high - extreme) / max(pre_high, 1e-12) * 100.0
+        reversal_pct = (current.close - extreme) / max(extreme, 1e-12) * 100.0
+        bullish = current.close > current.open
+        trigger = bullish and (current.close > prev.high or abs(current.close-current.open) >= atr5 * TOP_MOVER_MIN_BODY_ATR)
+    else:
+        extreme_i = max(range(len(history)), key=lambda i: history[i].high)
+        extreme = history[extreme_i].high
+        if extreme_i < 6 or extreme_i > len(history) - 3:
+            return None
+        pre_low = min(c.low for c in history[:extreme_i])
+        prior_move_pct = (extreme - pre_low) / max(pre_low, 1e-12) * 100.0
+        reversal_pct = (extreme - current.close) / max(extreme, 1e-12) * 100.0
+        bearish = current.close < current.open
+        trigger = bearish and (current.close < prev.low or abs(current.close-current.open) >= atr5 * TOP_MOVER_MIN_BODY_ATR)
 
-    # 4H disagreement is NOT a hard rejection.
-    # analyze_symbol() already treats it as a quality penalty. Making it
-    # a second hard gate caused the live scanner to reject virtually every
-    # candidate whenever 4H was counter-trend, despite the strategy allowing
-    # 1H setups with a weaker 4H alignment.
-    structure_4h = structure_direction(c4)
-    if structure_4h != setup.direction:
-        log.info(
-            "QUALITY GATE NOTE | %s | 4H counter-trend: %s vs %s",
-            setup.inst_id,
-            structure_4h,
-            setup.direction,
-        )
+    if prior_move_pct < TOP_MOVER_MIN_PRIOR_MOVE_PCT:
+        return None
+    if not (TOP_MOVER_MIN_REVERSAL_PCT <= reversal_pct <= TOP_MOVER_MAX_REVERSAL_PCT):
+        return None
+    if not trigger:
+        return None
 
-    if setup.setup_state == "ACTIVE":
-        if setup.direction == "LONG" and last.close <= setup.level:
-            return False, "breakout not closed above level"
-        if setup.direction == "SHORT" and last.close >= setup.level:
-            return False, "breakout not closed below level"
-        if body < 0.45:
-            return False, "weak breakout body"
-        if vol_ratio < 1.20:
-            return False, "weak breakout volume"
+    vr = volume_ratio(c5, 20)
+    if vr < TOP_MOVER_MIN_VOLUME_RATIO:
+        return None
 
-    if setup.setup_state == "READY":
-        distance = abs(pct(setup.current_price, setup.level))
-        if distance > PRE_TRIGGER_DISTANCE_PCT:
-            return False, "READY too far from level"
-        p_score, p_ok, _ = chart_pattern_analysis(c15, c5, setup.direction)
-        if not p_ok or p_score < 12:
-            return False, "pattern evidence too weak"
+    move15 = (c15[-1].close - c15[-9].close) / max(c15[-9].close, 1e-12) * 100.0 if len(c15) >= 9 else 0.0
+    if direction == "LONG" and move15 < -1.50:
+        return None
+    if direction == "SHORT" and move15 > 1.50:
+        return None
 
-    return True, "passed"
+    if direction == "LONG":
+        local_low = min(c.low for c in history[max(0, extreme_i-2):] + [current])
+        sl = min(extreme, local_low) - atr5 * 0.12
+        entry = current.close
+        risk_pct = (entry - sl) / max(entry, 1e-12) * 100.0
+        tp1 = entry * (1.0 + TOP_MOVER_TP1_PCT / 100.0)
+        tp2 = entry * (1.0 + TOP_MOVER_TP2_PCT / 100.0)
+        tp3 = entry * (1.0 + TOP_MOVER_TP3_PCT / 100.0)
+        room_reference = max(c.high for c in c5[-72:])
+        enough_room = room_reference >= tp2
+    else:
+        local_high = max(c.high for c in history[max(0, extreme_i-2):] + [current])
+        sl = max(extreme, local_high) + atr5 * 0.12
+        entry = current.close
+        risk_pct = (sl - entry) / max(entry, 1e-12) * 100.0
+        tp1 = entry * (1.0 - TOP_MOVER_TP1_PCT / 100.0)
+        tp2 = entry * (1.0 - TOP_MOVER_TP2_PCT / 100.0)
+        tp3 = entry * (1.0 - TOP_MOVER_TP3_PCT / 100.0)
+        room_reference = min(c.low for c in c5[-72:])
+        enough_room = room_reference <= tp2
+
+    if risk_pct < TOP_MOVER_MIN_RISK_PCT or risk_pct > TOP_MOVER_MAX_RISK_PCT:
+        return None
+    if not enough_room:
+        return None
+
+    score = 88
+    if abs(change24) >= 40: score += 3
+    if abs(change24) >= 50: score += 2
+    if prior_move_pct >= 20: score += 2
+    if vr >= 1.7: score += 2
+    if abs(current.close-current.open) >= atr5: score += 2
+    score = min(99, score)
+
+    pattern_name = "TOP LOSER · ПЕРВЫЙ ОТСКОК" if direction == "LONG" else "TOP GAINER · ПЕРВЫЙ РАЗВОРОТ"
+    reason = (f"24H {change24:+.1f}% → движение до экстремума {prior_move_pct:.1f}% → "
+              f"экстремум → первый подтверждённый {direction}; Volume {vr:.2f}x; "
+              f"отскок/разворот {reversal_pct:.2f}%")
+
+    setup = Setup(
+        inst_id=inst_id, coin=get_coin(inst_id), direction=direction, strategy="TOP MOVERS REVERSAL",
+        level=room_reference, level_strength=90, level_tf="5M", current_price=entry,
+        entry_low=entry*0.9995, entry_high=entry*1.0005, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+        score=score, liquidity=grade_liquidity(float(ticker.get("vol24h_usd", 0) or 0)),
+        volume_grade=grade_volume(vr), oi_status="NOT USED", reason=reason,
+        volume_24h=float(ticker.get("vol24h_usd", 0) or 0), breakout_volume_ratio=vr,
+        atr_pct=atr_pct(c5), setup_state="READY", candles_5m=c5[-72:]
+    )
+    setup.pattern_name = pattern_name
+    setup.change24 = change24
+    offset = max(0, len(c5)-72)
+    extreme_global = len(c5)-len(look)+extreme_i
+    setup.pattern_lines = [(max(0, len(c5[-72:])-28), room_reference, len(c5[-72:])-1, room_reference, "level")]
+    setup.pattern_points = [(extreme_global-offset, extreme, "EXTREME LOW" if direction=="LONG" else "EXTREME HIGH"),
+                            (len(c5[-72:])-1, entry, "FIRST BULLISH BREAK" if direction=="LONG" else "FIRST BEARISH BREAK")]
+    return setup
 
 
 def analyze_symbol_with_patterns(inst_id, ticker, candles):
-    # Pattern-first engine is now the only source of direction.
-    return analyze_symbol(inst_id, ticker, candles)
+    # Pattern Engine V2 is independent from the old V4 direction engine.
+    return build_pattern_setup(inst_id,ticker,candles)
 
 
+# ============================================================
 # RESULT TRACKING
 # ============================================================
 
@@ -3633,27 +4032,6 @@ def _row_risk(row):
     return abs(entry - sl)
 
 
-def _send_result_update(inst_id, direction, result):
-    """Send one public result update. Only this function publishes trade results."""
-    coin = get_coin(inst_id)
-    if result == "TP1":
-        message = f"🟢 *TP1 — {coin}USDT*\n\nПервая цель достигнута. Стоп переносится в безубыток по логике сигнала."
-    elif result == "TP2":
-        message = f"🟢 *TP2 — {coin}USDT*\n\nВторая цель достигнута. Движение развивается по плану."
-    elif result == "TP3":
-        message = f"💎 *TP3 — {coin}USDT*\n\nФинальная цель достигнута. Сделка завершена."
-    elif result == "SL":
-        message = f"🔴 *STOP LOSS — {coin}USDT*\n\nСделка закрыта по стопу. Дисциплина прежде всего."
-    elif result == "BE":
-        message = f"🟡 *BREAK EVEN — {coin}USDT*\n\nСделка закрыта в безубытке."
-    else:
-        return
-    try:
-        bot.send_message(CHANNEL_ID, telegram_html(message), parse_mode="HTML")
-    except Exception:
-        log.exception("RESULT TELEGRAM ERROR | %s | %s", inst_id, result)
-
-
 def update_signal_results():
     rows = db.execute("""
         SELECT id, inst_id, direction, strategy, level, entry_low, entry_high,
@@ -3678,6 +4056,8 @@ def update_signal_results():
         status = row[12]
         entry_low, entry_high = float(row[5]), float(row[6])
         sl, tp1, tp2, tp3 = map(float, (row[7], row[8], row[9], row[10]))
+        entry_mid = (entry_low + entry_high) / 2.0
+        one_r = max(abs(entry_mid - sl), 1e-12)
         tp1_hit, tp2_hit, tp3_hit = map(int, (row[15] or 0, row[16] or 0, row[17] or 0))
 
         # READY -> ACTIVE when price actually reaches the published entry zone.
@@ -3685,6 +4065,10 @@ def update_signal_results():
             touched = entry_low <= price <= entry_high
             if touched:
                 db.execute("UPDATE signals SET status='ACTIVE', activated_at=? WHERE id=?", (now_ts(), sid))
+                try:
+                    bot.send_message(CHANNEL_ID, f"🟢 *ENTRY ACTIVE — {get_coin(inst_id)}USDT*\n\nЦена вошла в опубликованную зону входа.", parse_mode="Markdown")
+                except Exception:
+                    log.exception("ACTIVE TELEGRAM ERROR")
                 status = "ACTIVE"
             elif now_ts() > float(row[14]):
                 db.execute("UPDATE signals SET status='EXPIRED', result='EXPIRED', closed_at=? WHERE id=?", (now_ts(), sid))
@@ -3700,54 +4084,41 @@ def update_signal_results():
         tp2_now = (c.high >= tp2) if direction == "LONG" else (c.low <= tp2)
         tp3_now = (c.high >= tp3) if direction == "LONG" else (c.low <= tp3)
 
-        # A result flag is also the de-duplication key. Once a target is marked
-        # hit in SQLite, later scan cycles cannot publish it again.
-        new_tp1 = bool(tp1_now and not tp1_hit)
-        new_tp2 = bool(tp2_now and not tp2_hit)
-        new_tp3 = bool(tp3_now and not tp3_hit)
-
-        if sl_hit and not tp1_hit and not tp2_hit and not tp3_hit and not (new_tp1 or new_tp2 or new_tp3):
-            db.execute("UPDATE signals SET status='CLOSED', result='SL', closed_at=?, r_multiple=-1 WHERE id=? AND status='ACTIVE'", (now_ts(), sid))
-            if db.rowcount:
-                db.commit()
-                _send_result_update(inst_id, direction, "SL")
+        # Before TP1: a stop closes the trade in loss.
+        if sl_hit and not tp1_hit and not tp2_hit and not tp3_hit:
+            db.execute("UPDATE signals SET status='CLOSED', result='SL', closed_at=?, r_multiple=-1 WHERE id=?", (now_ts(), sid))
             continue
 
-        if new_tp1:
-            db.execute("UPDATE signals SET tp1_hit=1 WHERE id=? AND tp1_hit=0", (sid,))
-            if db.rowcount:
-                tp1_hit = 1
-                db.commit()
-                _send_result_update(inst_id, direction, "TP1")
-        if new_tp2:
-            db.execute("UPDATE signals SET tp2_hit=1 WHERE id=? AND tp2_hit=0", (sid,))
-            if db.rowcount:
-                tp2_hit = 1
-                db.commit()
-                _send_result_update(inst_id, direction, "TP2")
-        if new_tp3:
-            db.execute("UPDATE signals SET tp3_hit=1 WHERE id=? AND tp3_hit=0", (sid,))
-            if db.rowcount:
-                tp3_hit = 1
-                db.commit()
-                _send_result_update(inst_id, direction, "TP3")
+        # After TP1 the published rule is to move SL to BE. If the next candles
+        # return to the entry, the trade is closed as BE rather than remaining active forever.
+        if tp1_hit and not tp2_hit and not tp3_hit:
+            be_price = entry_high if direction == "LONG" else entry_low
+            be_hit = (c.low <= be_price) if direction == "LONG" else (c.high >= be_price)
+            if be_hit:
+                db.execute("UPDATE signals SET status='CLOSED', result='BE', closed_at=?, r_multiple=0 WHERE id=?", (now_ts(), sid))
+                continue
+
+        if tp1_now and not tp1_hit:
+            tp1_hit = 1
+            db.execute("UPDATE signals SET tp1_hit=1 WHERE id=?", (sid,))
+        if tp2_now and not tp2_hit:
+            tp2_hit = 1
+            db.execute("UPDATE signals SET tp2_hit=1 WHERE id=?", (sid,))
+        if tp3_now and not tp3_hit:
+            tp3_hit = 1
+            db.execute("UPDATE signals SET tp3_hit=1 WHERE id=?", (sid,))
 
         if tp3_hit:
-            db.execute("UPDATE signals SET status='CLOSED', result='TP3', closed_at=?, r_multiple=3 WHERE id=? AND status='ACTIVE'", (now_ts(), sid))
+            db.execute("UPDATE signals SET status='CLOSED', result='TP3', closed_at=?, r_multiple=? WHERE id=?", (now_ts(), abs(tp3-entry_mid)/one_r, sid))
         elif tp2_hit:
-            db.execute("UPDATE signals SET status='ACTIVE', result='TP2', r_multiple=2 WHERE id=? AND status='ACTIVE'", (sid,))
+            db.execute("UPDATE signals SET status='ACTIVE', result='TP2', r_multiple=? WHERE id=?", (abs(tp2-entry_mid)/one_r, sid))
         elif tp1_hit:
-            # Do not evaluate BE on the same candle that first hit TP1.
-            # The stop can move to BE only on a later scan/candle.
-            if not new_tp1:
-                be_hit = (c.low <= entry_high) if direction == "LONG" else (c.high >= entry_low)
-                if be_hit:
-                    db.execute("UPDATE signals SET status='CLOSED', result='BE', closed_at=?, r_multiple=0 WHERE id=? AND status='ACTIVE'", (now_ts(), sid))
-                    if db.rowcount:
-                        db.commit()
-                        _send_result_update(inst_id, direction, "BE")
-                        continue
-            db.execute("UPDATE signals SET status='ACTIVE', result='TP1', r_multiple=1 WHERE id=? AND status='ACTIVE'", (sid,))
+            # After TP1 the original signal explicitly moves SL to BE.
+            be_hit = (c.low <= entry_high) if direction == "LONG" else (c.high >= entry_low)
+            if be_hit:
+                db.execute("UPDATE signals SET status='CLOSED', result='BE', closed_at=?, r_multiple=0 WHERE id=?", (now_ts(), sid))
+            else:
+                db.execute("UPDATE signals SET status='ACTIVE', result='TP1', r_multiple=? WHERE id=?", (abs(tp1-entry_mid)/one_r, sid))
 
     db.commit()
 
@@ -3756,97 +4127,55 @@ def update_signal_results():
 # REPORTS
 # ============================================================
 
-def report_period(start_ts, end_ts, title):
+def report_week_period(start_ts, end_ts):
     rows = db.execute("""
-        SELECT strategy, result, r_multiple, score, status
+        SELECT result, status
         FROM signals
         WHERE created_at >= ? AND created_at < ?
     """, (start_ts, end_ts)).fetchall()
 
     total = len(rows)
-    closed = [r for r in rows if r[1] in ("SL", "BE", "TP3")]
-    sl = sum(1 for r in rows if r[1] == "SL")
-    be = sum(1 for r in rows if r[1] == "BE")
-    tp3 = sum(1 for r in rows if r[1] == "TP3")
-    tp1 = sum(1 for r in rows if r[1] in ("TP1", "TP2", "TP3"))
-    tp2 = sum(1 for r in rows if r[1] in ("TP2", "TP3"))
-    r_sum = sum(float(r[2] or 0) for r in rows)
-    avg_r = (r_sum / len(closed)) if closed else 0.0
-    outcome_rate = ((tp3 + be) / len(closed) * 100.0) if closed else 0.0
-    tp1_rate = (tp1 / total * 100.0) if total else 0.0
-    tp2_rate = (tp2 / total * 100.0) if total else 0.0
-    tp3_rate = (tp3 / total * 100.0) if total else 0.0
+    plus = sum(1 for result, _ in rows if result in ("TP1", "TP2", "TP3"))
+    minus = sum(1 for result, _ in rows if result == "SL")
 
-    lines = [
-        f"📊 *{title}*",
-        "",
-        f"Сигналов: *{total}*",
-        f"Закрыто: *{len(closed)}*",
-        f"TP1: *{tp1}* | TP2: *{tp2}* | TP3: *{tp3}*",
-        f"SL: *{sl}* | BE: *{be}*",
-        f"TP1 hit rate: *{tp1_rate:.1f}%* | TP2: *{tp2_rate:.1f}%* | TP3: *{tp3_rate:.1f}%*",
-        f"Закрытие без SL (TP3/BE): *{outcome_rate:.1f}%*",
-        f"Суммарно R: *{r_sum:+.2f}R*",
-        f"Средний R закрытых: *{avg_r:+.2f}R*",
-    ]
-
-    strategies = {}
-    for strategy, result, r, score, status in rows:
-        d = strategies.setdefault(strategy, {"n":0,"closed":0,"r":0.0,"tp3":0,"sl":0})
-        d["n"] += 1
-        if result in ("SL", "BE", "TP3"):
-            d["closed"] += 1
-        d["r"] += float(r or 0)
-        d["tp3"] += int(result == "TP3")
-        d["sl"] += int(result == "SL")
-
-    if strategies:
-        lines += ["", "*По стратегиям:"]
-        for strategy, d in sorted(strategies.items(), key=lambda x: x[0]):
-            lines.append(f"• {strategy}: {d['n']} сигналов | {d['tp3']} TP3 | {d['sl']} SL | {d['r']:+.2f}R")
-
-    if not rows:
-        lines += ["", "Нет сигналов за период."]
-
-    return "\n".join(lines)
-
-
-def report_boundaries():
-    n = local_now()
-    day_start = datetime(n.year, n.month, n.day, tzinfo=ZoneInfo(TIMEZONE))
-    next_day = day_start + __import__('datetime').timedelta(days=1)
-    # Calendar week: Monday-Sunday.
-    week_start = day_start - __import__('datetime').timedelta(days=day_start.weekday())
-    next_week = week_start + __import__('datetime').timedelta(days=7)
-    month_start = datetime(n.year, n.month, 1, tzinfo=ZoneInfo(TIMEZONE))
-    if n.month == 12:
-        next_month = datetime(n.year + 1, 1, 1, tzinfo=ZoneInfo(TIMEZONE))
-    else:
-        next_month = datetime(n.year, n.month + 1, 1, tzinfo=ZoneInfo(TIMEZONE))
     return (
-        day_start.timestamp(), next_day.timestamp(),
-        week_start.timestamp(), next_week.timestamp(),
-        month_start.timestamp(), next_month.timestamp()
+        "📊 <b>ОТЧЁТ ЗА НЕДЕЛЮ</b>\n\n"
+        f"Сигналов пришло: <b>{total}</b>\n"
+        f"Закрылось в плюс: <b>{plus}</b>\n"
+        f"Закрылось в минус: <b>{minus}</b>"
     )
 
 
-def send_reports_once_per_day():
-    n=local_now()
-    if (n.weekday(), n.hour, n.minute) != (6, REPORT_HOUR, REPORT_MINUTE):
+def previous_week_boundaries():
+    n = local_now()
+    today = datetime(n.year, n.month, n.day, tzinfo=ZoneInfo(TIMEZONE))
+    this_week = today - __import__('datetime').timedelta(days=today.weekday())
+    previous_week = this_week - __import__('datetime').timedelta(days=7)
+    return previous_week.timestamp(), this_week.timestamp(), previous_week.date().isoformat()
+
+
+def send_weekly_report_once():
+    n = local_now()
+    # Отчёт отправляется один раз в неделю — в понедельник после REPORT_HOUR:REPORT_MINUTE.
+    if n.weekday() != 0 or (n.hour, n.minute) < (REPORT_HOUR, REPORT_MINUTE):
         return
-    key=f"weekly_report_{n.date().isoformat()}"
-    if db.execute("SELECT 1 FROM bot_state WHERE key=?",(key,)).fetchone():
+
+    start_ts, end_ts, week_key = previous_week_boundaries()
+    key = f"weekly_report_{week_key}"
+    if db.execute("SELECT 1 FROM bot_state WHERE key=?", (key,)).fetchone():
         return
-    start=(n.date() - timedelta(days=6))
-    end=n.date() + timedelta(days=1)
-    rows=db.execute("SELECT result FROM signals WHERE created_at>=? AND created_at<?",(datetime.combine(start,datetime.min.time(),tzinfo=n.tzinfo).timestamp(),datetime.combine(end,datetime.min.time(),tzinfo=n.tzinfo).timestamp())).fetchall()
-    total=len(rows); wins=sum(1 for r in rows if r[0] in ("WIN","TP3")); losses=sum(1 for r in rows if r[0]=="SL")
-    message=(f"📊 <b>ОТЧЁТ ЗА НЕДЕЛЮ</b>\n\nСигналов пришло: <b>{total}</b>\nЗакрылось в плюс: <b>{wins}</b>\nЗакрылось в минус: <b>{losses}</b>")
+
     try:
-        bot.send_message(CHANNEL_ID,message,parse_mode="HTML")
-        db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)",(key,"1")); db.commit()
+        bot.send_message(
+            CHANNEL_ID,
+            report_week_period(start_ts, end_ts),
+            parse_mode="HTML"
+        )
+        db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)", (key, "1"))
+        db.commit()
+        log.info("WEEKLY REPORT SENT | %s", week_key)
     except Exception:
-        log.exception("WEEKLY REPORT FAILED")
+        log.exception("WEEKLY REPORT SEND FAILED")
 
 
 # ============================================================
@@ -3865,83 +4194,83 @@ def load_candles_for_symbol(inst_id):
 
 
 def scan_market():
-    global signals_today, last_fast_pass_ts, watchlist
+    global signals_today
+    n=local_now(); day_key=n.date().isoformat()
+    state_key="signals_day"
+    saved=db.execute("SELECT value FROM bot_state WHERE key=?",(state_key,)).fetchone()
+    if not saved or saved[0]!=day_key:
+        signals_today=0
+        db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)",(state_key,day_key)); db.commit()
+    if signals_today>=MAX_SIGNALS_PER_DAY: return
 
-    n = local_now()
-    day_key = n.date().isoformat()
-    state_key = "signals_day"
-    saved_day = db.execute("SELECT value FROM bot_state WHERE key=?", (state_key,)).fetchone()
-    if not saved_day or saved_day[0] != day_key:
-        signals_today = 0
-        db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)", (state_key, day_key))
-        db.commit()
+    instruments=get_instruments(); tickers=get_tickers()
 
-    if signals_today >= MAX_SIGNALS_PER_DAY:
-        return
+    # ENGINE A — существующие паттерны
+    broad=[]
+    for inst_id,ticker in tickers.items():
+        if inst_id not in instruments: continue
+        vol=float(ticker.get("vol24h_usd",0) or 0)
+        if vol<MIN_CANDIDATE_VOLUME_USD: continue
+        hi=float(ticker.get("high24h",0) or 0); lo=float(ticker.get("low24h",0) or 0); last=float(ticker.get("last",0) or 0)
+        r24=(hi-lo)/last*100 if last>0 and hi>lo else 0.0
+        broad.append((vol,r24,inst_id,ticker))
+    broad.sort(key=lambda x:(x[1],x[0]),reverse=True); broad=broad[:FAST_CANDIDATE_POOL]
 
-    instruments = get_instruments()
-    tickers = get_tickers()
-    candidates = []
-
-    for inst_id, ticker in tickers.items():
-        if inst_id not in instruments:
-            continue
-        volume = float(ticker.get("vol24h_usd", 0) or 0)
-        if volume < max(MIN_24H_VOLUME_USD, 50_000_000):
-            continue
-        candidates.append((fast_market_score(ticker), volume, inst_id, ticker))
-
-    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-
-    now = now_ts()
-    if now - last_fast_pass_ts >= FAST_PASS_SECONDS or not watchlist:
-        watchlist = candidates[:DEEP_CANDIDATES] if DEEP_CANDIDATES > 0 else candidates
-        last_fast_pass_ts = now
-        log.info("WATCHLIST UPDATED | liquid=%s | deep=%s", len(candidates), len(watchlist))
-
-    setups = []
-    for _, _, inst_id, ticker in watchlist:
-        if not can_send_new_signal(inst_id):
-            continue
+    setups=[]
+    for _,_,inst_id,ticker in broad:
+        if not can_send_new_signal(inst_id): continue
         try:
-            candles = load_candles_for_symbol(inst_id)
-            setup = analyze_symbol_with_patterns(inst_id, ticker, candles)
-            if setup is not None and setup.score >= MIN_SCORE:
-                setups.append(setup)
+            candles=load_candles_for_symbol(inst_id)
+            setup=analyze_symbol_with_patterns(inst_id,ticker,candles)
+            if setup is not None: setups.append(setup)
         except Exception as exc:
-            log.warning("ANALYZE FAILED | %s | %s", inst_id, exc)
+            log.warning("PATTERN ANALYZE FAILED | %s | %s",inst_id,exc)
 
-    setups.sort(key=lambda x: x.score, reverse=True)
-    final_setups = setups[:FINAL_SIGNAL_CANDIDATES] if FINAL_SIGNAL_CANDIDATES > 0 else setups
+    # ENGINE B — TOP MOVERS REVERSAL. Threshold is real: no weak +/-12% fillers.
+    if TOP_MOVER_ENABLED:
+        gainers=[(i,t) for i,t in tickers.items() if i in instruments and float(t.get("vol24h_usd",0) or 0)>=MIN_CANDIDATE_VOLUME_USD and float(t.get("change24h_pct",0) or 0)>=TOP_MOVER_MIN_GAIN_PCT]
+        losers=[(i,t) for i,t in tickers.items() if i in instruments and float(t.get("vol24h_usd",0) or 0)>=MIN_CANDIDATE_VOLUME_USD and float(t.get("change24h_pct",0) or 0)<=TOP_MOVER_MIN_LOSS_PCT]
+        gainers.sort(key=lambda x:float(x[1].get("change24h_pct",0) or 0),reverse=True); gainers=gainers[:TOP_MOVER_GAINER_COUNT]
+        losers.sort(key=lambda x:float(x[1].get("change24h_pct",0) or 0)); losers=losers[:TOP_MOVER_LOSER_COUNT]
+        log.info("TOP MOVERS REVERSAL | gainers=%d/%d >=%.1f%% | losers=%d/%d <=%.1f%%",len(gainers),TOP_MOVER_GAINER_COUNT,TOP_MOVER_MIN_GAIN_PCT,len(losers),TOP_MOVER_LOSER_COUNT,TOP_MOVER_MIN_LOSS_PCT)
+        for inst_id,ticker in [(i,t) for i,t in gainers+losers]:
+            if signals_today>=MAX_SIGNALS_PER_DAY or not can_send_new_signal(inst_id): continue
+            try:
+                candles=load_candles_for_symbol(inst_id)
+                setup=build_top_mover_reversal_setup(inst_id,ticker,candles)
+                if setup is not None: setups.append(setup)
+            except Exception as exc:
+                log.warning("TOP MOVER ANALYZE FAILED | %s | %s",inst_id,exc)
 
-    for setup in final_setups:
-        if not can_send_new_signal(setup.inst_id):
-            continue
-        photo_id, text_id = send_photo_and_text(setup, setup.setup_state)
-        if photo_id or text_id:
-            save_signal(setup, setup.setup_state)
-            if setup.setup_state == "READY":
-                ready_setups[setup.inst_id] = ActiveReady(
-                    setup=setup,
-                    created_at=now_ts(),
-                    expires_at=now_ts() + READY_TTL_MINUTES * 60,
-                    telegram_message_id=text_id,
-                    photo_message_id=photo_id,
-                )
-            signals_hour.append(now_ts())
-            signals_today += 1
-            if signals_today >= MAX_SIGNALS_PER_DAY:
-                break
+    # If both engines see the same symbol, the dedicated reversal engine wins.
+    dedup={}
+    for setup in setups:
+        old=dedup.get(setup.inst_id)
+        if old is None or (setup.strategy=="TOP MOVERS REVERSAL" and old.strategy!="TOP MOVERS REVERSAL") or setup.score>old.score:
+            dedup[setup.inst_id]=setup
+    setups=list(dedup.values())
+    setups.sort(key=lambda x:(x.strategy=="TOP MOVERS REVERSAL",x.score),reverse=True)
+    log.info("QUANTUM SCAN | market=%d | pattern_pool=%d | final_setups=%d",len(tickers),len(broad),len(setups))
+
+    for setup in setups:
+        if signals_today>=MAX_SIGNALS_PER_DAY or not can_send_new_signal(setup.inst_id): continue
+        photo_id,text_id=send_photo_and_text(setup,"READY")
+        if photo_id:
+            save_signal(setup,"READY")
+            ready_setups[setup.inst_id]=ActiveReady(setup=setup,created_at=now_ts(),expires_at=now_ts()+READY_TTL_MINUTES*60,telegram_message_id=text_id,photo_message_id=photo_id)
+            signals_hour.append(now_ts()); signals_today+=1
+            log.info("SIGNAL SENT | %s | %s | strategy=%s | score=%s",setup.coin,setup.direction,setup.strategy,setup.score)
+            if signals_today>=MAX_SIGNALS_PER_DAY: break
 
 
 def main():
-    log.info("QUANTUM SCALPER V5 PATTERN STARTED")
+    log.info("QUANTUM PATTERN ENGINE V2 STARTED")
     while True:
         try:
             send_morning_message()
             expire_old_ready()
             update_signal_results()
-            send_reports_once_per_day()
+            send_weekly_report_once()
             scan_market()
         except KeyboardInterrupt:
             log.info("STOPPED")

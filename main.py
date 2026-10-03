@@ -76,7 +76,15 @@ MIN_RISK_PCT = float(os.getenv('MIN_RISK_PCT', '0.20'))
 TP1_R = float(os.getenv('TP1_R', '1.20'))
 TP2_R = float(os.getenv('TP2_R', '2.00'))
 TP3_R = float(os.getenv('TP3_R', '3.00'))
-MIN_SCORE = int(os.getenv('MIN_SCORE', '82'))
+MIN_SCORE = int(os.getenv('MIN_SCORE', '84'))
+
+# ---------------- derivative / fuel engine ----------------
+OI_REFRESH_SECONDS = int(os.getenv('OI_REFRESH_SECONDS', '20'))
+FUNDING_CACHE_SECONDS = int(os.getenv('FUNDING_CACHE_SECONDS', '180'))
+MIN_OI_CHANGE_SQUEEZE_PCT = float(os.getenv('MIN_OI_CHANGE_SQUEEZE_PCT', '0.35'))
+MIN_FUNDING_EXTREME_PCT = float(os.getenv('MIN_FUNDING_EXTREME_PCT', '0.015'))
+MIN_FUEL_SCORE = int(os.getenv('MIN_FUEL_SCORE', '76'))
+
 
 # ---------------- runtime ----------------
 SCAN_INTERVAL_SECONDS = int(os.getenv('SCAN_INTERVAL_SECONDS', '30'))
@@ -139,6 +147,11 @@ class Setup:
     candles_5m: List[Candle]
     points: List[Tuple[int, float, str]] = field(default_factory=list)
     hold_hours: str = '1–8 ч'
+    oi_usd: float = 0.0
+    oi_change_pct: float = 0.0
+    funding_rate_pct: float = 0.0
+    fuel_score: int = 0
+    runner_note: str = 'RUNNER: сопровождение по структуре'
 
 @dataclass
 class PendingSignal:
@@ -161,6 +174,11 @@ class ActiveSignal:
 pending: Dict[str, PendingSignal] = {}
 active: Dict[str, ActiveSignal] = {}
 candle_cache: Dict[Tuple[str, str], Tuple[float, List[Candle]]] = {}
+oi_cache: Dict[str, Tuple[float, Dict[str, float]]] = {'all': (0.0, {})}
+funding_cache: Dict[str, Tuple[float, float]] = {}
+oi_previous: Dict[str, Tuple[float, float]] = {}  # inst_id -> (timestamp, oi_usd)
+scan_rejects = {'low_fuel': 0, 'no_sweep': 0, 'no_breakout': 0, 'risk': 0, 'chase': 0, 'score': 0}
+
 
 # ============================================================
 # DATABASE + MIGRATION
@@ -406,6 +424,216 @@ def get_candles(inst_id: str, bar: str, limit: int = 180) -> List[Candle]:
     return out
 
 
+def get_open_interest_all() -> Dict[str, float]:
+    now = now_ts()
+    cached_ts, cached = oi_cache.get('all', (0.0, {}))
+    if cached and now - cached_ts < OI_REFRESH_SECONDS:
+        return cached
+    try:
+        rows = okx_get('/api/v5/public/open-interest', {'instType': 'SWAP'}).get('data', [])
+        out = {}
+        for x in rows:
+            iid = str(x.get('instId', ''))
+            if not iid.endswith('-USDT-SWAP'):
+                continue
+            try:
+                out[iid] = float(x.get('oiUsd') or 0.0)
+            except (TypeError, ValueError):
+                continue
+        oi_cache['all'] = (now, out)
+        return out
+    except Exception as exc:
+        log.warning('OI FAILED | %s', exc)
+        return cached
+
+
+def get_funding_rate(inst_id: str) -> float:
+    now = now_ts()
+    cached = funding_cache.get(inst_id)
+    if cached and now - cached[0] < FUNDING_CACHE_SECONDS:
+        return cached[1]
+    try:
+        row = okx_get('/api/v5/public/funding-rate', {'instId': inst_id}).get('data', [])
+        rate = float(row[0].get('fundingRate') or 0.0) if row else 0.0
+        funding_cache[inst_id] = (now, rate)
+        return rate
+    except Exception as exc:
+        log.debug('FUNDING FAILED | %s | %s', inst_id, exc)
+        return cached[1] if cached else 0.0
+
+
+def derivative_snapshot(inst_id: str, ticker: dict) -> Dict[str, float]:
+    oi_map = get_open_interest_all()
+    oi = float(oi_map.get(inst_id, 0.0))
+    now = now_ts()
+    old = oi_previous.get(inst_id)
+    oi_change = 0.0
+    if old and old[1] > 0:
+        oi_change = (oi / old[1] - 1.0) * 100.0
+    if oi > 0:
+        oi_previous[inst_id] = (now, oi)
+    funding = get_funding_rate(inst_id) * 100.0
+    return {'oi_usd': oi, 'oi_change_pct': oi_change, 'funding_rate_pct': funding}
+
+
+def fuel_score(direction: str, ticker: dict, c5: List[Candle], c15: List[Candle], vr: float, deriv: dict) -> int:
+    """Score the ingredients that can sustain an outsized move; not a profit forecast."""
+    move = abs(ticker['change24h_pct'])
+    m1, m2, _ = impulse_stats(c5)
+    atr5p, atr15p = atr_pct(c5), atr_pct(c15)
+    score = 0
+    score += int(clamp(move / 40.0 * 18.0, 0, 18))
+    score += int(clamp(abs(m1) / 8.0 * 12.0, 0, 12))
+    score += int(clamp(abs(m2) / 12.0 * 12.0, 0, 12))
+    score += int(clamp((vr - 1.0) * 10.0, 0, 12))
+    score += int(clamp(atr5p / 1.2 * 8.0, 0, 8))
+    score += int(clamp(atr15p / 3.0 * 8.0, 0, 8))
+
+    oi_delta = deriv.get('oi_change_pct', 0.0)
+    funding = deriv.get('funding_rate_pct', 0.0)
+    # Crowding context: adverse funding + OI can precede a squeeze; OI contraction
+    # during a sweep is a stronger confirmation that positions are being flushed.
+    if direction == 'LONG':
+        if funding <= -MIN_FUNDING_EXTREME_PCT: score += 8
+        if oi_delta <= -MIN_OI_CHANGE_SQUEEZE_PCT: score += 10
+        if oi_delta > 0 and funding < 0: score += 5
+    else:
+        if funding >= MIN_FUNDING_EXTREME_PCT: score += 8
+        if oi_delta <= -MIN_OI_CHANGE_SQUEEZE_PCT: score += 10
+        if oi_delta > 0 and funding > 0: score += 5
+    if ticker['range24h_pct'] >= 15: score += 5
+    return int(clamp(score, 0, 100))
+
+
+def sweep_setup(direction: str, c5: List[Candle], atr5: float):
+    """Return (level, extreme, reason) for a recent liquidity sweep/reclaim."""
+    if len(c5) < 20:
+        return None
+    cur = c5[-1]
+    window = c5[-13:-1]
+    if not window:
+        return None
+    if direction == 'LONG':
+        level = min(c.low for c in window)
+        prior = max(window, key=lambda c: c.low)
+        swept = cur.low < level - atr5 * 0.05
+        reclaim = cur.close > level and cur.close > cur.open
+        lower_wick = min(cur.open, cur.close) - cur.low
+        body = max(abs(cur.close-cur.open), cur.close*1e-8)
+        rejection = lower_wick / body >= 1.15 and close_location(cur) >= 0.62
+        if swept and reclaim and rejection:
+            return level, cur.low, 'снятие ликвидности под локальным минимумом → возврат выше уровня'
+    else:
+        level = max(c.high for c in window)
+        swept = cur.high > level + atr5 * 0.05
+        reclaim = cur.close < level and cur.close < cur.open
+        upper_wick = cur.high - max(cur.open, cur.close)
+        body = max(abs(cur.close-cur.open), cur.close*1e-8)
+        rejection = upper_wick / body >= 1.15 and close_location(cur) <= 0.38
+        if swept and reclaim and rejection:
+            return level, cur.high, 'снятие ликвидности над локальным максимумом → возврат ниже уровня'
+    return None
+
+
+def build_liquidity_sweep(iid, ticker, data) -> Optional[Setup]:
+    c5, c15, c1h = data['5m'], data['15m'], data['1h']
+    if min(len(c5), len(c15), len(c1h)) < 80:
+        return None
+    if abs(ticker['change24h_pct']) < 10 or ticker['range24h_pct'] < 7:
+        return None
+    atr5 = atr(c5)
+    vr = vol_ratio(c5)
+    direction = 'LONG' if ticker['change24h_pct'] < 0 else 'SHORT'
+    sweep = sweep_setup(direction, c5, atr5)
+    if not sweep:
+        scan_rejects['no_sweep'] += 1
+        return None
+    level, extreme, sweep_reason = sweep
+    if vr < 1.20:
+        return None
+    deriv = derivative_snapshot(iid, ticker)
+    fuel = fuel_score(direction, ticker, c5, c15, vr, deriv)
+    # OI/funding are confirmations, not hard prerequisites because REST OI history
+    # begins accumulating only after the process starts.
+    oi_flush = deriv['oi_change_pct'] <= -MIN_OI_CHANGE_SQUEEZE_PCT
+    funding_support = (direction == 'LONG' and deriv['funding_rate_pct'] < 0) or (direction == 'SHORT' and deriv['funding_rate_pct'] > 0)
+    if fuel < MIN_FUEL_SCORE:
+        scan_rejects['low_fuel'] += 1
+        return None
+
+    entry = c5[-1].close
+    buffer = max(atr5 * 0.18, entry * 0.0015)
+    sl = extreme - buffer if direction == 'LONG' else extreme + buffer
+    risk_pct = abs(entry-sl)/max(entry,1e-12)*100
+    if not validate_risk(entry, sl):
+        scan_rejects['risk'] += 1
+        return None
+    if abs(entry-level)/max(entry,1e-12)*100 > 1.5:
+        scan_rejects['chase'] += 1
+        return None
+    tps = target_levels(direction, entry, sl, c15)
+    if not tps:
+        return None
+    score = 70
+    score += min(12, fuel // 7)
+    score += 7 if oi_flush else 0
+    score += 5 if funding_support else 0
+    score += 5 if vr >= 1.8 else 0
+    score += 5 if abs(ticker['change24h_pct']) >= 25 else 0
+    score = int(clamp(score, 0, 99))
+    if score < MIN_SCORE:
+        scan_rejects['score'] += 1
+        return None
+    lo, hi = entry_zone(entry, atr5, direction)
+    reason = f'{sweep_reason}; volume x{vr:.2f}; fuel {fuel}/100'
+    if oi_flush:
+        reason += f'; OI {deriv["oi_change_pct"]:+.2f}% — flush'
+    if funding_support:
+        reason += f'; funding {deriv["funding_rate_pct"]:+.3f}%'
+    return Setup(iid,get_coin(iid),direction,'LIQUIDITY SWEEP',f"LIQUIDITY SWEEP · {'ПЕРВЫЙ ОТСКОК' if direction=='LONG' else 'ПЕРВАЯ ОТБИВКА'}",level,
+                 'LIQUIDITY LOW' if direction=='LONG' else 'LIQUIDITY HIGH',lo,hi,sl,*tps,score,reason,
+                 ticker['vol24h_usd'],ticker['change24h_pct'],ticker['range24h_pct'],atr_pct(c5),atr_pct(c15),vr,c5[-96:],
+                 [(len(c5[-96:])-1,level,'SWEEP LEVEL'),(len(c5[-96:])-1,entry,'TRIGGER')],'1–12 ч',
+                 deriv['oi_usd'],deriv['oi_change_pct'],deriv['funding_rate_pct'],fuel,'RUNNER: держать, пока структура и импульс сохраняются')
+
+
+def build_acceleration(iid, ticker, data) -> Optional[Setup]:
+    c5,c15,c1h=data['5m'],data['15m'],data['1h']
+    if min(len(c5),len(c15),len(c1h)) < 80:
+        return None
+    vr=vol_ratio(c5)
+    if vr < 1.5:
+        return None
+    m1,m2,_=impulse_stats(c5)
+    if abs(m1) < 2.5 or abs(m2) < 4.0:
+        return None
+    direction='LONG' if m1>0 and m2>0 else 'SHORT' if m1<0 and m2<0 else None
+    if not direction:
+        return None
+    cur,prev=c5[-1],c5[-2]
+    if direction=='LONG' and not(cur.close>cur.open and cur.close>prev.high and close_location(cur)>=0.68): return None
+    if direction=='SHORT' and not(cur.close<cur.open and cur.close<prev.low and close_location(cur)<=0.32): return None
+    deriv=derivative_snapshot(iid,ticker)
+    fuel=fuel_score(direction,ticker,c5,c15,vr,deriv)
+    if fuel < MIN_FUEL_SCORE+4: return None
+    entry=cur.close
+    # Do not chase an already extended candle.
+    body=abs(cur.close-cur.open)
+    if body/max(entry,1e-12)*100 > max(2.8, atr_pct(c5)*3.0): return None
+    sl=(min(c.low for c in c5[-4:])-atr(c5)*0.25) if direction=='LONG' else (max(c.high for c in c5[-4:])+atr(c5)*0.25)
+    if not validate_risk(entry,sl): return None
+    tps=target_levels(direction,entry,sl,c15)
+    if not tps: return None
+    score=int(clamp(72 + min(15,fuel//6) + (6 if vr>=2 else 0) + (5 if abs(ticker['change24h_pct'])>=20 else 0),0,99))
+    if score<MIN_SCORE: return None
+    lo,hi=entry_zone(entry,atr(c5),direction)
+    reason=f'ускорение импульса {m1:+.2f}%/1ч, {m2:+.2f}%/2ч; volume x{vr:.2f}; fuel {fuel}/100'
+    if deriv['oi_change_pct']>0: reason+=f'; OI {deriv["oi_change_pct"]:+.2f}%'
+    return Setup(iid,get_coin(iid),direction,'MOMENTUM ACCELERATION','УСКОРЕНИЕ ИМПУЛЬСА',entry,'BREAKOUT TRIGGER',lo,hi,sl,*tps,score,reason,
+                 ticker['vol24h_usd'],ticker['change24h_pct'],ticker['range24h_pct'],atr_pct(c5),atr_pct(c15),vr,c5[-96:],
+                 [(len(c5[-96:])-2,prev.close,'IMPULSE'),(len(c5[-96:])-1,entry,'TRIGGER')],'1–8 ч',
+                 deriv['oi_usd'],deriv['oi_change_pct'],deriv['funding_rate_pct'],fuel,'RUNNER: сопровождение по структуре')
+
 def load_symbol(inst_id: str) -> Dict[str, List[Candle]]:
     return {
         '1h': get_candles(inst_id, '1H', 160),
@@ -557,42 +785,32 @@ def validate_risk(entry: float, sl: float) -> bool:
 
 
 def target_levels(direction: str, entry: float, sl: float, c15: List[Candle]):
-    risk = abs(entry - sl)
+    """Dynamic structural targets. No fixed 5/10/20% profit ceiling."""
+    risk = abs(entry-sl)
     if risk <= 0:
         return None
-    levels = cluster_levels(c15)
-    if direction == 'LONG':
-        structural = sorted([p for p, k, t in levels if p > entry])
-        sign = 1
+    levels = cluster_levels(c15, tolerance_pct=0.30)
+    sign = 1 if direction == 'LONG' else -1
+    structural = sorted([p for p,k,t in levels if sign*(p-entry) > 0], key=lambda p: sign*(p-entry))
+    # TP1 is the first meaningful liquidity/structure pocket, TP2 the next,
+    # TP3 the extended structure. If structure is sparse, use R multiples only
+    # as fallback — never as a profit-percent target.
+    candidates=[p for p in structural if sign*(p-entry) >= risk*1.15]
+    if direction=='LONG':
+        fallback=[entry+risk*1.5, entry+risk*3.0, entry+risk*6.0]
     else:
-        structural = sorted([p for p, k, t in levels if p < entry], reverse=True)
-        sign = -1
-
-    def r_target(mult):
-        return entry + sign * risk * mult
-
-    candidates = [p for p in structural if sign * (p - entry) >= risk * 0.9]
-    tp1 = r_target(TP1_R)
-    tp2 = r_target(TP2_R)
-    tp3 = r_target(TP3_R)
-    if candidates:
-        if sign * (candidates[0] - entry) >= risk * 0.95:
-            tp1 = candidates[0]
-        if len(candidates) >= 2 and sign * (candidates[1] - entry) >= risk * 1.5:
-            tp2 = candidates[1]
-        if len(candidates) >= 3 and sign * (candidates[2] - entry) >= risk * 2.4:
-            tp3 = candidates[2]
-
-    # Force monotonic targets.
-    if direction == 'LONG':
-        tp1 = max(tp1, entry + risk)
-        tp2 = max(tp2, tp1 + risk * 0.4)
-        tp3 = max(tp3, tp2 + risk * 0.4)
-    else:
-        tp1 = min(tp1, entry - risk)
-        tp2 = min(tp2, tp1 - risk * 0.4)
-        tp3 = min(tp3, tp2 - risk * 0.4)
-    return tp1, tp2, tp3
+        fallback=[entry-risk*1.5, entry-risk*3.0, entry-risk*6.0]
+    chosen=[]
+    for p in candidates[:3]:
+        if not chosen or sign*(p-chosen[-1]) >= risk*0.6:
+            chosen.append(p)
+    while len(chosen)<3:
+        idx=len(chosen)
+        candidate=fallback[idx]
+        if chosen and sign*(candidate-chosen[-1]) < risk*0.6:
+            candidate=chosen[-1] + sign*risk*max(0.8, 0.6*(idx+1))
+        chosen.append(candidate)
+    return tuple(chosen[:3])
 
 
 def entry_zone(entry: float, atr5: float, direction: str):
@@ -758,13 +976,17 @@ def build_breakout(iid, ticker, data) -> Optional[Setup]:
     tps = target_levels(direction, entry, sl, c15)
     if not tps:
         return None
-    score = final_score(base_score(ticker,c5,c15,vr), [8, min(6, touches), 5 if vr >= 1.8 else 0], [])
-    if score < MIN_SCORE:
+    deriv=derivative_snapshot(iid,ticker)
+    fuel=fuel_score(direction,ticker,c5,c15,vr,deriv)
+    score = final_score(base_score(ticker,c5,c15,vr), [8, min(6, touches), 5 if vr >= 1.8 else 0, min(10, fuel//8)], [8 if fuel < MIN_FUEL_SCORE else 0])
+    if score < MIN_SCORE or fuel < MIN_FUEL_SCORE-4:
         return None
+    reason += f'; fuel {fuel}/100; OI {deriv["oi_change_pct"]:+.2f}%; funding {deriv["funding_rate_pct"]:+.3f}%'
     lo, hi = entry_zone(entry, atr(c5), direction)
     return Setup(iid,get_coin(iid),direction,'BREAKOUT + RETEST','ПРОБОЙ + РЕТЕСТ',level,'BROKEN LEVEL',lo,hi,sl,*tps,score,reason,
                  ticker['vol24h_usd'],ticker['change24h_pct'],ticker['range24h_pct'],atr_pct(c5),atr_pct(c15),vr,c5[-96:],
-                 [(len(c5[-96:])-2,level,'RETEST'),(len(c5[-96:])-1,entry,'CONFIRM')],'1–6 ч')
+                 [(len(c5[-96:])-2,level,'RETEST'),(len(c5[-96:])-1,entry,'CONFIRM')],'1–8 ч',
+                 deriv['oi_usd'],deriv['oi_change_pct'],deriv['funding_rate_pct'],fuel,'RUNNER: сопровождение по структуре')
 
 # ============================================================
 # STRATEGY 3 — TREND PULLBACK
@@ -871,7 +1093,7 @@ def build_mean_reversion(iid,ticker,data)->Optional[Setup]:
                  [(len(c5[-96:])-1,entry,'REVERSAL')],'1–6 ч')
 
 
-STRATEGIES=(build_reversal,build_breakout,build_pullback,build_mean_reversion)
+STRATEGIES=(build_liquidity_sweep, build_breakout, build_acceleration)
 
 # ============================================================
 # TELEGRAM VOTES
@@ -990,12 +1212,14 @@ def build_signal_text(s:Setup)->str:
         f'📌 <b>Сетап:</b> {s.pattern_name}\n'
         f'📈 <b>24H:</b> {s.change24:+.1f}% · Range {s.range24:.1f}%\n'
         f'⚡ <b>ATR:</b> 5M {s.atr5_pct:.2f}% · 15M {s.atr15_pct:.2f}%\n'
-        f'💧 <b>Volume:</b> x{s.volume_ratio:.2f} · Turnover ${s.volume_24h/1_000_000:.1f}M\n\n'
+        f'💧 <b>Volume:</b> x{s.volume_ratio:.2f} · Turnover ${s.volume_24h/1_000_000:.1f}M\n'
+        f'🔥 <b>Fuel:</b> {s.fuel_score}/100 · OI {s.oi_change_pct:+.2f}% · Funding {s.funding_rate_pct:+.3f}%\n\n'
         f'🎯 <b>Вход:</b> <code>{fmt_price(s.entry_low)} – {fmt_price(s.entry_high)}</code>\n'
         f'🛑 <b>Стоп:</b> <code>{fmt_price(s.sl)}</code> · риск {risk:.2f}%\n'
         f'🎯 <b>TP1:</b> <code>{fmt_price(s.tp1)}</code>\n'
         f'🎯 <b>TP2:</b> <code>{fmt_price(s.tp2)}</code> · RR 1:{rr2:.1f}\n'
-        f'🎯 <b>TP3:</b> <code>{fmt_price(s.tp3)}</code>\n\n'
+        f'🎯 <b>TP3:</b> <code>{fmt_price(s.tp3)}</code>\n'
+        f'🚀 <b>{s.runner_note}</b>\n\n'
         f'🧠 <b>Почему:</b> {s.reason}.\n'
         f'⏱ <b>Ожидаемое удержание:</b> {s.hold_hours}\n\n'
         f'⚠️ Внимательно проверьте сделку перед входом.\n'
@@ -1192,7 +1416,7 @@ def scan_market():
         if s.inst_id not in best or s.score>best[s.inst_id].score:
             best[s.inst_id]=s
     final=sorted(best.values(),key=lambda x:x.score,reverse=True)
-    log.info('SCAN | market=%d candidates=%d raw=%d final=%d',len(tickers),len(candidates),len(raw),len(final))
+    log.info('SCAN | market=%d candidates=%d raw=%d final=%d | rejects=%s',len(tickers),len(candidates),len(raw),len(final),scan_rejects)
 
     for s in final:
         if not can_send(s.inst_id):
@@ -1251,9 +1475,9 @@ def startup_healthcheck():
 
 def main():
     log.info('============================================================')
-    log.info('QUANTUM INTRADAY SWING ENGINE V2 STARTED')
-    log.info('Strategies: Extreme Reversal | Breakout+Retest | Pullback | Mean Reversion')
-    log.info('Universe: gainers | losers | volatile | new active | small alts')
+    log.info('QUANTUM BIG-MOVE ENGINE V3 STARTED')
+    log.info('Strategies: Liquidity Sweep | Breakout+Retest | Momentum Acceleration')
+    log.info('Universe: full SWAP market → gainers | losers | volatile | new active | small alts')
     log.info('============================================================')
     startup_healthcheck()
     start_telegram_polling()

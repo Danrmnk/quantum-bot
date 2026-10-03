@@ -1139,13 +1139,50 @@ def on_vote(call):
             pass
 
 
+# Telegram polling configuration.
+# IMPORTANT: one bot token can have only ONE active getUpdates consumer.
+# If another process/person is running this same bot token, Telegram returns 409.
+TELEGRAM_POLLING_ENABLED = os.getenv('TELEGRAM_POLLING_ENABLED', '1').strip().lower() not in ('0', 'false', 'no', 'off')
+
+
 def start_telegram_polling():
+    if not TELEGRAM_POLLING_ENABLED:
+        log.info('TELEGRAM POLLING DISABLED | TELEGRAM_POLLING_ENABLED=0')
+        return
+
     def runner():
-        try:
-            log.info('TELEGRAM POLLING START')
-            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-        except Exception:
-            log.exception('TELEGRAM POLLING STOPPED')
+        log.info('TELEGRAM POLLING START')
+        while True:
+            try:
+                # Use polling() instead of infinity_polling() so the 409 can be
+                # handled here instead of being hidden inside an endless retry loop.
+                bot.polling(
+                    non_stop=False,
+                    skip_pending=True,
+                    timeout=20,
+                    long_polling_timeout=20,
+                    allowed_updates=None,
+                )
+                # Normal polling return is not expected for a long-running bot.
+                log.warning('TELEGRAM POLLING RETURNED | retrying in 5s')
+                time.sleep(5)
+            except Exception as exc:
+                error_code = getattr(exc, 'error_code', None)
+                text = str(exc)
+                is_409 = error_code == 409 or ('409' in text and 'Conflict' in text)
+
+                if is_409:
+                    # Another instance owns getUpdates. Do NOT crash the scanner
+                    # and do NOT fight it forever. Market scanning can continue.
+                    log.error(
+                        'TELEGRAM 409 CONFLICT | another instance is polling this bot token. '
+                        'Telegram polling disabled for this process; market scanner continues.'
+                    )
+                    return
+
+                log.exception('TELEGRAM POLLING ERROR | %s', exc)
+                time.sleep(10)
+
     t=threading.Thread(target=runner,name='telegram-polling',daemon=True)
     t.start()
 

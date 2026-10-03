@@ -59,31 +59,31 @@ DEEP_SCAN_LIMIT = int(os.getenv('DEEP_SCAN_LIMIT', '70'))
 MIN_ACTIVE_24H_RANGE_PCT = float(os.getenv('MIN_ACTIVE_24H_RANGE_PCT', '5.0'))
 
 # ---------------- momentum/reversal ----------------
-MIN_24H_MOVE_FOR_REVERSAL = float(os.getenv('MIN_24H_MOVE_FOR_REVERSAL', '15'))
-STRONG_24H_MOVE = float(os.getenv('STRONG_24H_MOVE', '30'))
-MIN_2H_IMPULSE = float(os.getenv('MIN_2H_IMPULSE', '5'))
+MIN_24H_MOVE_FOR_REVERSAL = float(os.getenv('MIN_24H_MOVE_FOR_REVERSAL', '12'))
+STRONG_24H_MOVE = float(os.getenv('STRONG_24H_MOVE', '25'))
+MIN_2H_IMPULSE = float(os.getenv('MIN_2H_IMPULSE', '3.5'))
 MIN_1H_IMPULSE = float(os.getenv('MIN_1H_IMPULSE', '3'))
 MIN_ATR_5M_PCT = float(os.getenv('MIN_ATR_5M_PCT', '0.18'))
 MIN_ATR_15M_PCT = float(os.getenv('MIN_ATR_15M_PCT', '0.45'))
-MIN_VOLUME_RATIO = float(os.getenv('MIN_VOLUME_RATIO', '1.20'))
-MIN_REVERSAL_VOLUME_RATIO = float(os.getenv('MIN_REVERSAL_VOLUME_RATIO', '1.15'))
+MIN_VOLUME_RATIO = float(os.getenv('MIN_VOLUME_RATIO', '1.05'))
+MIN_REVERSAL_VOLUME_RATIO = float(os.getenv('MIN_REVERSAL_VOLUME_RATIO', '1.05'))
 
 # ---------------- strategy/risk ----------------
-MIN_BREAKOUT_VOLUME = float(os.getenv('MIN_BREAKOUT_VOLUME', '1.35'))
-MAX_ENTRY_CHASE_PCT = float(os.getenv('MAX_ENTRY_CHASE_PCT', '1.00'))
+MIN_BREAKOUT_VOLUME = float(os.getenv('MIN_BREAKOUT_VOLUME', '1.15'))
+MAX_ENTRY_CHASE_PCT = float(os.getenv('MAX_ENTRY_CHASE_PCT', '1.50'))
 MAX_RISK_PCT = float(os.getenv('MAX_RISK_PCT', '1.00'))
-MIN_RISK_PCT = float(os.getenv('MIN_RISK_PCT', '0.20'))
+MIN_RISK_PCT = float(os.getenv('MIN_RISK_PCT', '0.15'))
 TP1_R = float(os.getenv('TP1_R', '1.20'))
 TP2_R = float(os.getenv('TP2_R', '2.00'))
 TP3_R = float(os.getenv('TP3_R', '3.00'))
-MIN_SCORE = int(os.getenv('MIN_SCORE', '84'))
+MIN_SCORE = int(os.getenv('MIN_SCORE', '78'))
 
 # ---------------- derivative / fuel engine ----------------
 OI_REFRESH_SECONDS = int(os.getenv('OI_REFRESH_SECONDS', '20'))
 FUNDING_CACHE_SECONDS = int(os.getenv('FUNDING_CACHE_SECONDS', '180'))
 MIN_OI_CHANGE_SQUEEZE_PCT = float(os.getenv('MIN_OI_CHANGE_SQUEEZE_PCT', '0.35'))
 MIN_FUNDING_EXTREME_PCT = float(os.getenv('MIN_FUNDING_EXTREME_PCT', '0.015'))
-MIN_FUEL_SCORE = int(os.getenv('MIN_FUEL_SCORE', '76'))
+MIN_FUEL_SCORE = int(os.getenv('MIN_FUEL_SCORE', '64'))
 
 
 # ---------------- runtime ----------------
@@ -520,7 +520,7 @@ def sweep_setup(direction: str, c5: List[Candle], atr5: float):
         reclaim = cur.close > level and cur.close > cur.open
         lower_wick = min(cur.open, cur.close) - cur.low
         body = max(abs(cur.close-cur.open), cur.close*1e-8)
-        rejection = lower_wick / body >= 1.15 and close_location(cur) >= 0.62
+        rejection = lower_wick / body >= 0.85 and close_location(cur) >= 0.56
         if swept and reclaim and rejection:
             return level, cur.low, 'снятие ликвидности под локальным минимумом → возврат выше уровня'
     else:
@@ -529,9 +529,39 @@ def sweep_setup(direction: str, c5: List[Candle], atr5: float):
         reclaim = cur.close < level and cur.close < cur.open
         upper_wick = cur.high - max(cur.open, cur.close)
         body = max(abs(cur.close-cur.open), cur.close*1e-8)
-        rejection = upper_wick / body >= 1.15 and close_location(cur) <= 0.38
+        rejection = upper_wick / body >= 0.85 and close_location(cur) <= 0.44
         if swept and reclaim and rejection:
             return level, cur.high, 'снятие ликвидности над локальным максимумом → возврат ниже уровня'
+    return None
+
+
+def early_reversal_setup(direction: str, c5: List[Candle], atr5: float):
+    """Less rigid reversal trigger: recent extreme + rejection/reclaim over 1-2 candles."""
+    if len(c5) < 25 or atr5 <= 0:
+        return None
+    recent = c5[-13:-1]
+    if not recent:
+        return None
+    cur = c5[-1]
+    prev = c5[-2]
+    if direction == 'LONG':
+        level = min(c.low for c in recent)
+        extreme = min(cur.low, prev.low)
+        swept = min(cur.low, prev.low) <= level + atr5 * 0.10
+        reclaim = cur.close > level and cur.close > cur.open
+        lower = min(cur.open, cur.close) - cur.low
+        rejection = lower / max(cur.high-cur.low, 1e-12) >= 0.16 or cur.close > prev.high
+        if swept and reclaim and rejection:
+            return level, extreme, 'раннее снятие ликвидности/тест минимума → возврат выше уровня'
+    else:
+        level = max(c.high for c in recent)
+        extreme = max(cur.high, prev.high)
+        swept = max(cur.high, prev.high) >= level - atr5 * 0.10
+        reclaim = cur.close < level and cur.close < cur.open
+        upper = cur.high - max(cur.open, cur.close)
+        rejection = upper / max(cur.high-cur.low, 1e-12) >= 0.16 or cur.close < prev.low
+        if swept and reclaim and rejection:
+            return level, extreme, 'раннее снятие ликвидности/тест максимума → возврат ниже уровня'
     return None
 
 
@@ -545,6 +575,8 @@ def build_liquidity_sweep(iid, ticker, data) -> Optional[Setup]:
     vr = vol_ratio(c5)
     direction = 'LONG' if ticker['change24h_pct'] < 0 else 'SHORT'
     sweep = sweep_setup(direction, c5, atr5)
+    if not sweep:
+        sweep = early_reversal_setup(direction, c5, atr5)
     if not sweep:
         scan_rejects['no_sweep'] += 1
         return None
@@ -855,16 +887,16 @@ def build_reversal(iid, ticker, data) -> Optional[Setup]:
         return None
 
     if direction == 'SHORT':
-        retrace = pct_move(extreme.high, cur.close)
+        retrace = abs(pct_move(cur.close, extreme.high))
         upper, lower = wick_ratio(cur)
         # Strong rejection from the high + bearish confirmation.
-        if retrace < 0.55:
+        if retrace < 0.25:
             return None
-        if not (cur.close < cur.open and cur.close < prev.low * 1.001):
+        if not (cur.close < cur.open and (cur.close < prev.close or cur.low < prev.low)):
             return None
-        if body_ratio(cur) < 0.42 or close_location(cur) > 0.48:
+        if body_ratio(cur) < 0.28 or close_location(cur) > 0.55:
             return None
-        if upper < 0.10 and cur.high < max(c.high for c in c5[-6:-1]):
+        if upper < 0.06 and cur.high < max(c.high for c in c5[-6:-1]):
             return None
         sl = max(extreme.high, max(c.high for c in c5[-4:])) + atr(c5) * 0.28
         level = extreme.high
@@ -873,15 +905,15 @@ def build_reversal(iid, ticker, data) -> Optional[Setup]:
         reason = f'сильный рост 24H {ch:+.1f}% → 2H {m2h:+.1f}% → экстремум → медвежье подтверждение'
         bonuses = [7 if ch >= STRONG_24H_MOVE else 3, 6 if m2h >= 8 else 3, 5 if vr >= 1.5 else 0]
     else:
-        retrace = pct_move(cur.close, extreme.low)
+        retrace = abs(pct_move(cur.close, extreme.low))
         upper, lower = wick_ratio(cur)
-        if retrace < 0.55:
+        if retrace < 0.25:
             return None
-        if not (cur.close > cur.open and cur.close > prev.high * 0.999):
+        if not (cur.close > cur.open and (cur.close > prev.close or cur.high > prev.high)):
             return None
-        if body_ratio(cur) < 0.42 or close_location(cur) < 0.52:
+        if body_ratio(cur) < 0.28 or close_location(cur) < 0.45:
             return None
-        if lower < 0.10 and cur.low > min(c.low for c in c5[-6:-1]):
+        if lower < 0.06 and cur.low > min(c.low for c in c5[-6:-1]):
             return None
         sl = min(extreme.low, min(c.low for c in c5[-4:])) - atr(c5) * 0.28
         level = extreme.low
@@ -1093,7 +1125,7 @@ def build_mean_reversion(iid,ticker,data)->Optional[Setup]:
                  [(len(c5[-96:])-1,entry,'REVERSAL')],'1–6 ч')
 
 
-STRATEGIES=(build_liquidity_sweep, build_breakout, build_acceleration)
+STRATEGIES=(build_reversal, build_liquidity_sweep, build_breakout, build_acceleration)
 
 # ============================================================
 # TELEGRAM VOTES
@@ -1422,6 +1454,8 @@ def can_send(iid:str)->bool:
 # ============================================================
 
 def scan_market():
+    global scan_rejects
+    scan_rejects = {k: 0 for k in scan_rejects}
     instruments=get_instruments()
     tickers=get_tickers()
     candidates=build_universe(instruments,tickers)
@@ -1435,7 +1469,9 @@ def scan_market():
             c5=data['5m']; c15=data['15m']
             if len(c5)<70 or len(c15)<70:
                 continue
-            if atr_pct(c5)<MIN_ATR_5M_PCT or atr_pct(c15)<MIN_ATR_15M_PCT:
+            # 5M volatility is the trigger requirement. 15M ATR is context only;
+            # making it a hard gate was suppressing otherwise valid early moves.
+            if atr_pct(c5)<MIN_ATR_5M_PCT:
                 continue
             for builder in STRATEGIES:
                 try:

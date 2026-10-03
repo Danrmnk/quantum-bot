@@ -629,11 +629,13 @@ def update_signal_results():
         except Exception: log.exception('RESULT CHECK FAILED | %s',iid)
 
 def expire_ready():
+    # Тихое завершение ожидания входа.
+    # Уведомление о том, что точка входа не сработала, отключено.
     now=now_ts()
     for iid,ar in list(ready_setups.items()):
         if now < ar.expires_at: continue
-        db.execute('UPDATE signals SET status=\'EXPIRED\' WHERE inst_id=? AND status IN (\'READY\',\'ACTIVE\')',(iid,)); db.commit(); ready_setups.pop(iid,None)
-        send_update(ar,f'⚪ <b>SETUP EXPIRED — {ar.setup.coin}USDT</b>\nВход не активировался в отведённое окно. Рынок не догоняем.')
+        db.execute('UPDATE signals SET status=\'EXPIRED\' WHERE inst_id=? AND status IN (\'READY\',\'ACTIVE\')',(iid,)); db.commit()
+        ready_setups.pop(iid,None)
 
 # ============================================================
 # LIMITS / SCAN

@@ -72,10 +72,11 @@ MIN_REVERSAL_VOLUME_RATIO = float(os.getenv('MIN_REVERSAL_VOLUME_RATIO', '1.15')
 MIN_BREAKOUT_VOLUME = float(os.getenv('MIN_BREAKOUT_VOLUME', '1.35'))
 MAX_ENTRY_CHASE_PCT = float(os.getenv('MAX_ENTRY_CHASE_PCT', '1.00'))
 MAX_RISK_PCT = float(os.getenv('MAX_RISK_PCT', '1.00'))
-MIN_RISK_PCT = float(os.getenv('MIN_RISK_PCT', '0.20'))
-TP1_R = float(os.getenv('TP1_R', '1.20'))
-TP2_R = float(os.getenv('TP2_R', '2.00'))
-TP3_R = float(os.getenv('TP3_R', '3.00'))
+MIN_RISK_PCT = float(os.getenv('MIN_RISK_PCT', '0.80'))
+TARGET_RISK_PCT = float(os.getenv('TARGET_RISK_PCT', '0.90'))
+TP1_R = float(os.getenv('TP1_R', '1.50'))
+TP2_R = float(os.getenv('TP2_R', '3.00'))
+TP3_R = float(os.getenv('TP3_R', '5.00'))
 MIN_SCORE = int(os.getenv('MIN_SCORE', '82'))
 
 # ---------------- runtime ----------------
@@ -551,6 +552,15 @@ def base_score(ticker, c5, c15, vr) -> int:
     return min(score, 99)
 
 
+def normalize_stop(entry: float, sl: float, direction: str) -> float:
+    """Keep structural SL, but prevent ultra-tight stops that get clipped by noise."""
+    raw_pct = abs(entry - sl) / max(entry, 1e-12) * 100
+    if raw_pct < MIN_RISK_PCT:
+        pct = min(max(TARGET_RISK_PCT, MIN_RISK_PCT), MAX_RISK_PCT) / 100.0
+        return entry * (1.0 - pct) if direction == 'LONG' else entry * (1.0 + pct)
+    return sl
+
+
 def validate_risk(entry: float, sl: float) -> bool:
     risk_pct = abs(entry - sl) / max(entry, 1e-12) * 100
     return MIN_RISK_PCT <= risk_pct <= MAX_RISK_PCT
@@ -577,21 +587,21 @@ def target_levels(direction: str, entry: float, sl: float, c15: List[Candle]):
     tp3 = r_target(TP3_R)
     if candidates:
         if sign * (candidates[0] - entry) >= risk * 0.95:
-            tp1 = candidates[0]
+            tp1 = max(candidates[0], r_target(TP1_R))
         if len(candidates) >= 2 and sign * (candidates[1] - entry) >= risk * 1.5:
-            tp2 = candidates[1]
+            tp2 = max(candidates[1], r_target(TP2_R)) if direction == 'LONG' else min(candidates[1], r_target(TP2_R))
         if len(candidates) >= 3 and sign * (candidates[2] - entry) >= risk * 2.4:
-            tp3 = candidates[2]
+            tp3 = max(candidates[2], r_target(TP3_R)) if direction == 'LONG' else min(candidates[2], r_target(TP3_R))
 
     # Force monotonic targets.
     if direction == 'LONG':
-        tp1 = max(tp1, entry + risk)
-        tp2 = max(tp2, tp1 + risk * 0.4)
-        tp3 = max(tp3, tp2 + risk * 0.4)
+        tp1 = max(tp1, entry + risk * TP1_R)
+        tp2 = max(tp2, entry + risk * TP2_R, tp1 + risk * 0.5)
+        tp3 = max(tp3, entry + risk * TP3_R, tp2 + risk * 0.75)
     else:
-        tp1 = min(tp1, entry - risk)
-        tp2 = min(tp2, tp1 - risk * 0.4)
-        tp3 = min(tp3, tp2 - risk * 0.4)
+        tp1 = min(tp1, entry - risk * TP1_R)
+        tp2 = min(tp2, entry - risk * TP2_R, tp1 - risk * 0.5)
+        tp3 = min(tp3, entry - risk * TP3_R, tp2 - risk * 0.75)
     return tp1, tp2, tp3
 
 
@@ -675,6 +685,7 @@ def build_reversal(iid, ticker, data) -> Optional[Setup]:
     entry = cur.close
     if abs(entry - level) / max(entry, 1e-12) * 100 > MAX_ENTRY_CHASE_PCT * 1.8:
         return None
+    sl = normalize_stop(entry, sl, direction)
     if not validate_risk(entry, sl):
         return None
     tps = target_levels(direction, entry, sl, c15)
@@ -753,6 +764,7 @@ def build_breakout(iid, ticker, data) -> Optional[Setup]:
     entry = cur.close
     if abs(entry-level)/max(entry,1e-12)*100 > MAX_ENTRY_CHASE_PCT:
         return None
+    sl = normalize_stop(entry, sl, direction)
     if not validate_risk(entry, sl):
         return None
     tps = target_levels(direction, entry, sl, c15)
@@ -807,6 +819,7 @@ def build_pullback(iid, ticker, data) -> Optional[Setup]:
         reason=f'1H нисходящий тренд → 15M откат к EMA20 → 5M возврат ниже уровня; объём x{vr:.2f}'
 
     entry=cur.close
+    sl = normalize_stop(entry, sl, direction)
     if not validate_risk(entry,sl):
         return None
     if abs(entry-level)/max(entry,1e-12)*100>MAX_ENTRY_CHASE_PCT*1.5:
@@ -848,6 +861,7 @@ def build_mean_reversion(iid,ticker,data)->Optional[Setup]:
             return None
         sl=max(c.high for c in c5[-8:])+atr(c5)*0.25
     entry=cur.close
+    sl = normalize_stop(entry, sl, direction)
     if not validate_risk(entry,sl):
         return None
     tps=target_levels(direction,entry,sl,c15)
@@ -856,9 +870,9 @@ def build_mean_reversion(iid,ticker,data)->Optional[Setup]:
     # EMA is useful as a first mean-reversion target only if it is at least 1R away.
     risk=abs(entry-sl)
     ema_target=e20
-    if direction=='LONG' and ema_target>entry+risk:
+    if direction=='LONG' and ema_target>entry+risk*TP1_R:
         tp1=ema_target
-    elif direction=='SHORT' and ema_target<entry-risk:
+    elif direction=='SHORT' and ema_target<entry-risk*TP1_R:
         tp1=ema_target
     else:
         tp1=tps[0]
@@ -993,9 +1007,9 @@ def build_signal_text(s:Setup)->str:
         f'💧 <b>Volume:</b> x{s.volume_ratio:.2f} · Turnover ${s.volume_24h/1_000_000:.1f}M\n\n'
         f'🎯 <b>Вход:</b> <code>{fmt_price(s.entry_low)} – {fmt_price(s.entry_high)}</code>\n'
         f'🛑 <b>Стоп:</b> <code>{fmt_price(s.sl)}</code> · риск {risk:.2f}%\n'
-        f'🎯 <b>TP1:</b> <code>{fmt_price(s.tp1)}</code>\n'
-        f'🎯 <b>TP2:</b> <code>{fmt_price(s.tp2)}</code> · RR 1:{rr2:.1f}\n'
-        f'🎯 <b>TP3:</b> <code>{fmt_price(s.tp3)}</code>\n\n'
+        f'🎯 <b>TP1 (1.5R):</b> <code>{fmt_price(s.tp1)}</code>\n'
+        f'🎯 <b>TP2 (3R):</b> <code>{fmt_price(s.tp2)}</code> · RR 1:{rr2:.1f}\n'
+        f'🎯 <b>TP3 (5R):</b> <code>{fmt_price(s.tp3)}</code>\n\n'
         f'🧠 <b>Почему:</b> {s.reason}.\n'
         f'⏱ <b>Ожидаемое удержание:</b> {s.hold_hours}\n\n'
         f'⚠️ Внимательно проверьте сделку перед входом.\n'

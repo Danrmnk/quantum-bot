@@ -55,21 +55,8 @@ TOP_LOSERS = int(os.getenv('TOP_LOSERS', '20'))
 TOP_VOLATILE = int(os.getenv('TOP_VOLATILE', '25'))
 NEW_ACTIVE_DAYS = int(os.getenv('NEW_ACTIVE_DAYS', '45'))
 NEW_ACTIVE_COUNT = int(os.getenv('NEW_ACTIVE_COUNT', '15'))
-MIN_ACTIVE_24H_RANGE_PCT = float(os.getenv('MIN_ACTIVE_24H_RANGE_PCT', '4.0'))
-
-# ---------------- professional universe / market regime ----------------
-# These are soft candidate filters. They rank coins instead of blocking the
-# strategies with an oversized wall of requirements.
-MIN_24H_MOVE_FOR_CANDIDATE = float(os.getenv('MIN_24H_MOVE_FOR_CANDIDATE', '4.0'))
-MIN_2H_MOVE_FOR_CANDIDATE = float(os.getenv('MIN_2H_MOVE_FOR_CANDIDATE', '1.0'))
-MIN_1H_MOVE_FOR_CANDIDATE = float(os.getenv('MIN_1H_MOVE_FOR_CANDIDATE', '0.5'))
-CANDIDATE_MIN_ATR_5M_PCT = float(os.getenv('CANDIDATE_MIN_ATR_5M_PCT', '0.12'))
-MIN_CANDIDATE_VOLUME_RATIO = float(os.getenv('MIN_CANDIDATE_VOLUME_RATIO', '0.80'))
-TOP_MOVERS_POOL = int(os.getenv('TOP_MOVERS_POOL', '25'))
-DEEP_SCAN_LIMIT = int(os.getenv('DEEP_SCAN_LIMIT', '40'))
-UNIVERSE_CANDLE_LIMIT = int(os.getenv('UNIVERSE_CANDLE_LIMIT', '50'))
-MORNING_GREETING_HOUR = int(os.getenv('MORNING_GREETING_HOUR', '9'))
-MORNING_GREETING_MINUTE = int(os.getenv('MORNING_GREETING_MINUTE', '0'))
+DEEP_SCAN_LIMIT = int(os.getenv('DEEP_SCAN_LIMIT', '70'))
+MIN_ACTIVE_24H_RANGE_PCT = float(os.getenv('MIN_ACTIVE_24H_RANGE_PCT', '5.0'))
 
 # ---------------- momentum/reversal ----------------
 MIN_24H_MOVE_FOR_REVERSAL = float(os.getenv('MIN_24H_MOVE_FOR_REVERSAL', '15'))
@@ -152,9 +139,6 @@ class Setup:
     candles_5m: List[Candle]
     points: List[Tuple[int, float, str]] = field(default_factory=list)
     hold_hours: str = '1–8 ч'
-    candidate_score: int = 0
-    setup_score: int = 0
-    market_regime: str = 'NEUTRAL'
 
 @dataclass
 class PendingSignal:
@@ -433,151 +417,7 @@ def load_symbol(inst_id: str) -> Dict[str, List[Candle]]:
 # MARKET UNIVERSE
 # ============================================================
 
-def _safe_pct_move(candles: List[Candle], bars: int) -> float:
-    """Confirmed-candle momentum over N 5M bars."""
-    if len(candles) < bars + 2:
-        return 0.0
-    # Ignore the still-forming candle.
-    end = candles[-1]
-    start = candles[-1-bars]
-    return pct_move(end.close, start.close)
-
-
-def _candidate_momentum(iid: str):
-    """Lightweight 5M scan used only for ranking candidates."""
-    try:
-        cs = get_candles(iid, '5m', UNIVERSE_CANDLE_LIMIT)
-        confirmed = [c for c in cs if c.confirmed]
-        if len(confirmed) < 30:
-            return None
-        m1h = _safe_pct_move(confirmed, 12)
-        m2h = _safe_pct_move(confirmed, 24)
-        atr5 = atr_pct(confirmed)
-        vr = vol_ratio(confirmed)
-        # Current hour versus the preceding hour: positive = acceleration.
-        if len(confirmed) >= 25:
-            recent = pct_move(confirmed[-2].close, confirmed[-14].close)
-            previous = pct_move(confirmed[-14].close, confirmed[-26].close) if len(confirmed) >= 26 else 0.0
-            acceleration = abs(recent) - abs(previous)
-        else:
-            acceleration = 0.0
-        h1 = (max(c.high for c in confirmed[-12:]) - min(c.low for c in confirmed[-12:])) / max(confirmed[-1].close, 1e-12) * 100
-        return {
-            'm1h': m1h,
-            'm2h': m2h,
-            'atr5': atr5,
-            'vr': vr,
-            'range1h': h1,
-            'acceleration': acceleration,
-        }
-    except Exception as exc:
-        log.debug('UNIVERSE MOMENTUM FAILED | %s | %s', iid, exc)
-        return None
-
-
-def _market_regime(c5: List[Candle], c15: List[Candle]) -> str:
-    """Simple regime classifier used as context, never as a standalone signal."""
-    if len(c5) < 40 or len(c15) < 30:
-        return 'NEUTRAL'
-    m1 = _safe_pct_move(c5, 12)
-    m2 = _safe_pct_move(c5, 24)
-    a5 = atr_pct(c5)
-    e20 = ema([c.close for c in c15], 20)
-    if len(e20) < 10:
-        return 'NEUTRAL'
-    slope = pct_move(e20[-1], e20[-9])
-    if abs(m1) >= 2.0 and abs(m2) >= 3.0 and a5 >= 0.25:
-        return 'EXPANSION_UP' if m1 > 0 else 'EXPANSION_DOWN'
-    if abs(slope) >= 0.25 and ((m1 > 0 and slope > 0) or (m1 < 0 and slope < 0)):
-        return 'TREND_UP' if slope > 0 else 'TREND_DOWN'
-    if a5 >= 0.25 and abs(m1) < 1.0:
-        return 'EXHAUSTION'
-    return 'RANGE'
-
-
-def _regime_fit(strategy: str, direction: str, regime: str) -> int:
-    """Context bonus/penalty; strategies themselves remain untouched."""
-    if strategy == 'EXTREME REVERSAL':
-        if regime == 'EXHAUSTION':
-            return 8
-        if direction == 'SHORT' and regime == 'EXPANSION_UP':
-            return 3
-        if direction == 'LONG' and regime == 'EXPANSION_DOWN':
-            return 3
-        if (direction == 'LONG' and regime == 'EXPANSION_UP') or (direction == 'SHORT' and regime == 'EXPANSION_DOWN'):
-            return -4
-    elif strategy == 'BREAKOUT + RETEST':
-        if regime in ('EXPANSION_UP', 'EXPANSION_DOWN'):
-            return 8
-        if regime == 'RANGE':
-            return 2
-    elif strategy == 'TREND PULLBACK':
-        if (direction == 'LONG' and regime == 'TREND_UP') or (direction == 'SHORT' and regime == 'TREND_DOWN'):
-            return 8
-        if regime.startswith('EXPANSION'):
-            return 3
-    elif strategy == 'MEAN REVERSION':
-        if regime in ('RANGE', 'EXHAUSTION'):
-            return 8
-        if regime.startswith('EXPANSION'):
-            return -5
-    return 0
-
-
-def _space_to_target_score(s: Setup, c15: List[Candle]) -> int:
-    """Reward setups with actual room to the nearest structural obstacle."""
-    entry = (s.entry_low + s.entry_high) / 2
-    risk = abs(entry - s.sl)
-    if risk <= 0:
-        return -8
-    levels = cluster_levels(c15, 0.30)
-    if s.direction == 'LONG':
-        obstacles = sorted([p for p, k, t in levels if p > entry])
-    else:
-        obstacles = sorted([p for p, k, t in levels if p < entry], reverse=True)
-    if not obstacles:
-        return 2
-    nearest = obstacles[0]
-    room_r = abs(nearest - entry) / risk
-    if room_r < 1.0:
-        return -10
-    if room_r < 1.4:
-        return -5
-    if room_r >= 2.5:
-        return 6
-    if room_r >= 1.8:
-        return 4
-    return 1
-
-
-def _btc_eth_context(regime_map: Dict[str, str], direction: str) -> int:
-    """Small market-wide context adjustment for altcoin signals."""
-    btc = regime_map.get('BTC-USDT-SWAP', 'NEUTRAL')
-    eth = regime_map.get('ETH-USDT-SWAP', 'NEUTRAL')
-    score = 0
-    if direction == 'LONG':
-        if btc == 'TREND_UP' or btc == 'EXPANSION_UP': score += 2
-        if eth == 'TREND_UP' or eth == 'EXPANSION_UP': score += 1
-        if btc == 'EXPANSION_DOWN': score -= 3
-    else:
-        if btc == 'TREND_DOWN' or btc == 'EXPANSION_DOWN': score += 2
-        if eth == 'TREND_DOWN' or eth == 'EXPANSION_DOWN': score += 1
-        if btc == 'EXPANSION_UP': score -= 3
-    return score
-
-
-def _setup_quality(s: Setup, candidate_score: int, regime: str, market_bonus: int, c15: List[Candle]) -> int:
-    """Overlay score. It does not alter any strategy condition."""
-    score = int(s.score)
-    score += round((candidate_score - 60) * 0.15)
-    score += _regime_fit(s.strategy, s.direction, regime)
-    score += market_bonus
-    score += _space_to_target_score(s, c15)
-    return int(clamp(score, 0, 99))
-
-
 def build_universe(instruments: Dict[str, dict], tickers: Dict[str, dict]):
-    """Professional candidate ranking: broad enough to find setups, selective enough to avoid dead coins."""
     base = []
     for iid, t in tickers.items():
         if iid not in instruments:
@@ -586,62 +426,27 @@ def build_universe(instruments: Dict[str, dict], tickers: Dict[str, dict]):
             continue
         if t['range24h_pct'] < MIN_ACTIVE_24H_RANGE_PCT:
             continue
-        activity = clamp((t['vol24h_usd'] / PREFERRED_TURNOVER_USD) * 18, 0, 18)
-        movement = clamp(abs(t['change24h_pct']) * 1.25, 0, 35)
-        volatility = clamp(t['range24h_pct'] * 1.7, 0, 30)
-        mover_bonus = 6 if abs(t['change24h_pct']) >= MIN_24H_MOVE_FOR_CANDIDATE else 0
-        base.append((iid, t, activity + movement + volatility + mover_bonus))
+        activity = clamp((t['vol24h_usd'] / PREFERRED_TURNOVER_USD) * 20, 0, 20)
+        movement = clamp(abs(t['change24h_pct']) * 1.15, 0, 40)
+        volatility = clamp(t['range24h_pct'] * 1.8, 0, 40)
+        score = activity + movement + volatility
+        base.append((iid, t, score))
 
-    # Source pool: top gainers + losers + the most active/volatile contracts.
     gainers = sorted(base, key=lambda z: z[1]['change24h_pct'], reverse=True)[:TOP_GAINERS]
     losers = sorted(base, key=lambda z: z[1]['change24h_pct'])[:TOP_LOSERS]
     volatile = sorted(base, key=lambda z: z[1]['range24h_pct'], reverse=True)[:TOP_VOLATILE]
+    cutoff = int((local_now() - timedelta(days=NEW_ACTIVE_DAYS)).timestamp() * 1000)
+    new_active = [z for z in base if instruments[z[0]].get('listTime', 0) >= cutoff]
+    new_active = sorted(new_active, key=lambda z: z[2], reverse=True)[:NEW_ACTIVE_COUNT]
+
     pool = {}
-    for group in (gainers, losers, volatile):
+    for group in (gainers, losers, volatile, new_active):
         for item in group:
             pool[item[0]] = item
-
-    # First pass: ticker-only ranking. Then use confirmed 5M data on the best movers.
-    prelim = sorted(pool.values(), key=lambda z: z[2], reverse=True)[:max(TOP_MOVERS_POOL * 2, DEEP_SCAN_LIMIT)]
-    ranked = []
-    for iid, t, base_score_value in prelim:
-        mom = _candidate_momentum(iid)
-        if not mom:
-            continue
-        # Do not hard-reject every modest mover. Only remove truly dead names.
-        if abs(t['change24h_pct']) < MIN_24H_MOVE_FOR_CANDIDATE and abs(mom['m2h']) < MIN_2H_MOVE_FOR_CANDIDATE:
-            continue
-        if mom['atr5'] < CANDIDATE_MIN_ATR_5M_PCT:
-            continue
-        if mom['vr'] < MIN_CANDIDATE_VOLUME_RATIO:
-            continue
-
-        score = base_score_value
-        score += min(abs(mom['m1h']), 5.0) * 2.8
-        score += min(abs(mom['m2h']), 10.0) * 1.7
-        score += min(mom['atr5'], 1.2) * 8.0
-        score += min(max(mom['vr'] - 1.0, 0.0), 2.5) * 5.0
-        score += min(mom['range1h'], 6.0) * 1.2
-        if abs(t['change24h_pct']) >= MIN_24H_MOVE_FOR_CANDIDATE:
-            score += 5
-        if abs(mom['m1h']) >= MIN_1H_MOVE_FOR_CANDIDATE:
-            score += 4
-        if abs(mom['m2h']) >= MIN_2H_MOVE_FOR_CANDIDATE:
-            score += 4
-        if mom['acceleration'] > 0:
-            score += min(mom['acceleration'], 4.0) * 2.0
-        if t['vol24h_usd'] >= PREFERRED_TURNOVER_USD:
-            score += 4
-        score = int(clamp(score, 0, 100))
-        ranked.append((iid, t, score))
-
-    ranked.sort(key=lambda z: z[2], reverse=True)
-    final = [x for x in ranked if x[2] >= 60][:DEEP_SCAN_LIMIT]
-    log.info('UNIVERSE | gainers=%d losers=%d volatile=%d ranked=%d deep=%d',
-             len(gainers), len(losers), len(volatile), len(ranked), len(final))
-    if final:
-        log.info('UNIVERSE TOP | %s', ', '.join(f'{get_coin(i)}:{sc}' for i, _, sc in final[:10]))
-    return final
+    ranked = sorted(pool.values(), key=lambda z: z[2], reverse=True)[:DEEP_SCAN_LIMIT]
+    log.info('UNIVERSE | gainers=%d losers=%d volatile=%d new=%d deep=%d',
+             len(gainers), len(losers), len(volatile), len(new_active), len(ranked))
+    return ranked
 
 # ============================================================
 # STRUCTURE ENGINE
@@ -1185,8 +990,7 @@ def build_signal_text(s:Setup)->str:
         f'📌 <b>Сетап:</b> {s.pattern_name}\n'
         f'📈 <b>24H:</b> {s.change24:+.1f}% · Range {s.range24:.1f}%\n'
         f'⚡ <b>ATR:</b> 5M {s.atr5_pct:.2f}% · 15M {s.atr15_pct:.2f}%\n'
-        f'💧 <b>Volume:</b> x{s.volume_ratio:.2f} · Turnover ${s.volume_24h/1_000_000:.1f}M\n'
-        f'🧠 <b>Качество:</b> {s.setup_score or s.score}/100 · Candidate {s.candidate_score}/100 · {s.market_regime}\n\n'
+        f'💧 <b>Volume:</b> x{s.volume_ratio:.2f} · Turnover ${s.volume_24h/1_000_000:.1f}M\n\n'
         f'🎯 <b>Вход:</b> <code>{fmt_price(s.entry_low)} – {fmt_price(s.entry_high)}</code>\n'
         f'🛑 <b>Стоп:</b> <code>{fmt_price(s.sl)}</code> · риск {risk:.2f}%\n'
         f'🎯 <b>TP1:</b> <code>{fmt_price(s.tp1)}</code>\n'
@@ -1362,18 +1166,7 @@ def scan_market():
     candidates=build_universe(instruments,tickers)
     raw=[]
 
-    # Market-wide context. If BTC/ETH data fails, the rest of the scanner still works.
-    market_regime={}
-    for major in ('BTC-USDT-SWAP','ETH-USDT-SWAP'):
-        try:
-            md=load_symbol(major)
-            market_regime[major]=_market_regime(md['5m'],md['15m'])
-        except Exception as exc:
-            log.debug('MARKET REGIME FAILED | %s | %s',major,exc)
-            market_regime[major]='NEUTRAL'
-    log.info('MARKET REGIME | BTC=%s ETH=%s',market_regime.get('BTC-USDT-SWAP'),market_regime.get('ETH-USDT-SWAP'))
-
-    for iid,t,candidate_score in candidates:
+    for iid,t,_ in candidates:
         if not can_send(iid):
             continue
         try:
@@ -1383,20 +1176,11 @@ def scan_market():
                 continue
             if atr_pct(c5)<MIN_ATR_5M_PCT or atr_pct(c15)<MIN_ATR_15M_PCT:
                 continue
-            regime=_market_regime(c5,c15)
-            market_bonus=0
-            # The market context is deliberately small: strategy structure remains dominant.
             for builder in STRATEGIES:
                 try:
-                    setup=builder(iid,t,data)
-                    if setup:
-                        setup.candidate_score=int(candidate_score)
-                        setup.market_regime=regime
-                        setup.setup_score=_setup_quality(setup,int(candidate_score),regime,_btc_eth_context(market_regime,setup.direction),c15)
-                        setup.score=setup.setup_score
-                        if setup.setup_score < MIN_SCORE:
-                            continue
-                        raw.append(setup)
+                    s=builder(iid,t,data)
+                    if s:
+                        raw.append(s)
                 except Exception as exc:
                     log.debug('STRATEGY FAILED | %s | %s | %s',iid,builder.__name__,exc)
         except Exception as exc:
@@ -1414,34 +1198,6 @@ def scan_market():
         if not can_send(s.inst_id):
             continue
         send_signal(s)
-
-# ============================================================
-# MORNING GREETING
-# ============================================================
-
-def morning_greeting():
-    n=local_now()
-    if n.hour != MORNING_GREETING_HOUR or n.minute != MORNING_GREETING_MINUTE:
-        return
-    key=n.date().isoformat()
-    with db_lock:
-        row=db.execute("SELECT value FROM bot_state WHERE key='morning_greeting'").fetchone()
-    if row and row[0]==key:
-        return
-    text_msg=(
-        '☀️ <b>Доброе утро!</b>\n\n'
-        '💎 <b>QUANTUM | VIP Scanner</b> снова в работе.\n'
-        '🔎 Сегодня ищем ликвидные монеты с сильным движением, текущим импульсом и качественными сетапами по 4 стратегиям.\n\n'
-        '⚠️ Внимательно проверьте сделку перед входом.\n'
-        '🛡 Риск на одну сделку — <b>не более 1% депозита</b>.\n'
-        '🚫 Не догоняйте цену после ухода от зоны входа.'
-    )
-    try:
-        bot.send_message(CHANNEL_ID,text_msg,parse_mode='HTML')
-        with db_lock:
-            db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES('morning_greeting',?)",(key,)); db.commit()
-    except Exception:
-        log.exception('MORNING GREETING FAILED')
 
 # ============================================================
 # WEEKLY REPORT
@@ -1497,7 +1253,7 @@ def main():
     log.info('============================================================')
     log.info('QUANTUM INTRADAY SWING ENGINE V2 STARTED')
     log.info('Strategies: Extreme Reversal | Breakout+Retest | Pullback | Mean Reversion')
-    log.info('Universe: liquidity | movers | momentum | acceleration | market regime | ranking')
+    log.info('Universe: gainers | losers | volatile | new active | small alts')
     log.info('============================================================')
     startup_healthcheck()
     start_telegram_polling()
@@ -1505,7 +1261,6 @@ def main():
     while True:
         try:
             update_signal_results()
-            morning_greeting()
             weekly_report()
             scan_market()
         except KeyboardInterrupt:

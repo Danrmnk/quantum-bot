@@ -19,17 +19,17 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
 # ============================================================
-# QUANTUM INTRADAY SWING ENGINE V2
+# QUANTUM INTRADAY SWING ENGINE V3
 # ------------------------------------------------------------
 # Purpose:
 #   Find high-momentum crypto futures setups for 1-8 hour holds.
 #   5M = trigger/entry, 15M = structure, 1H = context.
 #
 # Strategies:
-#   1) Extreme Reversal       strong mover -> exhaustion -> reversal
-#   2) Breakout + Retest      structure break -> retest -> continuation
-#   3) Trend Pullback          1H trend -> 15M pullback -> 5M trigger
-#   4) Mean Reversion          stretched 15M price -> 5M reversal
+#   1) Trend Pullback          1H trend -> 15M pullback -> 5M continuation trigger
+#   2) Breakout + Retest       distinct break -> retest -> continuation
+#   3) Extreme Reversal        rare, strongly confirmed exhaustion reversal
+#   4) Mean Reversion          rare opportunistic exhaustion setup
 #
 # Important:
 #   This is a signal engine, not a profitability guarantee.
@@ -85,7 +85,7 @@ REQUEST_RETRIES = int(os.getenv('REQUEST_RETRIES', '3'))
 CANDLE_CACHE_SECONDS = int(os.getenv('CANDLE_CACHE_SECONDS', '15'))
 READY_TTL_MINUTES = int(os.getenv('READY_TTL_MINUTES', '20'))
 ACTIVE_MAX_HOURS = int(os.getenv('ACTIVE_MAX_HOURS', '12'))
-COOLDOWN_MINUTES = int(os.getenv('COOLDOWN_MINUTES', '120'))
+COOLDOWN_MINUTES = int(os.getenv('COOLDOWN_MINUTES', '45'))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 log = logging.getLogger('QUANTUM')
@@ -157,6 +157,8 @@ class ActiveSignal:
     tp1_sent: bool = False
     tp2_sent: bool = False
     tp3_sent: bool = False
+    activated_candle_ts: int = 0
+    last_processed_candle_ts: int = 0
 
 pending: Dict[str, PendingSignal] = {}
 active: Dict[str, ActiveSignal] = {}
@@ -182,7 +184,7 @@ SIGNAL_COLUMNS = {
     'score':'INTEGER', 'status':'TEXT', 'created_at':'REAL', 'activated_at':'REAL',
     'expires_at':'REAL', 'tp1_hit':'INTEGER DEFAULT 0', 'tp2_hit':'INTEGER DEFAULT 0',
     'tp3_hit':'INTEGER DEFAULT 0', 'result':'TEXT DEFAULT \'\'', 'closed_at':'REAL',
-    'r_multiple':'REAL DEFAULT 0'
+    'r_multiple':'REAL DEFAULT 0', 'message_id':'INTEGER DEFAULT 0'
 }
 
 
@@ -406,11 +408,18 @@ def get_candles(inst_id: str, bar: str, limit: int = 180) -> List[Candle]:
     return out
 
 
+def confirmed_candles(cs: List[Candle]) -> List[Candle]:
+    # Technical analysis must never use the still-forming candle.
+    return [c for c in cs if c.confirmed]
+
+
 def load_symbol(inst_id: str) -> Dict[str, List[Candle]]:
+    # Strategies operate only on closed candles. The raw 5M stream is fetched
+    # separately by the lifecycle engine when it needs live entry/exit touches.
     return {
-        '1h': get_candles(inst_id, '1H', 160),
-        '15m': get_candles(inst_id, '15m', 180),
-        '5m': get_candles(inst_id, '5m', 200),
+        '1h': confirmed_candles(get_candles(inst_id, '1H', 160)),
+        '15m': confirmed_candles(get_candles(inst_id, '15m', 180)),
+        '5m': confirmed_candles(get_candles(inst_id, '5m', 200)),
     }
 
 # ============================================================
@@ -534,80 +543,142 @@ def local_extreme(c5: List[Candle], direction: str, lookback: int = 48):
 # ============================================================
 
 def base_score(ticker, c5, c15, vr) -> int:
-    score = 58
+    """Market quality only. Entry quality is scored separately and heavily."""
+    score = 42
     ch = abs(ticker['change24h_pct'])
     rng = ticker['range24h_pct']
-    if ch >= 20: score += 5
-    if ch >= STRONG_24H_MOVE: score += 7
-    if ch >= 45: score += 4
-    if rng >= 10: score += 5
-    if rng >= 20: score += 4
+    if ch >= 3: score += 4
+    if ch >= 8: score += 5
+    if ch >= 15: score += 4
+    if rng >= 6: score += 4
+    if rng >= 10: score += 4
     if atr_pct(c5) >= MIN_ATR_5M_PCT: score += 4
     if atr_pct(c15) >= MIN_ATR_15M_PCT: score += 4
-    if vr >= 1.2: score += 3
-    if vr >= 1.5: score += 4
+    if vr >= 1.15: score += 3
+    if vr >= 1.5: score += 3
     if vr >= 2.0: score += 3
     if ticker['vol24h_usd'] >= PREFERRED_TURNOVER_USD: score += 3
-    return min(score, 99)
+    return min(score, 70)
 
 
-def validate_risk(entry: float, sl: float) -> bool:
-    risk_pct = abs(entry - sl) / max(entry, 1e-12) * 100
+def risk_pct_for_zone(direction: str, entry_low: float, entry_high: float, sl: float) -> float:
+    # Worst-case fill inside the published zone.
+    if direction == 'LONG':
+        entry = entry_low if sl >= entry_low else entry_low
+        # For a long, the lower edge is farther from a lower SL.
+        entry = entry_low
+        return (entry - sl) / max(entry, 1e-12) * 100
+    entry = entry_high
+    return (sl - entry) / max(entry, 1e-12) * 100
+
+
+def validate_zone_risk(direction: str, entry_low: float, entry_high: float, sl: float) -> bool:
+    if not (entry_low > sl if direction == 'LONG' else entry_high < sl):
+        return False
+    risk_pct = risk_pct_for_zone(direction, entry_low, entry_high, sl)
     return MIN_RISK_PCT <= risk_pct <= MAX_RISK_PCT
 
 
 def target_levels(direction: str, entry: float, sl: float, c15: List[Candle]):
+    """Structure-first targets with R-multiple fallback and strict ordering."""
     risk = abs(entry - sl)
     if risk <= 0:
         return None
-    levels = cluster_levels(c15)
+    levels = cluster_levels(c15, 0.30)
     if direction == 'LONG':
-        structural = sorted([p for p, k, t in levels if p > entry])
+        structural = sorted({p for p, k, t in levels if p > entry + risk * 0.65})
         sign = 1
     else:
-        structural = sorted([p for p, k, t in levels if p < entry], reverse=True)
+        structural = sorted({p for p, k, t in levels if p < entry - risk * 0.65}, reverse=True)
         sign = -1
 
-    def r_target(mult):
-        return entry + sign * risk * mult
+    r_targets = [entry + sign * risk * m for m in (TP1_R, TP2_R, TP3_R)]
+    chosen = []
+    for p in structural:
+        if sign * (p - entry) >= risk * 1.0:
+            chosen.append(p)
+        if len(chosen) == 3:
+            break
 
-    candidates = [p for p in structural if sign * (p - entry) >= risk * 0.9]
-    tp1 = r_target(TP1_R)
-    tp2 = r_target(TP2_R)
-    tp3 = r_target(TP3_R)
-    if candidates:
-        if sign * (candidates[0] - entry) >= risk * 0.95:
-            tp1 = candidates[0]
-        if len(candidates) >= 2 and sign * (candidates[1] - entry) >= risk * 1.5:
-            tp2 = candidates[1]
-        if len(candidates) >= 3 and sign * (candidates[2] - entry) >= risk * 2.4:
-            tp3 = candidates[2]
+    targets = r_targets[:]
+    if len(chosen) >= 1: targets[0] = chosen[0]
+    if len(chosen) >= 2 and sign * (chosen[1] - targets[0]) >= risk * 0.55: targets[1] = chosen[1]
+    if len(chosen) >= 3 and sign * (chosen[2] - targets[1]) >= risk * 0.55: targets[2] = chosen[2]
 
-    # Force monotonic targets.
+    tp1, tp2, tp3 = targets
     if direction == 'LONG':
-        tp1 = max(tp1, entry + risk)
-        tp2 = max(tp2, tp1 + risk * 0.4)
-        tp3 = max(tp3, tp2 + risk * 0.4)
+        tp1 = max(tp1, entry + risk * 1.0)
+        tp2 = max(tp2, tp1 + risk * 0.45)
+        tp3 = max(tp3, tp2 + risk * 0.45)
     else:
-        tp1 = min(tp1, entry - risk)
-        tp2 = min(tp2, tp1 - risk * 0.4)
-        tp3 = min(tp3, tp2 - risk * 0.4)
+        tp1 = min(tp1, entry - risk * 1.0)
+        tp2 = min(tp2, tp1 - risk * 0.45)
+        tp3 = min(tp3, tp2 - risk * 0.45)
     return tp1, tp2, tp3
 
 
-def entry_zone(entry: float, atr5: float, direction: str):
-    width = min(atr5 * 0.18, entry * MAX_ENTRY_CHASE_PCT / 100 * 0.35)
-    width = max(width, entry * 0.00025)
+def entry_zone_from_level(level: float, atr5: float, direction: str):
+    # Zone is deliberately near the structure, not centered on the current price.
+    width = max(atr5 * 0.20, level * 0.00035)
     if direction == 'LONG':
-        return entry - width, entry + width
-    return entry - width, entry + width
+        return level - width, level + width
+    return level - width, level + width
 
 
-def final_score(base: int, bonuses: List[int], penalties: List[int]) -> int:
-    return max(0, min(99, base + sum(bonuses) - sum(penalties)))
+def current_distance_atr(price: float, level: float, atr5: float) -> float:
+    return abs(price - level) / max(atr5, 1e-12)
+
+
+def entry_quality(direction: str, price: float, level: float, atr5: float,
+                  impulse_pct: float, pullback_pct: float, vr: float,
+                  candle: Candle, structure_touches: int = 0) -> int:
+    """Score the location of the trade, not merely how exciting the coin is."""
+    q = 0
+    dist = current_distance_atr(price, level, atr5)
+    if dist <= 0.25: q += 22
+    elif dist <= 0.45: q += 18
+    elif dist <= 0.70: q += 12
+    elif dist <= 0.95: q += 5
+    else: q -= 12
+
+    if 0.20 <= abs(pullback_pct) <= 1.8: q += 14
+    elif abs(pullback_pct) <= 3.0: q += 8
+    else: q -= 4
+
+    if abs(impulse_pct) >= 1.5: q += 7
+    if abs(impulse_pct) >= 3.0: q += 5
+    if vr >= 1.2: q += 5
+    if vr >= 1.8: q += 4
+    if body_ratio(candle) >= 0.45: q += 5
+    if (direction == 'LONG' and close_location(candle) >= 0.60) or (direction == 'SHORT' and close_location(candle) <= 0.40):
+        q += 5
+    q += min(structure_touches * 3, 9)
+    return int(clamp(q, 0, 80))
+
+
+def final_score(base: int, entry_q: int, bonuses: List[int], penalties: List[int]) -> int:
+    # Entry location is the dominant component. A late entry cannot hide behind volume.
+    return int(clamp(base + entry_q + sum(bonuses) - sum(penalties), 0, 99))
+
+
+def build_setup_common(iid, ticker, direction, strategy, pattern, level, level_kind,
+                       sl, c15, c5, vr, score, reason, points, hold='1–8 ч'):
+    entry = level
+    lo, hi = entry_zone_from_level(level, atr(c5), direction)
+    if not validate_zone_risk(direction, lo, hi, sl):
+        return None
+    tps = target_levels(direction, (lo + hi) / 2, sl, c15)
+    if not tps:
+        return None
+    chart_start = max(0, len(c5) - 96)
+    chart_points = [(max(0, min(95, int(idx) - chart_start)), price, label) for idx, price, label in points]
+    return Setup(iid, get_coin(iid), direction, strategy, pattern, level, level_kind,
+                 lo, hi, sl, *tps, int(score), reason,
+                 ticker['vol24h_usd'], ticker['change24h_pct'], ticker['range24h_pct'],
+                 atr_pct(c5), atr_pct(c15), vr, c5[-96:], chart_points, hold)
 
 # ============================================================
-# STRATEGY 1 — EXTREME REVERSAL
+# STRATEGY 1 — EXTREME REVERSAL (RARE)
 # ============================================================
 
 def build_reversal(iid, ticker, data) -> Optional[Setup]:
@@ -617,93 +688,67 @@ def build_reversal(iid, ticker, data) -> Optional[Setup]:
     ch = ticker['change24h_pct']
     if abs(ch) < MIN_24H_MOVE_FOR_REVERSAL:
         return None
-    if atr_pct(c5) < MIN_ATR_5M_PCT or atr_pct(c15) < MIN_ATR_15M_PCT:
+    vr = vol_ratio(c5)
+    if vr < MIN_REVERSAL_VOLUME_RATIO:
         return None
-
     m1h, m2h, _ = impulse_stats(c5)
     direction = 'SHORT' if ch > 0 else 'LONG'
     if direction == 'SHORT' and m2h < MIN_2H_IMPULSE:
         return None
     if direction == 'LONG' and m2h > -MIN_2H_IMPULSE:
         return None
-
-    extreme = local_extreme(c5, 'SHORT' if direction == 'SHORT' else 'LONG', 60)
-    if extreme is None:
-        return None
-    cur = c5[-1]
-    prev = c5[-2]
-    vr = vol_ratio(c5)
-    if vr < MIN_REVERSAL_VOLUME_RATIO:
-        return None
-
+    extreme = local_extreme(c5, direction, 60)
+    cur, prev = c5[-1], c5[-2]
     if direction == 'SHORT':
-        retrace = pct_move(extreme.high, cur.close)
-        upper, lower = wick_ratio(cur)
-        # Strong rejection from the high + bearish confirmation.
-        if retrace < 0.55:
+        upper, _ = wick_ratio(cur)
+        if not (cur.close < cur.open and cur.close < prev.low and upper >= 0.12 and body_ratio(cur) >= 0.42):
             return None
-        if not (cur.close < cur.open and cur.close < prev.low * 1.001):
-            return None
-        if body_ratio(cur) < 0.42 or close_location(cur) > 0.48:
-            return None
-        if upper < 0.10 and cur.high < max(c.high for c in c5[-6:-1]):
-            return None
-        sl = max(extreme.high, max(c.high for c in c5[-4:])) + atr(c5) * 0.28
         level = extreme.high
-        point_label = 'EXTREME HIGH'
-        pattern = 'ТОП МОВЕР → ПЕРВЫЙ РАЗВОРОТ SHORT'
-        reason = f'сильный рост 24H {ch:+.1f}% → 2H {m2h:+.1f}% → экстремум → медвежье подтверждение'
-        bonuses = [7 if ch >= STRONG_24H_MOVE else 3, 6 if m2h >= 8 else 3, 5 if vr >= 1.5 else 0]
+        sl = max(level, max(c.high for c in c5[-4:])) + atr(c5) * 0.25
+        reason = f'сильный рост 24H {ch:+.1f}% → экстремум → подтверждённый разворот; объём x{vr:.2f}'
     else:
-        retrace = pct_move(cur.close, extreme.low)
-        upper, lower = wick_ratio(cur)
-        if retrace < 0.55:
+        _, lower = wick_ratio(cur)
+        if not (cur.close > cur.open and cur.close > prev.high and lower >= 0.12 and body_ratio(cur) >= 0.42):
             return None
-        if not (cur.close > cur.open and cur.close > prev.high * 0.999):
-            return None
-        if body_ratio(cur) < 0.42 or close_location(cur) < 0.52:
-            return None
-        if lower < 0.10 and cur.low > min(c.low for c in c5[-6:-1]):
-            return None
-        sl = min(extreme.low, min(c.low for c in c5[-4:])) - atr(c5) * 0.28
         level = extreme.low
-        point_label = 'EXTREME LOW'
-        pattern = 'ТОП ЛУЗЕР → ПЕРВЫЙ РАЗВОРОТ LONG'
-        reason = f'сильное падение 24H {ch:+.1f}% → 2H {m2h:+.1f}% → экстремум → бычье подтверждение'
-        bonuses = [7 if ch <= -STRONG_24H_MOVE else 3, 6 if m2h <= -8 else 3, 5 if vr >= 1.5 else 0]
+        sl = min(level, min(c.low for c in c5[-4:])) - atr(c5) * 0.25
+        reason = f'сильное падение 24H {ch:+.1f}% → экстремум → подтверждённый разворот; объём x{vr:.2f}'
 
-    entry = cur.close
-    if abs(entry - level) / max(entry, 1e-12) * 100 > MAX_ENTRY_CHASE_PCT * 1.8:
+    # Reversal is intentionally much harder to publish than continuation.
+    dist = current_distance_atr(cur.close, level, atr(c5))
+    if dist > 0.65:
         return None
-    if not validate_risk(entry, sl):
+    lo, hi = entry_zone_from_level(level, atr(c5), direction)
+    if not validate_zone_risk(direction, lo, hi, sl):
         return None
-    tps = target_levels(direction, entry, sl, c15)
-    if not tps:
-        return None
-    score = final_score(base_score(ticker, c5, c15, vr), bonuses, [])
-    # Higher-timeframe agreement adds quality but does not create the setup.
-    tstate = trend_state(c15)
-    if (direction == 'LONG' and tstate == 'LONG') or (direction == 'SHORT' and tstate == 'SHORT'):
-        score = min(99, score + 3)
+    eq = entry_quality(direction, cur.close, level, atr(c5), m2h, 0, vr, cur)
+    score = final_score(base_score(ticker, c5, c15, vr), eq, [5 if abs(ch) >= STRONG_24H_MOVE else 0], [])
     if score < MIN_SCORE:
         return None
-    lo, hi = entry_zone(entry, atr(c5), direction)
-    chart = c5[-96:]
-    ext_index = max(0, len(chart) - 2 - 60)
-    return Setup(iid, get_coin(iid), direction, 'EXTREME REVERSAL', pattern,
-                 level, point_label, lo, hi, sl, *tps, score, reason,
-                 ticker['vol24h_usd'], ch, ticker['range24h_pct'], atr_pct(c5),
-                 atr_pct(c15), vr, chart,
-                 [(ext_index, level, point_label), (len(chart)-1, entry, 'CONFIRM')],
-                 '1–8 ч')
+    return build_setup_common(iid, ticker, direction, 'EXTREME REVERSAL',
+        'ЭКСТРЕМУМ → ПОДТВЕРЖДЁННЫЙ РАЗВОРОТ', level, 'EXTREME', sl, c15, c5, vr,
+        score, reason, [(len(c5[-96:])-1, level, 'EXTREME'), (len(c5[-96:])-1, cur.close, 'CONFIRM')], '1–6 ч')
+
 
 # ============================================================
-# STRATEGY 2 — BREAKOUT + RETEST
+# STRATEGY 2 — BREAKOUT + RETEST + CONTINUATION
 # ============================================================
+
+def _find_recent_break(c5: List[Candle], level: float, direction: str, lookback: int = 10):
+    start = max(1, len(c5) - lookback - 1)
+    for i in range(len(c5) - 2, start - 1, -1):
+        c = c5[i]
+        prev = c5[i-1]
+        if direction == 'LONG' and c.close > level and prev.close <= level:
+            return i
+        if direction == 'SHORT' and c.close < level and prev.close >= level:
+            return i
+    return None
+
 
 def build_breakout(iid, ticker, data) -> Optional[Setup]:
     c5, c15, c1h = data['5m'], data['15m'], data['1h']
-    if min(len(c5), len(c15), len(c1h)) < 70:
+    if min(len(c5), len(c15), len(c1h)) < 80:
         return None
     vr = vol_ratio(c5)
     if vr < MIN_BREAKOUT_VOLUME:
@@ -711,167 +756,205 @@ def build_breakout(iid, ticker, data) -> Optional[Setup]:
     levels = cluster_levels(c15, 0.30)
     if not levels:
         return None
-    cur, prev = c5[-1], c5[-2]
-    support, resistance = nearest_support_resistance(cur.close, levels)
-    direction = None
-    level = None
-    touches = 0
 
-    # Find a meaningful nearby structure level from prior candles, then require
-    # a break and a retest/hold rather than a raw one-candle breakout.
-    highs = [p for p, k, t in levels if k == 'HIGH' and t >= 2 and p < cur.close * 1.012]
-    lows = [p for p, k, t in levels if k == 'LOW' and t >= 2 and p > cur.close * 0.988]
-    if highs:
-        candidate = max(highs)
-        if cur.close > candidate and prev.high >= candidate * 0.997:
-            direction, level = 'LONG', candidate
-            touches = max(t for p, k, t in levels if k == 'HIGH' and abs(p-candidate)/candidate < 0.003)
-    if lows and direction is None:
-        candidate = min(lows)
-        if cur.close < candidate and prev.low <= candidate * 1.003:
-            direction, level = 'SHORT', candidate
-            touches = max(t for p, k, t in levels if k == 'LOW' and abs(p-candidate)/candidate < 0.003)
-    if not direction:
-        return None
+    cur = c5[-1]
+    candidates = [(p, t) for p, k, t in levels if t >= 2 and p < cur.close and k == 'HIGH']
+    for level, touches in sorted(candidates, key=lambda x: x[0], reverse=True):
+        bi = _find_recent_break(c5, level, 'LONG', 12)
+        if bi is None or bi >= len(c5)-1:
+            continue
+        retest = c5[bi+1:-1]
+        if not retest:
+            continue
+        # Price must actually come back to the broken level after the breakout.
+        if not any(c.low <= level * 1.003 for c in retest):
+            continue
+        if cur.close <= level or cur.close <= c5[-2].close:
+            continue
+        if body_ratio(cur) < 0.40 or close_location(cur) < 0.58:
+            continue
+        # Avoid buying after a vertical continuation away from the retest.
+        a5 = atr(c5)
+        if current_distance_atr(cur.close, level, a5) > 0.80:
+            continue
+        sl = min(level, min(c.low for c in retest[-4:])) - a5 * 0.22
+        lo, hi = entry_zone_from_level(level, a5, 'LONG')
+        if not validate_zone_risk('LONG', lo, hi, sl):
+            continue
+        pullback = pct_move(min(c.low for c in retest), max(c.high for c in c5[bi:bi+1]))
+        impulse = pct_move(c5[bi].close, c5[max(0, bi-8)].close)
+        eq = entry_quality('LONG', cur.close, level, a5, impulse, pullback, vr, cur, touches)
+        score = final_score(base_score(ticker, c5, c15, vr), eq, [8, min(6, touches)], [])
+        if score < MIN_SCORE:
+            continue
+        reason = f'15M сопротивление {touches}× → отдельный пробой → откат к уровню → 5M continuation; объём x{vr:.2f}'
+        return build_setup_common(iid, ticker, 'LONG', 'BREAKOUT + RETEST', 'ПРОБОЙ → РЕТЕСТ → ПРОДОЛЖЕНИЕ',
+            level, 'BROKEN RESISTANCE', sl, c15, c5, vr, score, reason,
+            [(bi, level, 'BREAK'), (len(c5[-96:])-2, level, 'RETEST'), (len(c5[-96:])-1, cur.close, 'CONFIRM')], '1–6 ч')
 
-    # Retest: current candle must interact with broken level and close away from it.
-    if direction == 'LONG':
-        if cur.low > level * 1.006:
-            return None
-        if cur.close <= level or cur.close <= prev.close:
-            return None
-        sl = min(level, cur.low) - atr(c5) * 0.30
-        reason = f'15M сопротивление {touches}× → пробой → ретест → 5M подтверждение; объём x{vr:.2f}'
-    else:
-        if cur.high < level * 0.994:
-            return None
-        if cur.close >= level or cur.close >= prev.close:
-            return None
-        sl = max(level, cur.high) + atr(c5) * 0.30
-        reason = f'15M поддержка {touches}× → пробой → ретест → 5M подтверждение; объём x{vr:.2f}'
+    candidates = [(p, t) for p, k, t in levels if t >= 2 and p > cur.close and k == 'LOW']
+    for level, touches in sorted(candidates, key=lambda x: x[0]):
+        bi = _find_recent_break(c5, level, 'SHORT', 12)
+        if bi is None or bi >= len(c5)-1:
+            continue
+        retest = c5[bi+1:-1]
+        if not retest:
+            continue
+        if not any(c.high >= level * 0.997 for c in retest):
+            continue
+        if cur.close >= level or cur.close >= c5[-2].close:
+            continue
+        if body_ratio(cur) < 0.40 or close_location(cur) > 0.42:
+            continue
+        a5 = atr(c5)
+        if current_distance_atr(cur.close, level, a5) > 0.80:
+            continue
+        sl = max(level, max(c.high for c in retest[-4:])) + a5 * 0.22
+        lo, hi = entry_zone_from_level(level, a5, 'SHORT')
+        if not validate_zone_risk('SHORT', lo, hi, sl):
+            continue
+        pullback = pct_move(max(c.high for c in retest), min(c.low for c in c5[bi:bi+1]))
+        impulse = pct_move(c5[bi].close, c5[max(0, bi-8)].close)
+        eq = entry_quality('SHORT', cur.close, level, a5, impulse, pullback, vr, cur, touches)
+        score = final_score(base_score(ticker, c5, c15, vr), eq, [8, min(6, touches)], [])
+        if score < MIN_SCORE:
+            continue
+        reason = f'15M поддержка {touches}× → отдельный пробой → откат к уровню → 5M continuation; объём x{vr:.2f}'
+        return build_setup_common(iid, ticker, 'SHORT', 'BREAKOUT + RETEST', 'ПРОБОЙ → РЕТЕСТ → ПРОДОЛЖЕНИЕ',
+            level, 'BROKEN SUPPORT', sl, c15, c5, vr, score, reason,
+            [(bi, level, 'BREAK'), (len(c5[-96:])-2, level, 'RETEST'), (len(c5[-96:])-1, cur.close, 'CONFIRM')], '1–6 ч')
+    return None
 
-    entry = cur.close
-    if abs(entry-level)/max(entry,1e-12)*100 > MAX_ENTRY_CHASE_PCT:
-        return None
-    if not validate_risk(entry, sl):
-        return None
-    tps = target_levels(direction, entry, sl, c15)
-    if not tps:
-        return None
-    score = final_score(base_score(ticker,c5,c15,vr), [8, min(6, touches), 5 if vr >= 1.8 else 0], [])
-    if score < MIN_SCORE:
-        return None
-    lo, hi = entry_zone(entry, atr(c5), direction)
-    return Setup(iid,get_coin(iid),direction,'BREAKOUT + RETEST','ПРОБОЙ + РЕТЕСТ',level,'BROKEN LEVEL',lo,hi,sl,*tps,score,reason,
-                 ticker['vol24h_usd'],ticker['change24h_pct'],ticker['range24h_pct'],atr_pct(c5),atr_pct(c15),vr,c5[-96:],
-                 [(len(c5[-96:])-2,level,'RETEST'),(len(c5[-96:])-1,entry,'CONFIRM')],'1–6 ч')
 
 # ============================================================
-# STRATEGY 3 — TREND PULLBACK
+# STRATEGY 3 — TREND PULLBACK (PRIMARY)
 # ============================================================
 
 def build_pullback(iid, ticker, data) -> Optional[Setup]:
-    c5,c15,c1h=data['5m'],data['15m'],data['1h']
-    if min(len(c5),len(c15),len(c1h))<70:
+    c5, c15, c1h = data['5m'], data['15m'], data['1h']
+    if min(len(c5), len(c15), len(c1h)) < 80:
         return None
-    trend=trend_state(c1h)
+    trend = trend_state(c1h)
     if not trend:
         return None
-    e20_15=ema([c.close for c in c15],20)
-    if len(e20_15)<10:
+    e20 = ema([c.close for c in c15], 20)
+    e50 = ema([c.close for c in c15], 50)
+    if len(e20) < 10 or len(e50) < 10:
         return None
-    cur,prev=c5[-1],c5[-2]
-    vr=vol_ratio(c5)
-    recent=c15[-10:-2]
-    if len(recent)<5:
+    vr = vol_ratio(c5)
+    cur, prev = c5[-1], c5[-2]
+    a5 = atr(c5)
+
+    recent = c15[-9:-1]
+    if len(recent) < 6:
         return None
 
-    if trend=='LONG':
-        pull_low=min(c.low for c in recent)
-        # Price must have pulled back toward 15M EMA, then reclaim it on 5M.
-        if not any(c.low <= e20_15[-3]*1.003 for c in recent):
+    if trend == 'LONG':
+        if not (e20[-1] > e50[-1] and e20[-1] > e20[-4]):
             return None
-        if not (cur.close > e20_15[-1] and cur.close > prev.high and cur.close > cur.open):
+        impulse_start = c15[-13].close
+        impulse = pct_move(c15[-2].close, impulse_start)
+        if impulse < 2.0:
             return None
-        level=pull_low
-        sl=pull_low-atr(c5)*0.30
-        reason=f'1H восходящий тренд → 15M откат к EMA20 → 5M возврат выше уровня; объём x{vr:.2f}'
+        pull_low = min(c.low for c in recent)
+        # Pullback must enter the moving-average/structure zone.
+        if pull_low > e20[-2] * 1.004:
+            return None
+        # But trend must remain structurally intact.
+        if pull_low < e50[-2] * 0.995:
+            return None
+        level = e20[-1]
+        # 5M trigger: reclaim local pullback micro-resistance, not a huge chase candle.
+        micro_high = max(c.high for c in c5[-6:-1])
+        if not (cur.close > micro_high and cur.close > cur.open):
+            return None
+        if current_distance_atr(cur.close, level, a5) > 0.85:
+            return None
+        pullback_pct = (pull_low - e20[-2]) / max(e20[-2], 1e-12) * 100
+        sl = min(pull_low, min(c.low for c in c5[-8:])) - a5 * 0.20
+        reason = f'1H LONG trend → 15M impulse {impulse:+.1f}% → откат к EMA20 → 5M reclaim; объём x{vr:.2f}'
+        points_label = 'PULLBACK LOW'
     else:
-        pull_high=max(c.high for c in recent)
-        if not any(c.high >= e20_15[-3]*0.997 for c in recent):
+        if not (e20[-1] < e50[-1] and e20[-1] < e20[-4]):
             return None
-        if not (cur.close < e20_15[-1] and cur.close < prev.low and cur.close < cur.open):
+        impulse_start = c15[-13].close
+        impulse = pct_move(c15[-2].close, impulse_start)
+        if impulse > -2.0:
             return None
-        level=pull_high
-        sl=pull_high+atr(c5)*0.30
-        reason=f'1H нисходящий тренд → 15M откат к EMA20 → 5M возврат ниже уровня; объём x{vr:.2f}'
+        pull_high = max(c.high for c in recent)
+        if pull_high < e20[-2] * 0.996:
+            return None
+        if pull_high > e50[-2] * 1.005:
+            return None
+        level = e20[-1]
+        micro_low = min(c.low for c in c5[-6:-1])
+        if not (cur.close < micro_low and cur.close < cur.open):
+            return None
+        if current_distance_atr(cur.close, level, a5) > 0.85:
+            return None
+        pullback_pct = (pull_high - e20[-2]) / max(e20[-2], 1e-12) * 100
+        sl = max(pull_high, max(c.high for c in c5[-8:])) + a5 * 0.20
+        reason = f'1H SHORT trend → 15M impulse {impulse:+.1f}% → откат к EMA20 → 5M reclaim; объём x{vr:.2f}'
+        points_label = 'PULLBACK HIGH'
 
-    entry=cur.close
-    if not validate_risk(entry,sl):
+    lo, hi = entry_zone_from_level(level, a5, trend)
+    if not validate_zone_risk(trend, lo, hi, sl):
         return None
-    if abs(entry-level)/max(entry,1e-12)*100>MAX_ENTRY_CHASE_PCT*1.5:
+    eq = entry_quality(trend, cur.close, level, a5, impulse, pullback_pct, vr, cur)
+    score = final_score(base_score(ticker, c5, c15, vr), eq, [10, 5 if vr >= 1.2 else 0], [])
+    if score < MIN_SCORE:
         return None
-    tps=target_levels(trend,entry,sl,c15)
-    if not tps:
-        return None
-    score=final_score(base_score(ticker,c5,c15,vr),[8,5 if vr>=1.2 else 0,5],[])
-    if score<MIN_SCORE:
-        return None
-    lo,hi=entry_zone(entry,atr(c5),trend)
-    return Setup(iid,get_coin(iid),trend,'TREND PULLBACK','ТРЕНДОВЫЙ ОТКАТ',level,'PULLBACK LOW' if trend=='LONG' else 'PULLBACK HIGH',lo,hi,sl,*tps,score,reason,
-                 ticker['vol24h_usd'],ticker['change24h_pct'],ticker['range24h_pct'],atr_pct(c5),atr_pct(c15),vr,c5[-96:],
-                 [(len(c5[-96:])-1,entry,'TRIGGER')],'1–8 ч')
+    return build_setup_common(iid, ticker, trend, 'TREND PULLBACK', 'ИМПУЛЬС → ОТКАТ → ПРОДОЛЖЕНИЕ',
+        level, 'EMA20 PULLBACK', sl, c15, c5, vr, score, reason,
+        [(len(c5[-96:])-6, level, points_label), (len(c5[-96:])-1, cur.close, 'TRIGGER')], '1–8 ч')
+
 
 # ============================================================
-# STRATEGY 4 — MEAN REVERSION
+# STRATEGY 4 — MEAN REVERSION (OPPORTUNISTIC, VERY RARE)
 # ============================================================
 
-def build_mean_reversion(iid,ticker,data)->Optional[Setup]:
-    c5,c15=data['5m'],data['15m']
-    if len(c5)<90 or len(c15)<70:
+def build_mean_reversion(iid, ticker, data) -> Optional[Setup]:
+    c5, c15 = data['5m'], data['15m']
+    if len(c5) < 90 or len(c15) < 70:
         return None
-    e20=ema([c.close for c in c15],20)[-1]
-    cur,prev=c5[-1],c5[-2]
-    deviation=(cur.close-e20)/max(e20,1e-12)*100
-    direction='LONG' if deviation<=-2.5 else 'SHORT' if deviation>=2.5 else None
+    e20 = ema([c.close for c in c15], 20)[-1]
+    cur, prev = c5[-1], c5[-2]
+    deviation = (cur.close - e20) / max(e20, 1e-12) * 100
+    direction = 'LONG' if deviation <= -3.5 else 'SHORT' if deviation >= 3.5 else None
     if not direction:
         return None
-    vr=vol_ratio(c5)
-    if vr<MIN_VOLUME_RATIO:
+    vr = vol_ratio(c5)
+    if vr < MIN_VOLUME_RATIO:
         return None
-    if direction=='LONG':
-        if not(cur.close>cur.open and cur.close>prev.high and close_location(cur)>=0.62):
+    # Do not fight a clean trend. Reversion is only for an exhaustion move.
+    if direction == 'LONG' and trend_state(c15) == 'SHORT':
+        return None
+    if direction == 'SHORT' and trend_state(c15) == 'LONG':
+        return None
+    if direction == 'LONG':
+        if not (cur.close > cur.open and cur.close > prev.high and close_location(cur) >= 0.65):
             return None
-        sl=min(c.low for c in c5[-8:])-atr(c5)*0.25
+        level = e20
+        sl = min(c.low for c in c5[-8:]) - atr(c5) * 0.22
     else:
-        if not(cur.close<cur.open and cur.close<prev.low and close_location(cur)<=0.38):
+        if not (cur.close < cur.open and cur.close < prev.low and close_location(cur) <= 0.35):
             return None
-        sl=max(c.high for c in c5[-8:])+atr(c5)*0.25
-    entry=cur.close
-    if not validate_risk(entry,sl):
+        level = e20
+        sl = max(c.high for c in c5[-8:]) + atr(c5) * 0.22
+    lo, hi = entry_zone_from_level(level, atr(c5), direction)
+    if not validate_zone_risk(direction, lo, hi, sl):
         return None
-    tps=target_levels(direction,entry,sl,c15)
-    if not tps:
+    eq = entry_quality(direction, cur.close, level, atr(c5), deviation, 0, vr, cur)
+    score = final_score(base_score(ticker, c5, c15, vr), eq, [2], [])
+    if score < MIN_SCORE + 3:
         return None
-    # EMA is useful as a first mean-reversion target only if it is at least 1R away.
-    risk=abs(entry-sl)
-    ema_target=e20
-    if direction=='LONG' and ema_target>entry+risk:
-        tp1=ema_target
-    elif direction=='SHORT' and ema_target<entry-risk:
-        tp1=ema_target
-    else:
-        tp1=tps[0]
-    score=final_score(base_score(ticker,c5,c15,vr),[6,5 if abs(deviation)>=4 else 0],[])
-    if score<MIN_SCORE:
-        return None
-    lo,hi=entry_zone(entry,atr(c5),direction)
-    return Setup(iid,get_coin(iid),direction,'MEAN REVERSION','СИЛЬНОЕ ОТКЛОНЕНИЕ → ВОЗВРАТ',e20,'15M EMA20',lo,hi,sl,tp1,tps[1],tps[2],score,
-                 f'цена отклонена от 15M EMA20 на {deviation:+.2f}% → 5M подтверждение возврата',ticker['vol24h_usd'],ticker['change24h_pct'],ticker['range24h_pct'],atr_pct(c5),atr_pct(c15),vr,c5[-96:],
-                 [(len(c5[-96:])-1,entry,'REVERSAL')],'1–6 ч')
+    return build_setup_common(iid, ticker, direction, 'MEAN REVERSION', 'ЭКСТРЕМУМ → ВОЗВРАТ К EMA20',
+        level, '15M EMA20', sl, c15, c5, vr, score,
+        f'отклонение от EMA20 {deviation:+.2f}% → exhaustion → 5M reversal',
+        [(len(c5[-96:])-1, cur.close, 'REVERSAL')], '1–6 ч')
 
 
-STRATEGIES=(build_reversal,build_breakout,build_pullback,build_mean_reversion)
+STRATEGIES=(build_pullback,build_breakout,build_reversal,build_mean_reversion)
 
 # ============================================================
 # TELEGRAM VOTES
@@ -982,6 +1065,7 @@ def make_chart(setup:Setup)->str:
 def build_signal_text(s:Setup)->str:
     entry=(s.entry_low+s.entry_high)/2
     risk=abs(entry-s.sl)/max(entry,1e-12)*100
+    worst_risk=risk_pct_for_zone(s.direction,s.entry_low,s.entry_high,s.sl)
     rr2=abs(s.tp2-entry)/max(abs(entry-s.sl),1e-12)
     side='🟢 LONG' if s.direction=='LONG' else '🔴 SHORT'
     return (
@@ -992,7 +1076,7 @@ def build_signal_text(s:Setup)->str:
         f'⚡ <b>ATR:</b> 5M {s.atr5_pct:.2f}% · 15M {s.atr15_pct:.2f}%\n'
         f'💧 <b>Volume:</b> x{s.volume_ratio:.2f} · Turnover ${s.volume_24h/1_000_000:.1f}M\n\n'
         f'🎯 <b>Вход:</b> <code>{fmt_price(s.entry_low)} – {fmt_price(s.entry_high)}</code>\n'
-        f'🛑 <b>Стоп:</b> <code>{fmt_price(s.sl)}</code> · риск {risk:.2f}%\n'
+        f'🛑 <b>Стоп:</b> <code>{fmt_price(s.sl)}</code> · риск до {worst_risk:.2f}%\n'
         f'🎯 <b>TP1:</b> <code>{fmt_price(s.tp1)}</code>\n'
         f'🎯 <b>TP2:</b> <code>{fmt_price(s.tp2)}</code> · RR 1:{rr2:.1f}\n'
         f'🎯 <b>TP3:</b> <code>{fmt_price(s.tp3)}</code>\n\n'
@@ -1004,31 +1088,41 @@ def build_signal_text(s:Setup)->str:
     )
 
 
-def insert_signal(s:Setup)->int:
-    created=now_ts()
+def insert_signal(s:Setup) -> int:
+    created = now_ts()
     with db_lock:
-        cur=db.execute('''INSERT INTO signals(inst_id,direction,strategy,level,entry_low,entry_high,sl,tp1,tp2,tp3,score,status,created_at,expires_at)
-                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                       (s.inst_id,s.direction,s.strategy,s.level,s.entry_low,s.entry_high,s.sl,s.tp1,s.tp2,s.tp3,s.score,'READY',created,created+READY_TTL_MINUTES*60))
-        sid=cur.lastrowid; db.commit()
+        cur = db.execute("""INSERT INTO signals(
+            inst_id,direction,strategy,level,entry_low,entry_high,sl,tp1,tp2,tp3,
+            score,status,created_at,expires_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (s.inst_id,s.direction,s.strategy,s.level,s.entry_low,s.entry_high,s.sl,
+         s.tp1,s.tp2,s.tp3,s.score,'READY',created,created+READY_TTL_MINUTES*60))
+        sid = cur.lastrowid
+        db.commit()
     return sid
 
 
-def send_signal(s:Setup)->bool:
-    path=None; sid=None
+def send_signal(s:Setup) -> bool:
+    path = None
+    sid = None
     try:
-        path=make_chart(s)
-        sid=insert_signal(s)
-        with open(path,'rb') as f:
-            msg=bot.send_photo(CHANNEL_ID,f,caption=build_signal_text(s),parse_mode='HTML',show_caption_above_media=True,reply_markup=vote_keyboard(sid))
-        pending[s.inst_id]=PendingSignal(s,sid,now_ts(),now_ts()+READY_TTL_MINUTES*60,msg.message_id)
-        log.info('SIGNAL SENT | %s | %s | %s | score=%s | id=%s',s.coin,s.direction,s.strategy,s.score,sid)
+        path = make_chart(s)
+        sid = insert_signal(s)
+        with open(path, 'rb') as f:
+            msg = bot.send_photo(CHANNEL_ID, f, caption=build_signal_text(s), parse_mode='HTML',
+                                 show_caption_above_media=True, reply_markup=vote_keyboard(sid))
+        with db_lock:
+            db.execute('UPDATE signals SET message_id=? WHERE id=?', (msg.message_id, sid))
+            db.commit()
+        created = now_ts()
+        pending[s.inst_id] = PendingSignal(s, sid, created, created+READY_TTL_MINUTES*60, msg.message_id)
+        log.info('SIGNAL SENT | %s | %s | %s | score=%s | id=%s', s.coin, s.direction, s.strategy, s.score, sid)
         return True
     except Exception:
-        log.exception('SIGNAL SEND FAILED | %s',s.inst_id)
+        log.exception('SIGNAL SEND FAILED | %s', s.inst_id)
         if sid is not None:
             with db_lock:
-                db.execute("UPDATE signals SET status='SEND_FAILED' WHERE id=?",(sid,)); db.commit()
+                db.execute("UPDATE signals SET status='SEND_FAILED' WHERE id=?", (sid,)); db.commit()
         return False
     finally:
         if path:
@@ -1036,12 +1130,43 @@ def send_signal(s:Setup)->bool:
             except OSError: pass
 
 # ============================================================
-# SIGNAL LIFECYCLE
+# RUNTIME RECOVERY
 # ============================================================
 
-def send_update(text:str):
+def setup_from_row(row) -> Setup:
+    (sid, iid, direction, strategy, level, entry_low, entry_high, sl, tp1, tp2, tp3,
+     score, status, created_at, activated_at, expires_at, tp1_hit, tp2_hit, tp3_hit, message_id) = row
+    return Setup(iid, get_coin(iid), direction, strategy, '', float(level or 0), '',
+                 float(entry_low), float(entry_high), float(sl), float(tp1), float(tp2), float(tp3),
+                 int(score or 0), 'recovered after restart', 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, [])
+
+
+def load_runtime_state():
+    with db_lock:
+        rows = db.execute("""SELECT id,inst_id,direction,strategy,level,entry_low,entry_high,sl,tp1,tp2,tp3,
+            score,status,created_at,activated_at,expires_at,tp1_hit,tp2_hit,tp3_hit,message_id
+            FROM signals WHERE status IN ('READY','ACTIVE') ORDER BY created_at""").fetchall()
+    now = now_ts()
+    restored = 0
+    for row in rows:
+        setup = setup_from_row(row)
+        sid, iid, direction, strategy, level, entry_low, entry_high, sl, tp1, tp2, tp3, score, status, created_at, activated_at, expires_at, h1, h2, h3, message_id = row
+        if status == 'READY':
+            if expires_at and float(expires_at) <= now:
+                with db_lock:
+                    db.execute("UPDATE signals SET status='EXPIRED',result='EXPIRED',closed_at=? WHERE id=? AND status='READY'", (now, sid)); db.commit()
+                continue
+            pending[iid] = PendingSignal(setup, sid, float(created_at), float(expires_at), int(message_id or 0))
+        else:
+            active[iid] = ActiveSignal(setup, sid, float(activated_at or created_at), int(message_id or 0),
+                                       bool(h1), bool(h2), bool(h3), 0, 0)
+        restored += 1
+    log.info('RECOVERY | restored=%d pending=%d active=%d', restored, len(pending), len(active))
+
+
+def send_update(text: str):
     try:
-        bot.send_message(CHANNEL_ID,text,parse_mode='HTML')
+        bot.send_message(CHANNEL_ID, text, parse_mode='HTML')
     except Exception:
         log.exception('TELEGRAM UPDATE FAILED')
 
@@ -1050,91 +1175,83 @@ def price_in_entry(s:Setup, price:float)->bool:
     return s.entry_low <= price <= s.entry_high
 
 
-def lifecycle_for_symbol(iid:str, cs:List[Candle]):
-    if len(cs)<3:
-        return
-    last=cs[-1]
-    # 1) Pending: wait for actual entry-zone touch.
-    p=pending.get(iid)
-    if p:
-        s=p.setup
-        if now_ts()>p.expires_at:
-            with db_lock:
-                db.execute("UPDATE signals SET status='EXPIRED' WHERE id=? AND status='READY'",(p.signal_id,)); db.commit()
-            pending.pop(iid,None)
-        elif price_in_entry(s,last.close) or (last.low<=s.entry_high and last.high>=s.entry_low):
-            with db_lock:
-                db.execute("UPDATE signals SET status='ACTIVE',activated_at=? WHERE id=? AND status='READY'",(now_ts(),p.signal_id)); db.commit()
-            active[iid]=ActiveSignal(s,p.signal_id,now_ts(),p.message_id)
-            pending.pop(iid,None)
+def _close_signal(signal_id:int, status:str, result:str, r_multiple:float=0.0):
+    with db_lock:
+        db.execute("UPDATE signals SET status=?,result=?,closed_at=?,r_multiple=? WHERE id=? AND status IN ('READY','ACTIVE')",
+                   (status,result,now_ts(),r_multiple,signal_id)); db.commit()
 
+
+def lifecycle_for_symbol(iid:str, cs:List[Candle]):
+    if len(cs) < 3:
+        return
+    last = cs[-1]
+    p = pending.get(iid)
+    if p:
+        if now_ts() > p.expires_at:
+            _close_signal(p.signal_id,'EXPIRED','EXPIRED',0.0); pending.pop(iid,None); p=None
+        elif price_in_entry(p.setup,last.close) or (last.low <= p.setup.entry_high and last.high >= p.setup.entry_low):
+            activated=now_ts()
+            with db_lock:
+                db.execute("UPDATE signals SET status='ACTIVE',activated_at=? WHERE id=? AND status='READY'",(activated,p.signal_id)); db.commit()
+            # Never evaluate the activation candle for TP/SL: intrabar order is unknowable.
+            active[iid]=ActiveSignal(p.setup,p.signal_id,activated,p.message_id,False,False,False,last.ts,last.ts)
+            pending.pop(iid,None)
     a=active.get(iid)
-    if not a:
+    if not a or not last.confirmed:
         return
-    s=a.setup
-    # Use the latest confirmed candle. If TP and SL are both inside the same
-    # candle, the exact intrabar order is unknown; conservatively count SL first.
-    if not last.confirmed:
+    eligible=[c for c in cs if c.confirmed and c.ts>a.activated_candle_ts]
+    if not eligible:
         return
-    long=s.direction=='LONG'
+    last=eligible[-1]
+    if last.ts<=a.last_processed_candle_ts:
+        return
+    a.last_processed_candle_ts=last.ts
+    s=a.setup; long=s.direction=='LONG'
     hit1=last.high>=s.tp1 if long else last.low<=s.tp1
     hit2=last.high>=s.tp2 if long else last.low<=s.tp2
     hit3=last.high>=s.tp3 if long else last.low<=s.tp3
     stop=last.low<=s.sl if long else last.high>=s.sl
-    both=stop and hit1
-
     with db_lock:
         row=db.execute('SELECT tp1_hit,tp2_hit,tp3_hit FROM signals WHERE id=?',(a.signal_id,)).fetchone()
-    if not row:
-        return
-    h1,h2,h3=row
-
-    if both and not h1:
-        # Conservative handling for an ambiguous candle.
-        with db_lock:
-            db.execute("UPDATE signals SET status='CLOSED_LOSS',result='SL',closed_at=?,r_multiple=-1 WHERE id=?",(now_ts(),a.signal_id)); db.commit()
-        send_update(f'🔴 <b>STOP — {s.coin}USDT</b>\nСтоп затронут в свече с неоднозначным пересечением целей. Результат засчитан консервативно по SL.')
-        active.pop(iid,None)
-        return
-
+    if not row: return
+    h1,h2,h3=[bool(x) for x in row]
+    # Any TP and SL on the same candle is ambiguous; conservative result is SL.
+    if stop and (hit1 or hit2 or hit3):
+        _close_signal(a.signal_id,'CLOSED_LOSS','SL',-1.0)
+        send_update(f'🔴 <b>STOP — {s.coin}USDT</b>\nTP и SL были затронуты одной свечой. Порядок неизвестен — результат консервативно засчитан по SL.')
+        active.pop(iid,None); return
     if hit1 and not h1:
-        with db_lock:
-            db.execute("UPDATE signals SET tp1_hit=1 WHERE id=?",(a.signal_id,)); db.commit()
+        with db_lock: db.execute('UPDATE signals SET tp1_hit=1 WHERE id=?',(a.signal_id,)); db.commit()
         a.tp1_sent=True
         send_update(f'🟢 <b>TP1 — {s.coin}USDT</b>\nЦена достигла <code>{fmt_price(s.tp1)}</code>.\nЧасть позиции можно зафиксировать по своему плану.')
     if hit2 and not h2:
-        with db_lock:
-            db.execute("UPDATE signals SET tp2_hit=1 WHERE id=?",(a.signal_id,)); db.commit()
+        with db_lock: db.execute('UPDATE signals SET tp2_hit=1 WHERE id=?',(a.signal_id,)); db.commit()
         a.tp2_sent=True
         send_update(f'🚀 <b>TP2 — {s.coin}USDT</b>\nЦена достигла <code>{fmt_price(s.tp2)}</code>.\nОстаток сопровождаем по плану.')
     if hit3 and not h3:
         entry=(s.entry_low+s.entry_high)/2
         r=abs(s.tp3-entry)/max(abs(entry-s.sl),1e-12)
         with db_lock:
-            db.execute("UPDATE signals SET tp3_hit=1,status='CLOSED_WIN',result='TP3',closed_at=?,r_multiple=? WHERE id=?",(now_ts(),r,a.signal_id)); db.commit()
+            db.execute("UPDATE signals SET tp1_hit=1,tp2_hit=1,tp3_hit=1,status='CLOSED_WIN',result='TP3',closed_at=?,r_multiple=? WHERE id=?",(now_ts(),r,a.signal_id)); db.commit()
         send_update(f'🏁 <b>TP3 — {s.coin}USDT</b>\nЦена достигла <code>{fmt_price(s.tp3)}</code>.\nРезультат зафиксирован: TP3.')
-        active.pop(iid,None)
-        return
+        active.pop(iid,None); return
     if stop:
-        with db_lock:
-            db.execute("UPDATE signals SET status='CLOSED_LOSS',result='SL',closed_at=?,r_multiple=-1 WHERE id=?",(now_ts(),a.signal_id)); db.commit()
+        _close_signal(a.signal_id,'CLOSED_LOSS','SL',-1.0)
         send_update(f'🔴 <b>STOP — {s.coin}USDT</b>\nЦена достигла стопа <code>{fmt_price(s.sl)}</code>.\nСделка закрыта по плановому риску.')
-        active.pop(iid,None)
-        return
-
-    if now_ts()-a.activated_at > ACTIVE_MAX_HOURS*3600:
-        with db_lock:
-            db.execute("UPDATE signals SET status='TIMEOUT',result='TIMEOUT',closed_at=? WHERE id=?",(now_ts(),a.signal_id)); db.commit()
+        active.pop(iid,None); return
+    if now_ts()-a.activated_at>ACTIVE_MAX_HOURS*3600:
+        _close_signal(a.signal_id,'TIMEOUT','TIMEOUT',0.0)
         send_update(f'⚪ <b>TIMEOUT — {s.coin}USDT</b>\nСделка не дошла до TP3/SL в установленное время. Результат закрыт как TIMEOUT.')
         active.pop(iid,None)
 
 
 def update_signal_results():
+    if not pending and not active:
+        load_runtime_state()
     symbols=set(pending)|set(active)
     for iid in list(symbols):
         try:
-            cs=get_candles(iid,'5m',80)
-            lifecycle_for_symbol(iid,cs)
+            lifecycle_for_symbol(iid,get_candles(iid,'5m',100))
         except Exception:
             log.exception('LIFECYCLE FAILED | %s',iid)
 
@@ -1218,9 +1335,12 @@ def weekly_report():
         total=db.execute('SELECT COUNT(*) FROM signals WHERE created_at>=?',(since,)).fetchone()[0]
         wins=db.execute("SELECT COUNT(*) FROM signals WHERE created_at>=? AND result='TP3'",(since,)).fetchone()[0]
         losses=db.execute("SELECT COUNT(*) FROM signals WHERE created_at>=? AND result='SL'",(since,)).fetchone()[0]
+        timeouts=db.execute("SELECT COUNT(*) FROM signals WHERE created_at>=? AND result='TIMEOUT'",(since,)).fetchone()[0]
+        expired=db.execute("SELECT COUNT(*) FROM signals WHERE created_at>=? AND result='EXPIRED'",(since,)).fetchone()[0]
+        avg_r=db.execute("SELECT AVG(r_multiple) FROM signals WHERE created_at>=? AND result IN ('TP3','SL')",(since,)).fetchone()[0] or 0.0
     try:
         bot.send_message(CHANNEL_ID,
-            f'📊 <b>QUANTUM — неделя</b>\n\nСигналов: <b>{total}</b>\nПрибыльных закрытых: <b>{wins}</b>\nУбыточных закрытых: <b>{losses}</b>',
+            f'📊 <b>QUANTUM — неделя</b>\n\nСигналов: <b>{total}</b>\nTP3: <b>{wins}</b>\nSL: <b>{losses}</b>\nTIMEOUT: <b>{timeouts}</b>\nНе активировались: <b>{expired}</b>\nСредний R по TP3/SL: <b>{avg_r:+.2f}</b>',
             parse_mode='HTML')
         with db_lock:
             db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES('weekly_report',?)",(key,)); db.commit()
@@ -1251,11 +1371,12 @@ def startup_healthcheck():
 
 def main():
     log.info('============================================================')
-    log.info('QUANTUM INTRADAY SWING ENGINE V2 STARTED')
-    log.info('Strategies: Extreme Reversal | Breakout+Retest | Pullback | Mean Reversion')
+    log.info('QUANTUM INTRADAY SWING ENGINE V3 STARTED')
+    log.info('Strategies: Trend Pullback | Breakout+Retest | Rare Reversal | Rare Mean Reversion')
     log.info('Universe: gainers | losers | volatile | new active | small alts')
     log.info('============================================================')
     startup_healthcheck()
+    load_runtime_state()
     start_telegram_polling()
 
     while True:

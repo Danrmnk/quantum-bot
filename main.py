@@ -175,6 +175,8 @@ class ActiveSignal:
 
 pending: Dict[str, PendingSignal] = {}
 active: Dict[str, ActiveSignal] = {}
+sending_symbols = set()
+sending_lock = threading.Lock()
 candle_cache: Dict[Tuple[str, str], Tuple[float, List[Candle]]] = {}
 ticker_cache: Dict[str, Tuple[float, dict]] = {}
 
@@ -671,18 +673,20 @@ def common_validate(setup: Setup) -> bool:
         return False
     if not validate_zone_risk(setup.direction, setup.entry_low, setup.entry_high, setup.sl):
         return False
-    mid = (setup.entry_low + setup.entry_high) / 2
-    risk = abs(mid - setup.sl)
+    # Evaluate RR at the unfavorable edge of the entry zone, not the midpoint.
+    worst_entry = setup.entry_high if setup.direction == 'LONG' else setup.entry_low
+    risk = abs(worst_entry - setup.sl)
     if risk <= 0:
         return False
-    rr2 = abs(setup.tp2 - mid) / risk
+    reward2 = (setup.tp2 - worst_entry) if setup.direction == 'LONG' else (worst_entry - setup.tp2)
+    rr2 = reward2 / risk
     if rr2 < MIN_RR_TP2:
         return False
     if setup.direction == 'LONG':
-        if not (setup.sl < setup.entry_low < setup.tp1 < setup.tp2 < setup.tp3):
+        if not (setup.sl < setup.entry_low < setup.entry_high < setup.tp1 < setup.tp2 < setup.tp3):
             return False
     else:
-        if not (setup.tp3 < setup.tp2 < setup.tp1 < setup.entry_high < setup.sl):
+        if not (setup.tp3 < setup.tp2 < setup.tp1 < setup.entry_low < setup.entry_high < setup.sl):
             return False
     if setup.score < MIN_SCORE:
         return False
@@ -723,6 +727,10 @@ def build_pullback(iid, ticker, data) -> Optional[Setup]:
     current = c5[-1]
     previous = c5[-2]
     atr5 = atr(c5)
+    # A pullback can form on quiet volume, but the actual 5M trigger should
+    # not be an almost inactive candle.
+    if vr < float(os.getenv('MIN_PULLBACK_TRIGGER_VOLUME', '0.55')):
+        return None
 
     if trend == 'LONG':
         impulse_window = c15[-26:-12]
@@ -1034,6 +1042,10 @@ def build_pre_breakout(iid, ticker, data) -> Optional[Setup]:
     vr = vol_ratio(c5)
     if not levels or atr5 <= 0:
         return None
+    # Quiet volume can precede a breakout, but an almost dead trigger is not
+    # enough evidence by itself. Compression is still checked separately.
+    if vr < float(os.getenv('MIN_PREBREAKOUT_VOLUME', '0.30')):
+        return None
 
     candidates = []
     # This search is deliberately about an UNBROKEN horizontal level.
@@ -1265,8 +1277,11 @@ def make_chart(setup: Setup) -> str:
 
 def build_signal_text(s: Setup) -> str:
     entry = (s.entry_low + s.entry_high) / 2
-    risk = abs(entry - s.sl) / max(entry, 1e-12) * 100
-    rr2 = abs(s.tp2 - entry) / max(abs(entry - s.sl), 1e-12)
+    worst_entry = s.entry_high if s.direction == 'LONG' else s.entry_low
+    risk = abs(worst_entry - s.sl) / max(worst_entry, 1e-12) * 100
+    worst_risk = abs(worst_entry - s.sl)
+    reward2 = (s.tp2 - worst_entry) if s.direction == 'LONG' else (worst_entry - s.tp2)
+    rr2 = reward2 / max(worst_risk, 1e-12)
     side = '🟢 LONG' if s.direction == 'LONG' else '🔴 SHORT'
     return (
         f'<b>{side} · {s.coin}USDT</b>\n'
@@ -1276,7 +1291,7 @@ def build_signal_text(s: Setup) -> str:
         f'⚡ <b>ATR:</b> 5M {s.atr5_pct:.2f}% · 15M {s.atr15_pct:.2f}%\n'
         f'💧 <b>Volume:</b> x{s.volume_ratio:.2f} · Turnover ${s.volume_24h/1_000_000:.1f}M\n\n'
         f'🎯 <b>Вход:</b> <code>{fmt_price(s.entry_low)} – {fmt_price(s.entry_high)}</code>\n'
-        f'🛑 <b>Стоп:</b> <code>{fmt_price(s.sl)}</code> · риск ≤ {risk:.2f}%\n'
+        f'🛑 <b>Стоп:</b> <code>{fmt_price(s.sl)}</code> · риск по краю зоны {risk:.2f}%\n'
         f'🎯 <b>TP1:</b> <code>{fmt_price(s.tp1)}</code>\n'
         f'🎯 <b>TP2:</b> <code>{fmt_price(s.tp2)}</code> · RR 1:{rr2:.1f}\n'
         f'🎯 <b>TP3:</b> <code>{fmt_price(s.tp3)}</code>\n\n'
@@ -1360,6 +1375,11 @@ def recover_runtime_state():
 def send_signal(s: Setup) -> bool:
     path = None
     sid = None
+    with sending_lock:
+        if s.inst_id in sending_symbols or s.inst_id in pending or s.inst_id in active:
+            log.info('DUPLICATE BLOCKED | %s | already sending/pending/active', s.inst_id)
+            return False
+        sending_symbols.add(s.inst_id)
     try:
         path = make_chart(s)
         sid = insert_signal(s)
@@ -1382,6 +1402,8 @@ def send_signal(s: Setup) -> bool:
                 db.commit()
         return False
     finally:
+        with sending_lock:
+            sending_symbols.discard(s.inst_id)
         if path:
             try:
                 os.remove(path)
@@ -1514,12 +1536,23 @@ def update_signal_results():
 # ============================================================
 
 def can_send(iid: str) -> bool:
+    # Block symbols that are currently being sent, READY, or ACTIVE. Also keep
+    # a DB-backed cooldown so a quick process restart cannot repost the same
+    # coin immediately. No global daily/hourly quota is applied.
+    with sending_lock:
+        if iid in sending_symbols:
+            return False
     if iid in pending or iid in active:
         return False
     with db_lock:
-        row = db.execute("SELECT created_at FROM signals WHERE inst_id=? AND status NOT IN ('SEND_FAILED') ORDER BY created_at DESC LIMIT 1",
+        row = db.execute("SELECT created_at,status FROM signals WHERE inst_id=? AND status NOT IN ('SEND_FAILED') ORDER BY created_at DESC LIMIT 1",
                          (iid,)).fetchone()
-    return not row or now_ts() - float(row[0]) >= COOLDOWN_MINUTES * 60
+    if not row:
+        return True
+    created_at, status = float(row[0]), str(row[1] or '')
+    if status in ('READY', 'ACTIVE'):
+        return False
+    return now_ts() - created_at >= COOLDOWN_MINUTES * 60
 
 # ============================================================
 # SCANNER — four independent strategy searches
@@ -1630,10 +1663,11 @@ def acquire_single_process_lock():
 
 def start_telegram_polling():
     if not acquire_single_process_lock():
-        raise RuntimeError('Another QUANTUM process already owns the Telegram polling lock.')
+        # Keep the market scanner alive; this process must not compete for
+        # getUpdates if another local process already owns the lock.
+        log.error('TELEGRAM POLLING DISABLED | another local process owns the lock')
+        return
     try:
-        # If a stale webhook exists, polling cannot work correctly. Remove it once
-        # before starting getUpdates. This does not create a second poller.
         bot.remove_webhook()
         time.sleep(0.5)
     except Exception:
@@ -1644,16 +1678,24 @@ def start_telegram_polling():
         while not polling_stop.is_set():
             try:
                 log.info('TELEGRAM POLLING START')
-                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20,
-                                     allowed_updates=['callback_query'])
-                backoff = 3
+                # polling(non_stop=False) lets a 409 escape to this handler;
+                # infinity_polling can internally reconnect forever on conflict.
+                bot.polling(non_stop=False, skip_pending=True, timeout=20,
+                            long_polling_timeout=20, allowed_updates=['callback_query'])
+                if not polling_stop.is_set():
+                    log.warning('TELEGRAM POLLING RETURNED | retrying in %ss', backoff)
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
             except Exception as exc:
-                text = str(exc)
-                if '409' in text or 'Conflict' in text or 'terminated by other getUpdates' in text:
-                    log.error('TELEGRAM 409 CONFLICT | another poller is using this bot token. '
-                              'Ensure Render runs exactly ONE instance/service worker. Retry in %ss.', backoff)
-                else:
-                    log.exception('TELEGRAM POLLING STOPPED')
+                text = str(exc).lower()
+                is_409 = getattr(exc, 'error_code', None) == 409 or ('409' in text and 'conflict' in text) or 'terminated by other getupdates' in text
+                if is_409:
+                    # Do not create a polling tug-of-war. Market scanning and
+                    # outgoing messages may continue, but callbacks need the
+                    # one process that owns polling. Fix extra Render service.
+                    log.error('TELEGRAM 409 CONFLICT | polling stopped in this process. Stop every other service/instance using this token except one.')
+                    return
+                log.exception('TELEGRAM POLLING ERROR | %s', exc)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)
 

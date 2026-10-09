@@ -1,41 +1,38 @@
 import os
 import time
-import math
 import logging
 import sqlite3
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import Optional, List, Dict, Tuple, Callable
+from typing import Optional, List, Dict, Tuple
 
 import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
+
 # ============================================================
-# QUANTUM INTRADAY SWING ENGINE V3
-# ============================================================
-# 5M = trigger / entry timing
-# 15M = setup structure / levels
-# 1H = context
+# QUANTUM INTRADAY SWING ENGINE V2
+# ------------------------------------------------------------
+# Purpose:
+#   Find high-momentum crypto futures setups for 1-8 hour holds.
+#   5M = trigger/entry, 15M = structure, 1H = context.
 #
-# Four genuinely different searches:
-#   1. TREND PULLBACK
-#   2. BREAKOUT + RETEST
-#   3. EXTREME REVERSAL
-#   4. PRE-BREAKOUT / LEVEL PRESSURE
+# Strategies:
+#   1) Extreme Reversal       strong mover -> exhaustion -> reversal
+#   2) Breakout + Retest      structure break -> retest -> continuation
+#   3) Trend Pullback          1H trend -> 15M pullback -> 5M trigger
+#   4) Mean Reversion          stretched 15M price -> 5M reversal
 #
-# Important architecture rule:
-# Each strategy searches for its OWN setup. There is no single
-# generic "setup search" reused by all four strategies.
-# Common validation is applied only after a strategy has produced
-# a candidate.
+# Important:
+#   This is a signal engine, not a profitability guarantee.
+#   The code deliberately prefers NO SIGNAL over a weak signal.
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', os.getenv('BOT_TOKEN', '')).strip()
@@ -52,33 +49,34 @@ if not CHANNEL_ID:
 # ---------------- market discovery ----------------
 MIN_24H_TURNOVER_USD = float(os.getenv('MIN_24H_TURNOVER_USD', '5000000'))
 PREFERRED_TURNOVER_USD = float(os.getenv('PREFERRED_TURNOVER_USD', '15000000'))
-TOP_GAINERS = int(os.getenv('TOP_GAINERS', '25'))
-TOP_LOSERS = int(os.getenv('TOP_LOSERS', '25'))
-TOP_VOLATILE = int(os.getenv('TOP_VOLATILE', '35'))
+TOP_GAINERS = int(os.getenv('TOP_GAINERS', '20'))
+TOP_LOSERS = int(os.getenv('TOP_LOSERS', '20'))
+TOP_VOLATILE = int(os.getenv('TOP_VOLATILE', '25'))
 NEW_ACTIVE_DAYS = int(os.getenv('NEW_ACTIVE_DAYS', '45'))
-NEW_ACTIVE_COUNT = int(os.getenv('NEW_ACTIVE_COUNT', '20'))
-DEEP_SCAN_LIMIT = int(os.getenv('DEEP_SCAN_LIMIT', '90'))
-MIN_ACTIVE_24H_RANGE_PCT = float(os.getenv('MIN_ACTIVE_24H_RANGE_PCT', '4.0'))
+NEW_ACTIVE_COUNT = int(os.getenv('NEW_ACTIVE_COUNT', '15'))
+DEEP_SCAN_LIMIT = int(os.getenv('DEEP_SCAN_LIMIT', '70'))
+MIN_ACTIVE_24H_RANGE_PCT = float(os.getenv('MIN_ACTIVE_24H_RANGE_PCT', '5.0'))
 
-# ---------------- activity / strategy thresholds ----------------
-MIN_24H_MOVE_FOR_REVERSAL = float(os.getenv('MIN_24H_MOVE_FOR_REVERSAL', '12'))
-STRONG_24H_MOVE = float(os.getenv('STRONG_24H_MOVE', '25'))
-MIN_2H_IMPULSE = float(os.getenv('MIN_2H_IMPULSE', '4'))
-MIN_ATR_5M_PCT = float(os.getenv('MIN_ATR_5M_PCT', '0.15'))
-MIN_ATR_15M_PCT = float(os.getenv('MIN_ATR_15M_PCT', '0.35'))
-MIN_VOLUME_RATIO = float(os.getenv('MIN_VOLUME_RATIO', '1.10'))
-MIN_REVERSAL_VOLUME_RATIO = float(os.getenv('MIN_REVERSAL_VOLUME_RATIO', '1.10'))
-MIN_BREAKOUT_VOLUME = float(os.getenv('MIN_BREAKOUT_VOLUME', '1.25'))
+# ---------------- momentum/reversal ----------------
+MIN_24H_MOVE_FOR_REVERSAL = float(os.getenv('MIN_24H_MOVE_FOR_REVERSAL', '15'))
+STRONG_24H_MOVE = float(os.getenv('STRONG_24H_MOVE', '30'))
+MIN_2H_IMPULSE = float(os.getenv('MIN_2H_IMPULSE', '5'))
+MIN_1H_IMPULSE = float(os.getenv('MIN_1H_IMPULSE', '3'))
+MIN_ATR_5M_PCT = float(os.getenv('MIN_ATR_5M_PCT', '0.18'))
+MIN_ATR_15M_PCT = float(os.getenv('MIN_ATR_15M_PCT', '0.45'))
+MIN_VOLUME_RATIO = float(os.getenv('MIN_VOLUME_RATIO', '1.20'))
+MIN_REVERSAL_VOLUME_RATIO = float(os.getenv('MIN_REVERSAL_VOLUME_RATIO', '1.15'))
 
-# ---------------- risk / entry ----------------
+# ---------------- strategy/risk ----------------
+MIN_BREAKOUT_VOLUME = float(os.getenv('MIN_BREAKOUT_VOLUME', '1.35'))
 MAX_ENTRY_CHASE_PCT = float(os.getenv('MAX_ENTRY_CHASE_PCT', '1.00'))
 MAX_RISK_PCT = float(os.getenv('MAX_RISK_PCT', '1.00'))
 MIN_RISK_PCT = float(os.getenv('MIN_RISK_PCT', '0.20'))
 TP1_R = float(os.getenv('TP1_R', '1.20'))
 TP2_R = float(os.getenv('TP2_R', '2.00'))
 TP3_R = float(os.getenv('TP3_R', '3.00'))
-MIN_RR_TP2 = float(os.getenv('MIN_RR_TP2', '1.70'))
-MIN_SCORE = int(os.getenv('MIN_SCORE', '78'))
+MIN_SCORE = int(os.getenv('MIN_SCORE', '82'))
+MAX_SIGNALS_PER_SCAN = int(os.getenv('MAX_SIGNALS_PER_SCAN', '2'))
 
 # ---------------- runtime ----------------
 SCAN_INTERVAL_SECONDS = int(os.getenv('SCAN_INTERVAL_SECONDS', '30'))
@@ -87,20 +85,21 @@ REQUEST_RETRIES = int(os.getenv('REQUEST_RETRIES', '3'))
 CANDLE_CACHE_SECONDS = int(os.getenv('CANDLE_CACHE_SECONDS', '15'))
 READY_TTL_MINUTES = int(os.getenv('READY_TTL_MINUTES', '20'))
 ACTIVE_MAX_HOURS = int(os.getenv('ACTIVE_MAX_HOURS', '12'))
-COOLDOWN_MINUTES = int(os.getenv('COOLDOWN_MINUTES', '45'))
-TELEGRAM_RETRY_SECONDS = int(os.getenv('TELEGRAM_RETRY_SECONDS', '20'))
+COOLDOWN_MINUTES = int(os.getenv('COOLDOWN_MINUTES', '120'))
+OKX_MIN_INTERVAL = float(os.getenv('OKX_MIN_INTERVAL', '0.08'))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 log = logging.getLogger('QUANTUM')
-
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode='HTML')
 session = requests.Session()
-session.headers.update({'User-Agent': 'QuantumIntradaySwing/3.0', 'Accept': 'application/json'})
+session.headers.update({'User-Agent': 'QuantumIntradaySwing/2.0', 'Accept': 'application/json'})
+_api_lock = threading.Lock()
+_last_api_ts = 0.0
+
 
 # ============================================================
 # DATA TYPES
 # ============================================================
-
 @dataclass
 class Candle:
     ts: int
@@ -116,16 +115,7 @@ class Candle:
 class Pivot:
     index: int
     price: float
-    kind: str
-
-@dataclass
-class Level:
-    price: float
-    kind: str
-    touches: int
-    first_index: int
-    last_index: int
-    strength: float
+    kind: str  # HIGH / LOW
 
 @dataclass
 class Setup:
@@ -143,7 +133,6 @@ class Setup:
     tp2: float
     tp3: float
     score: int
-    strategy_score: int
     reason: str
     volume_24h: float
     change24: float
@@ -154,6 +143,7 @@ class Setup:
     candles_5m: List[Candle]
     points: List[Tuple[int, float, str]] = field(default_factory=list)
     hold_hours: str = '1–8 ч'
+    message_id: int = 0
 
 @dataclass
 class PendingSignal:
@@ -175,41 +165,30 @@ class ActiveSignal:
 
 pending: Dict[str, PendingSignal] = {}
 active: Dict[str, ActiveSignal] = {}
-sending_symbols = set()
-sending_lock = threading.Lock()
 candle_cache: Dict[Tuple[str, str], Tuple[float, List[Candle]]] = {}
-ticker_cache: Dict[str, Tuple[float, dict]] = {}
+
 
 # ============================================================
-# DATABASE
+# DATABASE + MIGRATION
 # ============================================================
-
 def db_connect():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.execute('PRAGMA journal_mode=WAL')
     con.execute('PRAGMA busy_timeout=5000')
     return con
 
-
 db = db_connect()
 db_lock = threading.Lock()
 
 SIGNAL_COLUMNS = {
-    'coin': 'TEXT',
-    'pattern_name': 'TEXT',
-    'level_kind': 'TEXT',
-    'reason': 'TEXT',
-    'volume_24h': 'REAL DEFAULT 0',
-    'change24': 'REAL DEFAULT 0',
-    'range24': 'REAL DEFAULT 0',
-    'atr5_pct': 'REAL DEFAULT 0',
-    'atr15_pct': 'REAL DEFAULT 0',
-    'volume_ratio': 'REAL DEFAULT 0',
-    'hold_hours': 'TEXT DEFAULT \'1–8 ч\'',
-    'message_id': 'INTEGER DEFAULT 0',
-    'strategy_score': 'INTEGER DEFAULT 0',
+    'inst_id': 'TEXT', 'direction': 'TEXT', 'strategy': 'TEXT', 'level': 'REAL',
+    'entry_low': 'REAL', 'entry_high': 'REAL', 'sl': 'REAL', 'tp1': 'REAL', 'tp2': 'REAL', 'tp3': 'REAL',
+    'score': 'INTEGER', 'status': 'TEXT', 'created_at': 'REAL', 'activated_at': 'REAL',
+    'expires_at': 'REAL', 'tp1_hit': 'INTEGER DEFAULT 0', 'tp2_hit': 'INTEGER DEFAULT 0',
+    'tp3_hit': 'INTEGER DEFAULT 0', 'result': "TEXT DEFAULT ''", 'closed_at': 'REAL',
+    'r_multiple': 'REAL DEFAULT 0', 'pattern_name': "TEXT DEFAULT ''",
+    'reason': "TEXT DEFAULT ''", 'message_id': 'INTEGER DEFAULT 0'
 }
-
 
 def init_db():
     with db_lock:
@@ -227,10 +206,8 @@ def init_db():
             if name not in cols:
                 db.execute(f'ALTER TABLE signals ADD COLUMN {name} {typ}')
         db.execute('''CREATE TABLE IF NOT EXISTS signal_votes (
-            signal_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            vote TEXT NOT NULL,
-            created_at REAL NOT NULL,
+            signal_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            vote TEXT NOT NULL, created_at REAL NOT NULL,
             PRIMARY KEY(signal_id, user_id)
         )''')
         db.execute('''CREATE TABLE IF NOT EXISTS bot_state (
@@ -238,28 +215,22 @@ def init_db():
         )''')
         db.commit()
 
-
 init_db()
+
 
 # ============================================================
 # BASIC HELPERS
 # ============================================================
-
 def now_ts() -> float:
     return time.time()
-
 
 def local_now() -> datetime:
     return datetime.now(ZoneInfo(TIMEZONE))
 
-
 def get_coin(inst_id: str) -> str:
     return inst_id.replace('-USDT-SWAP', '')
 
-
 def fmt_price(p: float) -> str:
-    if p >= 1000:
-        return f'{p:,.2f}'.replace(',', ' ')
     if p >= 100:
         return f'{p:,.2f}'.replace(',', ' ')
     if p >= 1:
@@ -268,14 +239,11 @@ def fmt_price(p: float) -> str:
         return f'{p:.6f}'.rstrip('0').rstrip('.')
     return f'{p:.10f}'.rstrip('0').rstrip('.')
 
-
 def pct_move(new: float, old: float) -> float:
     return (new - old) / max(abs(old), 1e-12) * 100
 
-
 def clamp(x: float, a: float, b: float) -> float:
     return max(a, min(b, x))
-
 
 def ema(vals: List[float], period: int) -> List[float]:
     if not vals:
@@ -286,7 +254,6 @@ def ema(vals: List[float], period: int) -> List[float]:
         out.append(x * k + out[-1] * (1 - k))
     return out
 
-
 def atr(cs: List[Candle], period: int = 14) -> float:
     if len(cs) < period + 1:
         return 0.0
@@ -296,54 +263,55 @@ def atr(cs: List[Candle], period: int = 14) -> float:
         trs.append(max(c.high - c.low, abs(c.high - p.close), abs(c.low - p.close)))
     return sum(trs[-period:]) / period
 
-
 def atr_pct(cs: List[Candle], period: int = 14) -> float:
     return atr(cs, period) / max(cs[-1].close, 1e-12) * 100 if cs else 0.0
-
 
 def vol_ratio(cs: List[Candle], lookback: int = 20) -> float:
     if len(cs) < lookback + 1:
         return 0.0
     cur = cs[-1].quote_volume
-    hist = [c.quote_volume for c in cs[-lookback-1:-1] if c.quote_volume > 0]
+    hist = [c.quote_volume for c in cs[-lookback - 1:-1] if c.quote_volume > 0]
     return cur / (sum(hist) / len(hist)) if hist else 0.0
-
 
 def body_ratio(c: Candle) -> float:
     r = c.high - c.low
     return abs(c.close - c.open) / r if r > 0 else 0.0
 
-
 def close_location(c: Candle) -> float:
     r = c.high - c.low
     return (c.close - c.low) / r if r > 0 else 0.5
 
-
 def wick_ratio(c: Candle) -> Tuple[float, float]:
     r = max(c.high - c.low, 1e-12)
-    return (
-        (c.high - max(c.open, c.close)) / r,
-        (min(c.open, c.close) - c.low) / r,
-    )
+    upper = c.high - max(c.open, c.close)
+    lower = min(c.open, c.close) - c.low
+    return upper / r, lower / r
 
+def closed_candles(cs: List[Candle]) -> List[Candle]:
+    if cs and not cs[-1].confirmed:
+        return cs[:-1]
+    return cs
 
-def confirmed_candles(cs: List[Candle]) -> List[Candle]:
-    # Strategy generation must never use the live/unconfirmed candle.
-    return [c for c in cs if c.confirmed]
-
-
-def candle_direction(c: Candle) -> str:
-    return 'LONG' if c.close >= c.open else 'SHORT'
 
 # ============================================================
 # OKX API
 # ============================================================
-
 def okx_get(path: str, params: dict) -> dict:
+    global _last_api_ts
     err = None
     for attempt in range(1, REQUEST_RETRIES + 1):
         try:
-            r = session.get(OKX_BASE_URL + path, params=params, timeout=HTTP_TIMEOUT)
+            with _api_lock:
+                wait = OKX_MIN_INTERVAL - (time.time() - _last_api_ts)
+                if wait > 0:
+                    time.sleep(wait)
+                r = session.get(OKX_BASE_URL + path, params=params, timeout=HTTP_TIMEOUT)
+                _last_api_ts = time.time()
+            if r.status_code == 429:
+                retry_after = float(r.headers.get('Retry-After') or (attempt * 1.5))
+                log.warning('OKX 429 | %s | sleep %.1fs', path, retry_after)
+                time.sleep(retry_after)
+                continue
             r.raise_for_status()
             payload = r.json()
             if str(payload.get('code', '')) != '0':
@@ -353,9 +321,8 @@ def okx_get(path: str, params: dict) -> dict:
             err = exc
             log.warning('OKX FAILED | %s | %s/%s | %s', path, attempt, REQUEST_RETRIES, exc)
             if attempt < REQUEST_RETRIES:
-                time.sleep(attempt * 0.7)
+                time.sleep(attempt * 0.8)
     raise RuntimeError(f'OKX request failed: {err}')
-
 
 def get_instruments() -> Dict[str, dict]:
     data = okx_get('/api/v5/public/instruments', {'instType': 'SWAP'}).get('data', [])
@@ -374,697 +341,309 @@ def get_instruments() -> Dict[str, dict]:
             out[iid] = {}
     return out
 
-
-def _ticker_from_row(x: dict) -> Optional[dict]:
-    try:
-        iid = str(x.get('instId', ''))
-        last = float(x.get('last') or 0)
-        op = float(x.get('open24h') or 0)
-        hi = float(x.get('high24h') or 0)
-        lo = float(x.get('low24h') or 0)
-        vol = float(x.get('vol24h') or 0)
-        vol_ccy = float(x.get('volCcy24h') or 0)
-        bid = float(x.get('bidPx') or 0)
-        ask = float(x.get('askPx') or 0)
-        if last <= 0 or op <= 0 or not iid.endswith('-USDT-SWAP'):
-            return None
-        # OKX SWAP ticker units matter here:
-        #   volCcy24h = base-currency volume (e.g. ETH),
-        #   vol24h    = number of contracts.
-        # Therefore volCcy24h * last estimates USDT notional turnover.
-        # Multiplying contract count by last is WRONG without ctVal, and using
-        # volCcy24h as if it were already USD badly understates most altcoins.
-        turnover = vol_ccy * last if vol_ccy > 0 else 0.0
-        if not math.isfinite(turnover) or turnover < 0:
-            turnover = 0.0
-        spread_pct = None
-        if 0 < bid <= ask:
-            mid = (bid + ask) / 2
-            if mid > 0:
-                spread_pct = (ask - bid) / mid * 100
-        return {
-            'last': last, 'open24h': op, 'high24h': hi, 'low24h': lo,
-            'bid': bid, 'ask': ask, 'spread_pct': spread_pct,
-            'vol24h_usd': turnover,
-            'change24h_pct': (last / op - 1) * 100,
-            'range24h_pct': (hi - lo) / last * 100 if hi > lo else 0.0,
-            'ts': int(x.get('ts') or 0),
-        }
-    except (TypeError, ValueError):
-        return None
-
-
 def get_tickers() -> Dict[str, dict]:
     data = okx_get('/api/v5/market/tickers', {'instType': 'SWAP'}).get('data', [])
     out = {}
     for x in data:
-        t = _ticker_from_row(x)
-        if t:
-            out[str(x.get('instId'))] = t
-            ticker_cache[str(x.get('instId'))] = (now_ts(), t)
+        iid = str(x.get('instId', ''))
+        if not iid.endswith('-USDT-SWAP'):
+            continue
+        try:
+            last = float(x.get('last') or 0)
+            op = float(x.get('open24h') or 0)
+            hi = float(x.get('high24h') or 0)
+            lo = float(x.get('low24h') or 0)
+            vol = float(x.get('vol24h') or 0)
+            vol_ccy = float(x.get('volCcy24h') or 0)
+            if last <= 0 or op <= 0:
+                continue
+            turnover_a = vol_ccy * last
+            turnover_b = vol * last
+            if turnover_a <= 0:
+                turnover = turnover_b
+            elif turnover_b > 0 and turnover_a > turnover_b * 1000:
+                turnover = turnover_b
+            else:
+                turnover = turnover_a
+            change = (last / op - 1) * 100
+            rng = (hi - lo) / last * 100 if hi > lo else 0
+            out[iid] = {
+                'last': last, 'open24h': op, 'high24h': hi, 'low24h': lo,
+                'vol24h_usd': turnover, 'change24h_pct': change,
+                'range24h_pct': rng, 'ts': int(x.get('ts') or 0)
+            }
+        except (TypeError, ValueError):
+            continue
     return out
 
-
-def get_ticker(inst_id: str) -> Optional[dict]:
-    cached = ticker_cache.get(inst_id)
-    if cached and now_ts() - cached[0] < 3:
-        return cached[1]
-    try:
-        data = okx_get('/api/v5/market/ticker', {'instId': inst_id}).get('data', [])
-        if not data:
-            return None
-        t = _ticker_from_row(data[0])
-        if t:
-            ticker_cache[inst_id] = (now_ts(), t)
-        return t
-    except Exception:
-        return None
-
+def _candle_quote_volume(row) -> float:
+    close = float(row[4] or 0)
+    vol = float(row[5] or 0)
+    vol_ccy = float(row[6] or 0) if len(row) > 6 else 0.0
+    vol_quote = float(row[7] or 0) if len(row) > 7 else 0.0
+    if vol_quote > 0:
+        return vol_quote
+    if vol_ccy > 0 and close > 0:
+        return vol_ccy * close
+    return vol * close if close > 0 else 0.0
 
 def get_candles(inst_id: str, bar: str, limit: int = 180) -> List[Candle]:
+    want = min(max(limit, 200), 300)
     key = (inst_id, bar)
     cached = candle_cache.get(key)
-    if cached and now_ts() - cached[0] < CANDLE_CACHE_SECONDS:
-        return cached[1]
+    if cached and now_ts() - cached[0] < CANDLE_CACHE_SECONDS and len(cached[1]) >= min(limit, len(cached[1])):
+        rows = cached[1]
+        return rows[-limit:] if limit < len(rows) else rows
     rows = okx_get('/api/v5/market/candles', {
-        'instId': inst_id, 'bar': bar, 'limit': str(min(limit, 300))
+        'instId': inst_id, 'bar': bar, 'limit': str(want)
     }).get('data', [])
-    out: List[Candle] = []
+    out = []
     for r in reversed(rows):
         try:
+            confirmed = str(r[8]) == '1' if len(r) > 8 else True
             out.append(Candle(
                 int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]),
-                float(r[5] or 0), float(r[7] or 0), str(r[8]) == '1'
+                float(r[5] or 0), _candle_quote_volume(r), confirmed
             ))
         except (IndexError, TypeError, ValueError):
             continue
     candle_cache[key] = (now_ts(), out)
-    return out
-
+    return out[-limit:] if limit < len(out) else out
 
 def load_symbol(inst_id: str) -> Dict[str, List[Candle]]:
     return {
         '1h': get_candles(inst_id, '1H', 160),
-        '15m': get_candles(inst_id, '15m', 220),
-        '5m': get_candles(inst_id, '5m', 240),
+        '15m': get_candles(inst_id, '15m', 180),
+        '5m': get_candles(inst_id, '5m', 200),
     }
 
 
-def market_data_is_fresh(data: Dict[str, List[Candle]]) -> bool:
-    """Reject stale API snapshots; candle timestamps are in milliseconds."""
-    now_ms = int(time.time() * 1000)
-    # A confirmed candle timestamp is its opening time, so allow the interval
-    # duration plus a modest exchange/cache delay.
-    limits_ms = {'5m': 12 * 60_000, '15m': 32 * 60_000, '1h': 125 * 60_000}
-    for tf, max_age in limits_ms.items():
-        candles = confirmed_candles(data.get(tf, []))
-        if not candles:
-            return False
-        age = now_ms - candles[-1].ts
-        if age < -60_000 or age > max_age:
-            log.debug('STALE CANDLES | tf=%s | age_ms=%s', tf, age)
-            return False
-    return True
-
 # ============================================================
-# UNIVERSE — broad market discovery, NOT strategy-specific
+# MARKET UNIVERSE
 # ============================================================
-
 def build_universe(instruments: Dict[str, dict], tickers: Dict[str, dict]):
-    """Rank liquid, active swaps by balanced opportunity, not 24H winners alone.
-
-    The scanner still uses DEEP_SCAN_LIMIT as a per-cycle workload batch, not a
-    signal quota. A broad ranking avoids filling the scan with only the biggest
-    24H pumps/dumps and gives liquid mid-movers a chance to be evaluated.
-    """
     base = []
     for iid, t in tickers.items():
-        if iid not in instruments or not iid.endswith('-USDT-SWAP'):
+        if iid not in instruments:
             continue
-        turnover = max(float(t.get('vol24h_usd', 0.0)), 0.0)
-        move = abs(float(t.get('change24h_pct', 0.0)))
-        day_range = max(float(t.get('range24h_pct', 0.0)), 0.0)
-        if turnover < MIN_24H_TURNOVER_USD:
+        if t['vol24h_usd'] < MIN_24H_TURNOVER_USD:
             continue
-
-        # Log scaling rewards real liquidity without letting a few mega-caps
-        # dominate; momentum is useful but saturates so late vertical pumps do
-        # not automatically outrank coins forming a fresh structure.
-        liquidity = clamp(math.log10(max(turnover, 1.0) / max(MIN_24H_TURNOVER_USD, 1.0)) * 7.0, 0, 14)
-        movement = clamp(move * 0.85, 0, 18)
-        active_range = clamp(day_range * 1.15, 0, 22)
-        balanced_motion = max(0.0, 10.0 - abs(day_range - max(move, 3.0)) * 0.35)
-        # Spread is a tradability-quality signal, not a hard universe exclusion.
-        # Wide-spread contracts rank lower even when their 24H move looks large.
-        spread = t.get('spread_pct')
-        spread_penalty = clamp(float(spread) * 25.0, 0.0, 12.0) if spread is not None else 1.5
-        score = liquidity + movement + active_range + balanced_motion - spread_penalty
+        if t['range24h_pct'] < MIN_ACTIVE_24H_RANGE_PCT:
+            continue
+        activity = clamp((t['vol24h_usd'] / PREFERRED_TURNOVER_USD) * 20, 0, 20)
+        movement = clamp(abs(t['change24h_pct']) * 1.15, 0, 40)
+        volatility = clamp(t['range24h_pct'] * 1.8, 0, 40)
+        score = activity + movement + volatility
         base.append((iid, t, score))
-
-    # Rank the whole eligible universe. scan_market rotates through batches so
-    # coins outside the highest-ranked batch are still inspected on later cycles.
-    ranked = sorted(base, key=lambda z: z[2], reverse=True)
-    log.info('UNIVERSE | eligible=%d', len(ranked))
+    gainers = sorted(base, key=lambda z: z[1]['change24h_pct'], reverse=True)[:TOP_GAINERS]
+    losers = sorted(base, key=lambda z: z[1]['change24h_pct'])[:TOP_LOSERS]
+    volatile = sorted(base, key=lambda z: z[1]['range24h_pct'], reverse=True)[:TOP_VOLATILE]
+    cutoff = int((local_now() - timedelta(days=NEW_ACTIVE_DAYS)).timestamp() * 1000)
+    new_active = [z for z in base if instruments[z[0]].get('listTime', 0) >= cutoff]
+    new_active = sorted(new_active, key=lambda z: z[2], reverse=True)[:NEW_ACTIVE_COUNT]
+    pool = {}
+    for group in (gainers, losers, volatile, new_active):
+        for item in group:
+            pool[item[0]] = item
+    ranked = sorted(pool.values(), key=lambda z: z[2], reverse=True)[:DEEP_SCAN_LIMIT]
+    log.info('UNIVERSE | gainers=%d losers=%d volatile=%d new=%d deep=%d',
+             len(gainers), len(losers), len(volatile), len(new_active), len(ranked))
     return ranked
 
-# ============================================================
-# STRUCTURE / LEVEL ENGINE
-# ============================================================
 
+# ============================================================
+# STRUCTURE ENGINE
+# ============================================================
 def pivots(cs: List[Candle], left: int = 2, right: int = 2) -> List[Pivot]:
-    """Return confirmed swing points without counting flat plateaus repeatedly.
-
-    Ties are resolved consistently: a pivot must be strictly more extreme than
-    every candle on its left and at least as extreme as candles on its right.
-    This prevents a run of equal highs/lows from inflating level touch counts.
-    """
     out = []
     if len(cs) < left + right + 1:
         return out
     for i in range(left, len(cs) - right):
-        current = cs[i]
-        left_window = cs[i-left:i]
-        right_window = cs[i+1:i+right+1]
-        if (all(current.high > c.high for c in left_window)
-                and all(current.high >= c.high for c in right_window)):
-            out.append(Pivot(i, current.high, 'HIGH'))
-        if (all(current.low < c.low for c in left_window)
-                and all(current.low <= c.low for c in right_window)):
-            out.append(Pivot(i, current.low, 'LOW'))
+        h = cs[i].high
+        l = cs[i].low
+        if h >= max(c.high for c in cs[i - left:i + right + 1]):
+            out.append(Pivot(i, h, 'HIGH'))
+        if l <= min(c.low for c in cs[i - left:i + right + 1]):
+            out.append(Pivot(i, l, 'LOW'))
     return out
 
-
-def recent_pivots(cs: List[Candle], lookback: int = 100) -> List[Pivot]:
+def recent_pivots(cs: List[Candle], lookback: int = 80) -> List[Pivot]:
     start = max(0, len(cs) - lookback)
     raw = pivots(cs[start:], 2, 2)
     return [Pivot(p.index + start, p.price, p.kind) for p in raw]
 
-
-def cluster_levels(cs: List[Candle], tolerance_pct: float = 0.30) -> List[Level]:
-    # Level tolerance must scale with the instrument's volatility: a fixed 0.28%
-    # merges too much on quiet coins and splits the same structure on fast alts.
-    vol_adjusted_tolerance = min(0.80, max(tolerance_pct, atr_pct(cs) * 0.35))
-    tolerance_pct = vol_adjusted_tolerance
-    ps = recent_pivots(cs, min(120, len(cs)))
-    levels: List[Level] = []
+def cluster_levels(cs: List[Candle], tolerance_pct: float = 0.35) -> List[Tuple[float, str, int]]:
+    ps = recent_pivots(cs, min(100, len(cs)))
+    clusters: List[Tuple[float, str, int]] = []
     for p in ps:
         merged = False
-        for j, lv in enumerate(levels):
-            if lv.kind != p.kind:
-                continue
-            if abs(p.price - lv.price) / max(lv.price, 1e-12) * 100 <= tolerance_pct:
-                touches = lv.touches + 1
-                price = (lv.price * lv.touches + p.price) / touches
-                levels[j] = Level(price, lv.kind, touches,
-                                  min(lv.first_index, p.index),
-                                  max(lv.last_index, p.index),
-                                  min(100.0, 25 + touches * 18 + (lv.last_index - lv.first_index) * 0.10))
+        for j, (price, kind, touches) in enumerate(clusters):
+            if kind == p.kind and abs(p.price - price) / max(price, 1e-12) * 100 <= tolerance_pct:
+                new_price = (price * touches + p.price) / (touches + 1)
+                clusters[j] = (new_price, kind, touches + 1)
                 merged = True
                 break
         if not merged:
-            levels.append(Level(p.price, p.kind, 1, p.index, p.index, 43.0))
-    return sorted(levels, key=lambda x: (x.touches, x.strength), reverse=True)
-
-
-def nearest_levels(price: float, levels: List[Level]):
-    below = sorted([x for x in levels if x.price < price], key=lambda x: x.price, reverse=True)
-    above = sorted([x for x in levels if x.price > price], key=lambda x: x.price)
-    return (below[0] if below else None, above[0] if above else None)
-
+            clusters.append((p.price, p.kind, 1))
+    return sorted(clusters, key=lambda z: z[2], reverse=True)
 
 def trend_state(cs: List[Candle]) -> Optional[str]:
     if len(cs) < 60:
         return None
     closes = [c.close for c in cs]
-    e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
-    slope20 = pct_move(e20[-1], e20[-8])
-    if e20[-1] > e50[-1] and slope20 > 0.15:
+    e20 = ema(closes, 20)[-1]
+    e50 = ema(closes, 50)[-1]
+    slope20 = pct_move(ema(closes, 20)[-1], ema(closes, 20)[-8])
+    if e20 > e50 and slope20 > 0.15:
         return 'LONG'
-    if e20[-1] < e50[-1] and slope20 < -0.15:
+    if e20 < e50 and slope20 < -0.15:
         return 'SHORT'
     return None
-
 
 def impulse_stats(c5: List[Candle]):
     def move(n):
         if len(c5) <= n:
             return 0.0
-        return pct_move(c5[-1].close, c5[-1-n].close)
+        return pct_move(c5[-1].close, c5[-1 - n].close)
     return move(12), move(24), move(36)
 
-
-def local_extreme(c5: List[Candle], direction: str, lookback: int = 60):
-    x = c5[-lookback-1:-1] if len(c5) > lookback + 1 else c5[:-1]
+def local_extreme(c5: List[Candle], direction: str, lookback: int = 48):
+    x = c5[-lookback - 1:-1] if len(c5) > lookback + 1 else c5[:-1]
     if not x:
         return None
-    return (min(x, key=lambda c: c.low) if direction == 'LONG'
-            else max(x, key=lambda c: c.high))
-
-
-def range_pct(cs: List[Candle]) -> float:
-    if not cs:
-        return 0.0
-    hi = max(c.high for c in cs)
-    lo = min(c.low for c in cs)
-    return (hi - lo) / max(cs[-1].close, 1e-12) * 100
-
-# ============================================================
-# COMMON QUALITY / RISK
-# ============================================================
-
-def market_score(
-    ticker: dict,
-    c5: List[Candle],
-    c15: List[Candle],
-    vr: float,
-    c1h: Optional[List[Candle]] = None,
-    direction: Optional[str] = None,
-    strategy: Optional[str] = None,
-) -> int:
-    """Continuous market-quality score; structural pattern checks stay in builders."""
-    score = 48.0
-    turnover = max(float(ticker.get('vol24h_usd', 0.0)), 1.0)
-    score += clamp(math.log10(turnover / max(MIN_24H_TURNOVER_USD, 1.0)) * 3.2, 0, 9)
-    score += clamp(atr_pct(c5) / max(MIN_ATR_5M_PCT, 0.01), 0, 2.2) * 2.0
-    score += clamp(atr_pct(c15) / max(MIN_ATR_15M_PCT, 0.01), 0, 2.0) * 2.0
-    if strategy == 'PRE-BREAKOUT':
-        # Quiet candles are allowed, but an almost inactive directional trigger
-        # should materially lower confidence instead of passing on bonuses alone.
-        score += clamp(math.log(max(vr, 0.05), 1.7) * 5.0, -8, 7)
-    else:
-        score += clamp(math.log(max(vr, 0.05), 1.7) * 4.0, -5, 9)
-
-    # Reward aligned multi-timeframe structure; do not hard-reject a setup just
-    # because a timeframe is neutral or mildly opposed.
-    if direction in ('LONG', 'SHORT'):
-        sign = 1 if direction == 'LONG' else -1
-        for candles, weight in ((c5, 3.0), (c15, 4.0), (c1h or [], 5.0)):
-            if len(candles) < 25:
-                continue
-            closes = [c.close for c in candles]
-            e20, e50 = ema(closes, 20), ema(closes, min(50, max(20, len(closes)-1)))
-            slope = pct_move(e20[-1], e20[-5]) if len(e20) >= 5 else 0.0
-            alignment = sign * slope
-            if sign * (e20[-1] - e50[-1]) > 0:
-                score += weight * 0.55
-            elif sign * (e20[-1] - e50[-1]) < 0:
-                score -= weight * 0.30
-            score += clamp(alignment * 3.0, -weight * 0.45, weight * 0.45)
-
-        cur = c5[-1] if c5 else None
-        if cur:
-            loc = close_location(cur)
-            directional_loc = loc if direction == 'LONG' else 1.0 - loc
-            score += (directional_loc - 0.5) * 8.0
-            if candle_direction(cur) == direction:
-                score += min(3.0, body_ratio(cur) * 3.0)
-
-        # For continuation strategies, 24H direction should support the trade;
-        # reversals are intentionally evaluated against the old move.
-        if strategy != 'EXTREME REVERSAL':
-            signed_day_move = sign * float(ticker.get('change24h_pct', 0.0))
-            score += clamp(signed_day_move * 0.18, -5.0, 5.0)
-
-    # Avoid treating extreme 24H movement as quality by itself.
-    day_move = abs(float(ticker.get('change24h_pct', 0.0)))
-    if day_move > 35 and strategy != 'EXTREME REVERSAL':
-        score -= clamp((day_move - 35) * 0.10, 0, 5)
-    spread = ticker.get('spread_pct')
-    if spread is not None:
-        score -= clamp(float(spread) * 20.0, 0.0, 10.0)
-    return int(clamp(round(score), 0, 99))
-
-
-def validate_zone_risk(direction: str, entry_low: float, entry_high: float, sl: float) -> bool:
-    # Worst-case entry, not midpoint. This prevents a signal from exceeding 1%
-    # risk when the user enters at the unfavorable edge of the zone.
     if direction == 'LONG':
-        if sl >= entry_low:
-            return False
-        worst_entry = entry_high
-    else:
-        if sl <= entry_high:
-            return False
-        worst_entry = entry_low
-    risk_pct = abs(worst_entry - sl) / max(worst_entry, 1e-12) * 100
+        return min(x, key=lambda c: c.low)
+    return max(x, key=lambda c: c.high)
+
+
+# ============================================================
+# QUALITY / RISK / TARGET ENGINE
+# ============================================================
+def base_score(ticker, c5, c15, vr) -> int:
+    score = 58
+    ch = abs(ticker['change24h_pct'])
+    rng = ticker['range24h_pct']
+    if ch >= 20:
+        score += 5
+    if ch >= STRONG_24H_MOVE:
+        score += 7
+    if ch >= 45:
+        score += 4
+    if rng >= 10:
+        score += 5
+    if rng >= 20:
+        score += 4
+    if atr_pct(c5) >= MIN_ATR_5M_PCT:
+        score += 4
+    if atr_pct(c15) >= MIN_ATR_15M_PCT:
+        score += 4
+    if vr >= 1.2:
+        score += 3
+    if vr >= 1.5:
+        score += 4
+    if vr >= 2.0:
+        score += 3
+    if ticker['vol24h_usd'] >= PREFERRED_TURNOVER_USD:
+        score += 3
+    return min(score, 99)
+
+def validate_risk(entry: float, sl: float) -> bool:
+    risk_pct = abs(entry - sl) / max(entry, 1e-12) * 100
     return MIN_RISK_PCT <= risk_pct <= MAX_RISK_PCT
 
+def normalize_stop(entry: float, sl: float, direction: str) -> Optional[float]:
+    dist = abs(entry - sl)
+    min_dist = entry * MIN_RISK_PCT / 100
+    max_dist = entry * MAX_RISK_PCT / 100
+    if dist < min_dist:
+        dist = min_dist
+    if dist > max_dist:
+        return None
+    if direction == 'LONG':
+        sl = min(sl, entry - dist)
+    else:
+        sl = max(sl, entry + dist)
+    return sl if validate_risk(entry, sl) else None
 
-def target_levels(
-    direction: str,
-    entry: float,
-    sl: float,
-    c15: List[Candle],
-    preferred_targets: Optional[List[float]] = None,
-    min_target_pcts: Optional[Tuple[float, float, float]] = None,
-    trigger_level: Optional[float] = None,
-):
-    """Create risk-based targets and use nearby structure only when it improves them.
-
-    Structural levels far away must not distort the target ladder (for example,
-    TP1 near entry followed by TP2/TP3 at almost the same distant price).
-    For PRE-BREAKOUT, all targets must sit beyond the trigger level.
-    """
+def target_levels(direction: str, entry: float, sl: float, c15: List[Candle]):
     risk = abs(entry - sl)
-    if risk <= 0 or entry <= 0:
-        return None
-
-    sign = 1 if direction == 'LONG' else -1
-    floors = min_target_pcts or (0.0, 0.0, 0.0)
-    r_multiples = (TP1_R, TP2_R, TP3_R)
-    base_moves = [max(risk * r, entry * max(0.0, floors[i]))
-                  for i, r in enumerate(r_multiples)]
-
-    trigger_buffer = max(risk * 0.35, entry * 0.0015) if trigger_level is not None else 0.0
-    trigger_move = sign * (trigger_level - entry) + trigger_buffer if trigger_level is not None else 0.0
-    if trigger_level is not None:
-        base_moves = [max(move, trigger_move) for move in base_moves]
-
-    # Keep targets anchored to risk. Structure may refine a target, but should
-    # not stretch it to an unrelated level many ATRs away.
-    targets = [entry + sign * move for move in base_moves]
-    levels = cluster_levels(c15)
-    structural = [lv.price for lv in levels
-                  if sign * (lv.price - entry) > 0
-                  and (trigger_level is None or sign * (lv.price - trigger_level) > trigger_buffer)]
-    candidates = list(preferred_targets or []) + structural
-    candidates = [p for p in candidates
-                  if p > 0 and sign * (p - entry) > 0
-                  and (trigger_level is None or sign * (p - trigger_level) > trigger_buffer)]
-    # Crucial: preferred targets and pivots are mixed together, then sorted by
-    # distance from entry. Their original list order must not decide TP1/TP2/TP3.
-    candidates = sorted(set(candidates), key=lambda p: sign * (p - entry))
-
-    atr15_pct_value = atr_pct(c15) if c15 else 0.0
-    min_gap = max(risk * 0.55, entry * max(0.0045, atr15_pct_value / 100.0 * 0.35))
-    previous_target = None
-    for i, base_move in enumerate(base_moves):
-        required_move = max(risk * r_multiples[i], entry * max(0.0, floors[i]))
-        if trigger_level is not None:
-            required_move = max(required_move, trigger_move)
-        # Do not substitute a distant historical pivot for a sensible R target.
-        max_structural_move = max(base_move * 1.8, base_move + entry * 0.008)
-        for p in candidates:
-            move = sign * (p - entry)
-            if move < required_move:
-                continue
-            if move > max_structural_move:
-                break
-            if previous_target is not None and sign * (p - previous_target) < min_gap:
-                continue
-            targets[i] = p
-            break
-        # Maintain a meaningful ladder without relying on near-identical pivots.
-        if previous_target is not None and sign * (targets[i] - previous_target) < min_gap:
-            targets[i] = previous_target + sign * min_gap
-        previous_target = targets[i]
-
-    # Re-apply the trigger constraint and ordered ladder after structural choices.
-    if trigger_level is not None:
-        trigger_floor = trigger_level + sign * trigger_buffer
-        targets = [max(t, trigger_floor) if direction == 'LONG'
-                   else min(t, trigger_floor) for t in targets]
-    for i in range(1, 3):
-        if sign * (targets[i] - targets[i - 1]) < min_gap:
-            targets[i] = targets[i - 1] + sign * min_gap
-    return tuple(targets)
-
-def common_validate(setup: Setup) -> bool:
-    if not (setup.entry_low > 0 and setup.entry_high > 0 and setup.sl > 0):
-        return False
-    if setup.entry_low > setup.entry_high:
-        return False
-    if not validate_zone_risk(setup.direction, setup.entry_low, setup.entry_high, setup.sl):
-        return False
-    # Evaluate RR at the unfavorable edge of the entry zone, not the midpoint.
-    worst_entry = setup.entry_high if setup.direction == 'LONG' else setup.entry_low
-    risk = abs(worst_entry - setup.sl)
     if risk <= 0:
-        return False
-    reward2 = (setup.tp2 - worst_entry) if setup.direction == 'LONG' else (worst_entry - setup.tp2)
-    rr2 = reward2 / risk
-    if rr2 < MIN_RR_TP2:
-        return False
-    if setup.direction == 'LONG':
-        if not (setup.sl < setup.entry_low < setup.entry_high < setup.tp1 < setup.tp2 < setup.tp3):
-            return False
+        return None
+    levels = cluster_levels(c15)
+    if direction == 'LONG':
+        structural = sorted([p for p, k, t in levels if p > entry])
+        sign = 1
     else:
-        if not (setup.tp3 < setup.tp2 < setup.tp1 < setup.entry_low < setup.entry_high < setup.sl):
-            return False
-    if setup.score < MIN_SCORE:
-        return False
-    return True
+        structural = sorted([p for p, k, t in levels if p < entry], reverse=True)
+        sign = -1
 
+    def r_target(mult):
+        return entry + sign * risk * mult
 
-def make_entry_zone(center: float, atr5: float, direction: str, max_width_pct: float = 0.30):
-    width = min(max(atr5 * 0.12, center * 0.00018), center * max_width_pct / 100)
-    return center - width, center + width
+    candidates = [p for p in structural if sign * (p - entry) >= risk * 0.9]
+    tp1 = r_target(TP1_R)
+    tp2 = r_target(TP2_R)
+    tp3 = r_target(TP3_R)
+    if candidates:
+        if sign * (candidates[0] - entry) >= risk * 0.95:
+            tp1 = candidates[0]
+        if len(candidates) >= 2 and sign * (candidates[1] - entry) >= risk * 1.5:
+            tp2 = candidates[1]
+        if len(candidates) >= 3 and sign * (candidates[2] - entry) >= risk * 2.4:
+            tp3 = candidates[2]
+    return enforce_tp_order(direction, entry, risk, tp1, tp2, tp3)
 
-
-def strategy_score(base: int, bonuses: List[int], penalties: List[int]) -> int:
-    return int(clamp(base + sum(bonuses) - sum(penalties), 0, 99))
-
-# ============================================================
-# STRATEGY 1 — TREND PULLBACK
-# ============================================================
-
-def build_pullback(iid, ticker, data) -> Optional[Setup]:
-    c5 = confirmed_candles(data['5m'])
-    c15 = confirmed_candles(data['15m'])
-    c1h = confirmed_candles(data['1h'])
-    if min(len(c5), len(c15), len(c1h)) < 80:
-        return None
-
-    trend = trend_state(c1h)
-    if not trend:
-        return None
-
-    # Strategy-specific search: locate a meaningful recent impulse, then a
-    # retracement toward 15M EMA20 / prior structure, then a 5M reclaim.
-    closes15 = [c.close for c in c15]
-    e20 = ema(closes15, 20)
-    recent15 = c15[-14:-1]
-    if len(recent15) < 8:
-        return None
-    vr = vol_ratio(c5)
-    current = c5[-1]
-    previous = c5[-2]
-    atr5 = atr(c5)
-    # A pullback can form on quiet volume, but the actual 5M trigger should
-    # not be an almost inactive candle.
-    if vr < float(os.getenv('MIN_PULLBACK_TRIGGER_VOLUME', '0.55')):
-        return None
-
-    if trend == 'LONG':
-        impulse_window = c15[-26:-12]
-        if len(impulse_window) < 8:
-            return None
-        impulse = pct_move(max(c.close for c in impulse_window), min(c.close for c in impulse_window))
-        pull_low = min(c.low for c in recent15)
-        touched_ema = any(c.low <= e20[-1] * 1.004 for c in recent15)
-        held_structure = pull_low > min(c.low for c in c15[-35:-14]) * 0.998
-        trigger = (current.close > current.open and
-                   current.close > previous.high and
-                   current.close > e20[-1])
-        if impulse < 2.2 or not touched_ema or not held_structure or not trigger:
-            return None
-        # Do not enter at the top of a fresh impulse. The trigger must still be
-        # reasonably close to the pullback base.
-        entry_center = current.close
-        if pct_move(entry_center, pull_low) > 2.2:
-            return None
-        sl = pull_low - atr5 * 0.28
-        level = pull_low
-        preferred = []
-        above = sorted(lv.price for lv in cluster_levels(c15) if lv.price > entry_center)
-        if above:
-            preferred = [above[0]]
-        reason = (f'1H LONG → 15M импульс {impulse:.1f}% → откат к EMA20/структуре → '
-                  f'5M reclaim; объём x{vr:.2f}')
-        points = [(len(c5[-96:]) - 3, pull_low, 'PULLBACK'),
-                  (len(c5[-96:]) - 1, entry_center, 'TRIGGER')]
+def enforce_tp_order(direction: str, entry: float, risk: float, tp1: float, tp2: float, tp3: float):
+    if direction == 'LONG':
+        tp1 = max(tp1, entry + risk)
+        tp2 = max(tp2, tp1 + risk * 0.4)
+        tp3 = max(tp3, tp2 + risk * 0.4)
     else:
-        impulse_window = c15[-26:-12]
-        if len(impulse_window) < 8:
-            return None
-        impulse = abs(pct_move(min(c.close for c in impulse_window), max(c.close for c in impulse_window)))
-        pull_high = max(c.high for c in recent15)
-        touched_ema = any(c.high >= e20[-1] * 0.996 for c in recent15)
-        held_structure = pull_high < max(c.high for c in c15[-35:-14]) * 1.002
-        trigger = (current.close < current.open and
-                   current.close < previous.low and
-                   current.close < e20[-1])
-        if impulse < 2.2 or not touched_ema or not held_structure or not trigger:
-            return None
-        entry_center = current.close
-        if pct_move(pull_high, entry_center) > 2.2:
-            return None
-        sl = pull_high + atr5 * 0.28
-        level = pull_high
-        below = sorted((lv.price for lv in cluster_levels(c15) if lv.price < entry_center), reverse=True)
-        preferred = [below[0]] if below else []
-        reason = (f'1H SHORT → 15M импульс {impulse:.1f}% → откат к EMA20/структуре → '
-                  f'5M reclaim вниз; объём x{vr:.2f}')
-        points = [(len(c5[-96:]) - 3, pull_high, 'PULLBACK'),
-                  (len(c5[-96:]) - 1, entry_center, 'TRIGGER')]
+        tp1 = min(tp1, entry - risk)
+        tp2 = min(tp2, tp1 - risk * 0.4)
+        tp3 = min(tp3, tp2 - risk * 0.4)
+    return tp1, tp2, tp3
 
-    lo, hi = make_entry_zone(entry_center, atr5, trend)
-    if trend == 'LONG':
-        lo = max(lo, level - atr5 * 0.15)
-    else:
-        hi = min(hi, level + atr5 * 0.15)
-    tps = target_levels(trend, (lo + hi) / 2, sl, c15, preferred)
-    if not tps:
-        return None
-    base = market_score(ticker, c5, c15, vr, c1h, trend, 'TREND PULLBACK')
-    ss = strategy_score(base, [8, 5 if vr >= 1.3 else 0, 4], [])
-    setup = Setup(iid, get_coin(iid), trend, 'TREND PULLBACK', 'ТРЕНД → ОТКАТ → ПРОДОЛЖЕНИЕ',
-                  level, 'PULLBACK STRUCTURE', lo, hi, sl, *tps, ss, ss, reason,
-                  ticker['vol24h_usd'], ticker['change24h_pct'], ticker['range24h_pct'],
-                  atr_pct(c5), atr_pct(c15), vr, c5[-96:], points, '1–8 ч')
-    return setup if common_validate(setup) else None
+def entry_zone(entry: float, atr5: float, direction: str):
+    width = min(atr5 * 0.18, entry * MAX_ENTRY_CHASE_PCT / 100 * 0.35)
+    width = max(width, entry * 0.00025)
+    chase = width * 0.15
+    if direction == 'LONG':
+        return entry - width, entry + chase
+    return entry - chase, entry + width
+
+def final_score(base: int, bonuses: List[int], penalties: List[int]) -> int:
+    return max(0, min(99, base + sum(bonuses) - sum(penalties)))
+
+
+def make_setup(iid, ticker, direction, strategy, pattern, level, level_kind,
+               lo, hi, sl, tps, score, reason, c5, c15, vr, points, hold_hours):
+    return Setup(
+        iid, get_coin(iid), direction, strategy, pattern, level, level_kind,
+        lo, hi, sl, *tps, score, reason, ticker['vol24h_usd'], ticker['change24h_pct'],
+        ticker['range24h_pct'], atr_pct(c5), atr_pct(c15), vr, c5[-96:], points, hold_hours
+    )
+
 
 # ============================================================
-# STRATEGY 2 — BREAKOUT + RETEST
+# STRATEGY 1 — EXTREME REVERSAL
 # ============================================================
-
-def build_breakout_retest(iid, ticker, data) -> Optional[Setup]:
-    c5 = confirmed_candles(data['5m'])
-    c15 = confirmed_candles(data['15m'])
-    c1h = confirmed_candles(data['1h'])
-    if min(len(c5), len(c15), len(c1h)) < 90:
-        return None
-
-    levels = cluster_levels(c15, 0.28)
-    if not levels:
-        return None
-    vr = vol_ratio(c5)
-    atr5 = atr(c5)
-    # Search backward: a breakout candle MUST precede the retest candles.
-    # The latest candle is the confirmation, not the original breakout.
-    end = len(c5) - 1
-    best = None
-    best_rank = float('-inf')
-    # Require three distinct phases: breakout candle -> at least one holding
-    # candle -> retest/confirmation candle. This prevents one candle from being
-    # labelled both breakout and retest.
-    for retest_idx in range(max(12, end - 7), end + 1):
-        confirmation = c5[retest_idx]
-        breakout_idx = retest_idx - 2
-        hold_idx = retest_idx - 1
-        if breakout_idx < 5:
-            continue
-        holding = c5[hold_idx]
-        breakout = c5[breakout_idx]
-        for lv in levels:
-            if lv.touches < 2:
-                continue
-            # LONG: breakout closes above resistance, later candle returns to it
-            # and holds above it.
-            if lv.kind == 'HIGH':
-                if not (breakout.close > lv.price and breakout.open <= lv.price * 1.001):
-                    continue
-                if body_ratio(breakout) < 0.45:
-                    continue
-                if holding.close <= lv.price:
-                    continue
-                if not (confirmation.low <= lv.price * 1.004 and confirmation.close > lv.price):
-                    continue
-                if confirmation.close <= confirmation.open:
-                    continue
-                if confirmation.close <= holding.close * 0.995:
-                    continue
-                if retest_idx != end:
-                    continue
-                direction = 'LONG'
-                level = lv.price
-                sl = min(lv.price, confirmation.low) - atr5 * 0.25
-                entry = confirmation.close
-                points = [(breakout_idx - max(0, len(c5) - 96), breakout.close, 'BREAK'),
-                          (retest_idx - max(0, len(c5) - 96), level, 'RETEST'),
-                          (end - max(0, len(c5) - 96), entry, 'CONFIRM')]
-                candidate_rank = (lv.strength * 0.20 + lv.touches * 2.0 +
-                                  body_ratio(breakout) * 5.0 -
-                                  abs(entry - level) / max(entry, 1e-12) * 100 * 2.0)
-                if candidate_rank > best_rank:
-                    best_rank = candidate_rank
-                    best = (direction, level, sl, entry, lv.touches, points)
-            # SHORT: breakout closes below support, later candle retests it.
-            if lv.kind == 'LOW':
-                if not (breakout.close < lv.price and breakout.open >= lv.price * 0.999):
-                    continue
-                if body_ratio(breakout) < 0.45:
-                    continue
-                if holding.close >= lv.price:
-                    continue
-                if not (confirmation.high >= lv.price * 0.996 and confirmation.close < lv.price):
-                    continue
-                if confirmation.close >= confirmation.open:
-                    continue
-                if confirmation.close >= holding.close * 1.005:
-                    continue
-                if retest_idx != end:
-                    continue
-                direction = 'SHORT'
-                level = lv.price
-                sl = max(lv.price, confirmation.high) + atr5 * 0.25
-                entry = confirmation.close
-                points = [(breakout_idx - max(0, len(c5) - 96), breakout.close, 'BREAK'),
-                          (retest_idx - max(0, len(c5) - 96), level, 'RETEST'),
-                          (end - max(0, len(c5) - 96), entry, 'CONFIRM')]
-                candidate_rank = (lv.strength * 0.20 + lv.touches * 2.0 +
-                                  body_ratio(breakout) * 5.0 -
-                                  abs(entry - level) / max(entry, 1e-12) * 100 * 2.0)
-                if candidate_rank > best_rank:
-                    best_rank = candidate_rank
-                    best = (direction, level, sl, entry, lv.touches, points)
-
-    if not best or vr < MIN_BREAKOUT_VOLUME:
-        return None
-    direction, level, sl, entry, touches, points = best
-    if abs(entry - level) / max(entry, 1e-12) * 100 > MAX_ENTRY_CHASE_PCT:
-        return None
-    lo, hi = make_entry_zone(entry, atr5, direction)
-    tps = target_levels(direction, (lo + hi) / 2, sl, c15)
-    if not tps:
-        return None
-    base = market_score(ticker, c5, c15, vr, c1h, direction, 'BREAKOUT + RETEST')
-    ss = strategy_score(base, [10, min(8, touches * 2), 5 if vr >= 1.6 else 0], [])
-    reason = (f'15M уровень {touches}× → отдельная свеча ПРОБОЙ → отдельная свеча РЕТЕСТ → '
-              f'5M удержание; объём x{vr:.2f}')
-    setup = Setup(iid, get_coin(iid), direction, 'BREAKOUT + RETEST', 'ПРОБОЙ → РЕТЕСТ → УДЕРЖАНИЕ',
-                  level, 'BROKEN HORIZONTAL LEVEL', lo, hi, sl, *tps, ss, ss, reason,
-                  ticker['vol24h_usd'], ticker['change24h_pct'], ticker['range24h_pct'],
-                  atr_pct(c5), atr_pct(c15), vr, c5[-96:], points, '1–6 ч')
-    return setup if common_validate(setup) else None
-
-# ============================================================
-# STRATEGY 3 — EXTREME REVERSAL
-# ============================================================
-
 def build_reversal(iid, ticker, data) -> Optional[Setup]:
-    c5 = confirmed_candles(data['5m'])
-    c15 = confirmed_candles(data['15m'])
-    c1h = confirmed_candles(data['1h'])
-    if min(len(c5), len(c15), len(c1h)) < 80:
+    c5, c15, c1h = map(closed_candles, (data['5m'], data['15m'], data['1h']))
+    if min(len(c5), len(c15), len(c1h)) < 70:
         return None
     ch = ticker['change24h_pct']
     if abs(ch) < MIN_24H_MOVE_FOR_REVERSAL:
         return None
     if atr_pct(c5) < MIN_ATR_5M_PCT or atr_pct(c15) < MIN_ATR_15M_PCT:
         return None
-
-    _, m2h, _ = impulse_stats(c5)
+    m1h, m2h, _ = impulse_stats(c5)
     direction = 'SHORT' if ch > 0 else 'LONG'
-    if direction == 'SHORT' and m2h < MIN_2H_IMPULSE:
+    if direction == 'SHORT' and (m2h < MIN_2H_IMPULSE or m1h < MIN_1H_IMPULSE):
         return None
-    if direction == 'LONG' and m2h > -MIN_2H_IMPULSE:
+    if direction == 'LONG' and (m2h > -MIN_2H_IMPULSE or m1h > -MIN_1H_IMPULSE):
         return None
-
-    # Strategy-specific search: exhaustion + rejection + break of the very
-    # short-term structure. It does NOT require continuation in the old trend.
-    extreme = local_extreme(c5, 'SHORT' if direction == 'SHORT' else 'LONG', 60)
+    extreme = local_extreme(c5, direction, 60)
     if extreme is None:
         return None
     cur = c5[-1]
@@ -1072,306 +651,260 @@ def build_reversal(iid, ticker, data) -> Optional[Setup]:
     vr = vol_ratio(c5)
     if vr < MIN_REVERSAL_VOLUME_RATIO:
         return None
-    upper, lower = wick_ratio(cur)
-
     if direction == 'SHORT':
         retrace = pct_move(extreme.high, cur.close)
-        recent_low = min(c.low for c in c5[-5:-1])
-        if retrace < 0.55 or cur.close >= recent_low or cur.close >= cur.open:
+        upper, _ = wick_ratio(cur)
+        if retrace < 0.55:
             return None
-        if body_ratio(cur) < 0.40 or (upper < 0.10 and cur.high < max(c.high for c in c5[-6:-1])):
+        if not (cur.close < cur.open and cur.close < prev.low * 1.001):
             return None
-        sl = max(extreme.high, max(c.high for c in c5[-4:])) + atr(c5) * 0.25
+        if body_ratio(cur) < 0.42 or close_location(cur) > 0.48:
+            return None
+        if upper < 0.10 and cur.high < max(c.high for c in c5[-6:-1]):
+            return None
+        sl = max(extreme.high, max(c.high for c in c5[-4:])) + atr(c5) * 0.28
         level = extreme.high
-        pattern = 'ИСТОЩЕНИЕ РОСТА → СЛОМ → SHORT'
-        reason = f'рост 24H {ch:+.1f}% → 2H {m2h:+.1f}% → экстремум → rejection → слом 5M'
-        points = [(max(0, len(c5[-96:]) - 60), level, 'EXTREME HIGH'),
-                  (len(c5[-96:]) - 1, cur.close, 'STRUCTURE BREAK')]
+        point_label = 'EXTREME HIGH'
+        pattern = 'ТОП МОВЕР → ПЕРВЫЙ РАЗВОРОТ SHORT'
+        reason = f'сильный рост 24H {ch:+.1f}% → 2H {m2h:+.1f}% → экстремум → медвежье подтверждение'
+        bonuses = [7 if ch >= STRONG_24H_MOVE else 3, 6 if m2h >= 8 else 3, 5 if vr >= 1.5 else 0]
     else:
         retrace = pct_move(cur.close, extreme.low)
-        recent_high = max(c.high for c in c5[-5:-1])
-        if retrace < 0.55 or cur.close <= recent_high or cur.close <= cur.open:
+        _, lower = wick_ratio(cur)
+        if retrace < 0.55:
             return None
-        if body_ratio(cur) < 0.40 or (lower < 0.10 and cur.low > min(c.low for c in c5[-6:-1])):
+        if not (cur.close > cur.open and cur.close > prev.high * 0.999):
             return None
-        sl = min(extreme.low, min(c.low for c in c5[-4:])) - atr(c5) * 0.25
+        if body_ratio(cur) < 0.42 or close_location(cur) < 0.52:
+            return None
+        if lower < 0.10 and cur.low > min(c.low for c in c5[-6:-1]):
+            return None
+        sl = min(extreme.low, min(c.low for c in c5[-4:])) - atr(c5) * 0.28
         level = extreme.low
-        pattern = 'ИСТОЩЕНИЕ ПАДЕНИЯ → СЛОМ → LONG'
-        reason = f'падение 24H {ch:+.1f}% → 2H {m2h:+.1f}% → экстремум → rejection → слом 5M'
-        points = [(max(0, len(c5[-96:]) - 60), level, 'EXTREME LOW'),
-                  (len(c5[-96:]) - 1, cur.close, 'STRUCTURE BREAK')]
-
+        point_label = 'EXTREME LOW'
+        pattern = 'ТОП ЛУЗЕР → ПЕРВЫЙ РАЗВОРОТ LONG'
+        reason = f'сильное падение 24H {ch:+.1f}% → 2H {m2h:+.1f}% → экстремум → бычье подтверждение'
+        bonuses = [7 if ch <= -STRONG_24H_MOVE else 3, 6 if m2h <= -8 else 3, 5 if vr >= 1.5 else 0]
     entry = cur.close
+    if abs(entry - level) / max(entry, 1e-12) * 100 > MAX_ENTRY_CHASE_PCT * 1.8:
+        return None
+    sl = normalize_stop(entry, sl, direction)
+    if sl is None:
+        return None
+    tps = target_levels(direction, entry, sl, c15)
+    if not tps:
+        return None
+    score = final_score(base_score(ticker, c5, c15, vr), bonuses, [])
+    tstate = trend_state(c15)
+    if (direction == 'LONG' and tstate == 'LONG') or (direction == 'SHORT' and tstate == 'SHORT'):
+        score = min(99, score + 3)
+    if score < MIN_SCORE:
+        return None
+    lo, hi = entry_zone(entry, atr(c5), direction)
+    chart = c5[-96:]
+    ext_index = max(0, len(chart) - 2 - 60)
+    return make_setup(
+        iid, ticker, direction, 'EXTREME REVERSAL', pattern, level, point_label,
+        lo, hi, sl, tps, score, reason, c5, c15, vr,
+        [(ext_index, level, point_label), (len(chart) - 1, entry, 'CONFIRM')], '1–8 ч'
+    )
+
+
+# ============================================================
+# STRATEGY 2 — BREAKOUT + RETEST
+# ============================================================
+def build_breakout(iid, ticker, data) -> Optional[Setup]:
+    c5, c15, c1h = map(closed_candles, (data['5m'], data['15m'], data['1h']))
+    if min(len(c5), len(c15), len(c1h)) < 70:
+        return None
+    vr = vol_ratio(c5)
+    if vr < MIN_BREAKOUT_VOLUME:
+        return None
+    levels = cluster_levels(c15, 0.30)
+    if not levels:
+        return None
+    cur, prev = c5[-1], c5[-2]
+    direction = None
+    level = None
+    touches = 0
+    highs = [p for p, k, t in levels if k == 'HIGH' and t >= 2 and p < cur.close * 1.012]
+    lows = [p for p, k, t in levels if k == 'LOW' and t >= 2 and p > cur.close * 0.988]
+    if highs:
+        candidate = max(highs)
+        if cur.close > candidate and prev.high >= candidate * 0.997:
+            direction, level = 'LONG', candidate
+            touches = max((t for p, k, t in levels if k == 'HIGH' and abs(p - candidate) / candidate < 0.003), default=2)
+    if lows and direction is None:
+        candidate = min(lows)
+        if cur.close < candidate and prev.low <= candidate * 1.003:
+            direction, level = 'SHORT', candidate
+            touches = max((t for p, k, t in levels if k == 'LOW' and abs(p - candidate) / candidate < 0.003), default=2)
+    if not direction:
+        return None
+    if direction == 'LONG':
+        if cur.low > level * 1.006:
+            return None
+        if cur.close <= level or cur.close <= prev.close:
+            return None
+        sl = min(level, cur.low) - atr(c5) * 0.30
+        reason = f'15M сопротивление {touches}× → пробой → ретест → 5M подтверждение; объём x{vr:.2f}'
+    else:
+        if cur.high < level * 0.994:
+            return None
+        if cur.close >= level or cur.close >= prev.close:
+            return None
+        sl = max(level, cur.high) + atr(c5) * 0.30
+        reason = f'15M поддержка {touches}× → пробой → ретест → 5M подтверждение; объём x{vr:.2f}'
+    entry = cur.close
+    if abs(entry - level) / max(entry, 1e-12) * 100 > MAX_ENTRY_CHASE_PCT:
+        return None
+    sl = normalize_stop(entry, sl, direction)
+    if sl is None:
+        return None
+    tps = target_levels(direction, entry, sl, c15)
+    if not tps:
+        return None
+    score = final_score(base_score(ticker, c5, c15, vr), [8, min(6, touches), 5 if vr >= 1.8 else 0], [])
+    if score < MIN_SCORE:
+        return None
+    lo, hi = entry_zone(entry, atr(c5), direction)
+    chart_len = len(c5[-96:])
+    return make_setup(
+        iid, ticker, direction, 'BREAKOUT + RETEST', 'ПРОБОЙ + РЕТЕСТ', level, 'BROKEN LEVEL',
+        lo, hi, sl, tps, score, reason, c5, c15, vr,
+        [(chart_len - 2, level, 'RETEST'), (chart_len - 1, entry, 'CONFIRM')], '1–6 ч'
+    )
+
+
+# ============================================================
+# STRATEGY 3 — TREND PULLBACK
+# ============================================================
+def build_pullback(iid, ticker, data) -> Optional[Setup]:
+    c5, c15, c1h = map(closed_candles, (data['5m'], data['15m'], data['1h']))
+    if min(len(c5), len(c15), len(c1h)) < 70:
+        return None
+    trend = trend_state(c1h)
+    if not trend:
+        return None
+    e20_15 = ema([c.close for c in c15], 20)
+    if len(e20_15) < 10:
+        return None
+    cur, prev = c5[-1], c5[-2]
+    vr = vol_ratio(c5)
+    recent = c15[-10:-2]
+    if len(recent) < 5:
+        return None
+    if trend == 'LONG':
+        pull_low = min(c.low for c in recent)
+        if not any(c.low <= e20_15[-3] * 1.003 for c in recent):
+            return None
+        if not (cur.close > e20_15[-1] and cur.close > prev.high and cur.close > cur.open):
+            return None
+        level = pull_low
+        sl = pull_low - atr(c5) * 0.30
+        reason = f'1H восходящий тренд → 15M откат к EMA20 → 5M возврат выше уровня; объём x{vr:.2f}'
+    else:
+        pull_high = max(c.high for c in recent)
+        if not any(c.high >= e20_15[-3] * 0.997 for c in recent):
+            return None
+        if not (cur.close < e20_15[-1] and cur.close < prev.low and cur.close < cur.open):
+            return None
+        level = pull_high
+        sl = pull_high + atr(c5) * 0.30
+        reason = f'1H нисходящий тренд → 15M откат к EMA20 → 5M возврат ниже уровня; объём x{vr:.2f}'
+    entry = cur.close
+    sl = normalize_stop(entry, sl, trend)
+    if sl is None:
+        return None
     if abs(entry - level) / max(entry, 1e-12) * 100 > MAX_ENTRY_CHASE_PCT * 1.5:
         return None
-    lo, hi = make_entry_zone(entry, atr(c5), direction)
-    tps = target_levels(direction, (lo + hi) / 2, sl, c15)
+    tps = target_levels(trend, entry, sl, c15)
     if not tps:
         return None
-    base = market_score(ticker, c5, c15, vr, c1h, direction, 'EXTREME REVERSAL')
-    ss = strategy_score(base, [8 if abs(ch) >= STRONG_24H_MOVE else 4,
-                               7 if abs(m2h) >= 8 else 3,
-                               5 if vr >= 1.5 else 0], [])
-    setup = Setup(iid, get_coin(iid), direction, 'EXTREME REVERSAL', pattern,
-                  level, 'EXTREME', lo, hi, sl, *tps, ss, ss, reason,
-                  ticker['vol24h_usd'], ch, ticker['range24h_pct'], atr_pct(c5),
-                  atr_pct(c15), vr, c5[-96:], points, '1–8 ч')
-    return setup if common_validate(setup) else None
-
-# ============================================================
-# STRATEGY 4 — PRE-BREAKOUT / HORIZONTAL LEVEL PRESSURE
-# ============================================================
-
-def _pressure_metrics(c5: List[Candle], level: float, direction: str):
-    """Measure repeated level tests, approach pressure and volatility contraction."""
-    window = c5[-12:-1]
-    if len(window) < 8:
+    score = final_score(base_score(ticker, c5, c15, vr), [8, 5 if vr >= 1.2 else 0, 5], [])
+    if score < MIN_SCORE:
         return None
-    atr5 = atr(c5)
-    near_limit = max(atr5 * 0.85, level * 0.003)
-    touches = 0
-    for c in window:
-        if direction == 'LONG':
-            d = level - c.high
-            if d >= -near_limit and c.high <= level * 1.0015:
-                touches += 1
-        else:
-            d = c.low - level
-            if d >= -near_limit and c.low >= level * 0.9985:
-                touches += 1
-    if touches < 3:
-        return None
-
-    split = max(3, len(window) // 2)
-    early, late = window[:split], window[split:]
-
-    def mean_distance(group):
-        values = [abs(level - c.close) for c in group]
-        return sum(values) / len(values) if values else float('inf')
-
-    def mean_range(group):
-        values = [max(c.high - c.low, 0.0) for c in group]
-        return sum(values) / len(values) if values else 0.0
-
-    early_d, late_d = mean_distance(early), mean_distance(late)
-    early_range, late_range = mean_range(early), mean_range(late)
-    price_compression = early_d > 0 and late_d < early_d * 0.82
-    range_ratio = late_range / early_range if early_range > 0 else 1.0
-    range_compression = range_ratio <= 0.88
-    # Either the closes progressively press the level or the candle ranges
-    # contract while repeated tests hold. This avoids calling mere proximity
-    # "compression" while retaining valid quiet pre-breakout structures.
-    pressure = price_compression or range_compression
-    return touches, pressure, price_compression, range_compression, early_d, late_d, range_ratio
-
-def build_pre_breakout(iid, ticker, data) -> Optional[Setup]:
-    c5 = confirmed_candles(data['5m'])
-    c15 = confirmed_candles(data['15m'])
-    c1h = confirmed_candles(data['1h'])
-    if min(len(c5), len(c15), len(c1h)) < 90:
-        return None
-
-    levels = cluster_levels(c15, 0.28)
-    current = c5[-1]
-    previous = c5[-2]
-    atr5 = atr(c5)
-    vr = vol_ratio(c5)
-    if not levels or atr5 <= 0:
-        return None
-    # PRE-BREAKOUT volume is a continuous quality feature, not a hard gate:
-    # volume often contracts during valid pressure structures. Extremely weak
-    # activity is penalized in scoring, while price/structure still decide setup validity.
-
-    candidates = []
-    # This search is deliberately about an UNBROKEN horizontal level.
-    for lv in levels:
-        if lv.touches < 3:
-            continue
-        if lv.kind == 'HIGH' and lv.price > current.close:
-            distance_pct = (lv.price - current.close) / current.close * 100
-            if distance_pct <= MAX_ENTRY_CHASE_PCT:
-                candidates.append(('LONG', lv))
-        if lv.kind == 'LOW' and lv.price < current.close:
-            distance_pct = (current.close - lv.price) / current.close * 100
-            if distance_pct <= MAX_ENTRY_CHASE_PCT:
-                candidates.append(('SHORT', lv))
-
-    if not candidates:
-        return None
-    # A pre-breakout needs a live trigger candle, not just a level and compression.
-    # Quiet compression is acceptable, but the latest closed candle must lean in
-    # the proposed direction.
-    candle_range = max(current.high - current.low, 1e-12)
-    close_location = (current.close - current.low) / candle_range
-
-    best = None
-    best_rank = float('-inf')
-    for direction, lv in candidates:
-        # Level must remain unbroken on the recent confirmed candles.
-        recent = c5[-10:]
-        if direction == 'LONG':
-            if any(c.close > lv.price * 1.001 for c in recent):
-                continue
-        else:
-            if any(c.close < lv.price * 0.999 for c in recent):
-                continue
-        metrics = _pressure_metrics(c5, lv.price, direction)
-        if not metrics:
-            continue
-        touches, compression, price_compression, range_compression, early_d, late_d, range_ratio = metrics
-        if not compression:
-            continue
-
-        if direction == 'LONG' and (current.close <= current.open or close_location < 0.58):
-            continue
-        if direction == 'SHORT' and (current.close >= current.open or close_location > 0.42):
-            continue
-
-        # Reject PRE-BREAKOUT entries directly against a clearly accelerating 1H trend.
-        ema1h = ema([c.close for c in c1h], 20)
-        if len(ema1h) >= 6:
-            if direction == 'LONG' and c1h[-1].close < ema1h[-1] and ema1h[-1] < ema1h[-5] * 0.997:
-                continue
-            if direction == 'SHORT' and c1h[-1].close > ema1h[-1] and ema1h[-1] > ema1h[-5] * 1.003:
-                continue
-
-        # Structure must press toward the level: LONG higher lows, SHORT lower highs.
-        last8 = c5[-9:-1]
-        if direction == 'LONG':
-            lows = [c.low for c in last8]
-            if not (lows[-1] > min(lows[:4]) * 1.001):
-                continue
-            # No hard rejection from the resistance in the latest candle.
-            if current.close < previous.close and upper_wick_rejection(current, lv.price, 'LONG'):
-                continue
-            entry = min(current.close, lv.price - atr5 * 0.12)
-            sl_base = min(c.low for c in c5[-6:])
-            sl = sl_base - atr5 * 0.22
-            # Entry should be close to the level, but still BEFORE it.
-            if entry >= lv.price:
-                continue
-            distance = (lv.price - entry) / entry * 100
-            if distance > MAX_ENTRY_CHASE_PCT:
-                continue
-            # The resistance itself is the breakout trigger, not a profit target.
-            # Targets must sit beyond it, otherwise TP1 is often only a tiny move.
-            preferred = []
-            next_levels = sorted([x.price for x in levels if x.price > lv.price])
-            preferred.extend(next_levels[:3])
-            pattern = 'ДАВЛЕНИЕ НА СОПРОТИВЛЕНИЕ → PRE-BREAKOUT LONG'
-            reason = (f'горизонтальное сопротивление {touches}× → сжатие → higher lows → '
-                      f'цена {distance:.2f}% под уровнем; вход ДО пробоя')
-            points = [(len(c5[-96:]) - 8, lv.price, 'RESISTANCE'),
-                      (len(c5[-96:]) - 1, entry, 'PRE-BREAKOUT')]
-            quality = (touches + (3 if price_compression else 0)
-                       + (2 if range_compression else 0)
-                       + (1 if vr >= 1.3 else 0) - (2 if vr < 0.25 else 0))
-            distance_atr = (distance / 100.0 * entry) / max(atr5, 1e-12)
-            candidate_rank = (quality * 3 + lv.strength * 0.08 + touches * 1.5
-                              - min(12.0, distance_atr * 2.5)
-                              - max(0.0, 0.5 - vr) * 3.0
-                              - max(0.0, range_ratio - 1.0) * 2.0)
-            if candidate_rank > best_rank:
-                best_rank = candidate_rank
-                best = (direction, lv, entry, sl, preferred, pattern, reason, points, quality)
-        else:
-            highs = [c.high for c in last8]
-            if not (highs[-1] < max(highs[:4]) * 0.999):
-                continue
-            if current.close > previous.close and upper_wick_rejection(current, lv.price, 'SHORT'):
-                continue
-            entry = max(current.close, lv.price + atr5 * 0.12)
-            sl_base = max(c.high for c in c5[-6:])
-            sl = sl_base + atr5 * 0.22
-            if entry <= lv.price:
-                continue
-            distance = (entry - lv.price) / entry * 100
-            if distance > MAX_ENTRY_CHASE_PCT:
-                continue
-            # The support itself is the breakdown trigger, not a profit target.
-            preferred = []
-            next_levels = sorted([x.price for x in levels if x.price < lv.price], reverse=True)
-            preferred.extend(next_levels[:3])
-            pattern = 'ДАВЛЕНИЕ НА ПОДДЕРЖКУ → PRE-BREAKOUT SHORT'
-            reason = (f'горизонтальная поддержка {touches}× → сжатие → lower highs → '
-                      f'цена {distance:.2f}% над уровнем; вход ДО пробоя')
-            points = [(len(c5[-96:]) - 8, lv.price, 'SUPPORT'),
-                      (len(c5[-96:]) - 1, entry, 'PRE-BREAKOUT')]
-            quality = (touches + (3 if price_compression else 0)
-                       + (2 if range_compression else 0)
-                       + (1 if vr >= 1.3 else 0) - (2 if vr < 0.25 else 0))
-            distance_atr = (distance / 100.0 * entry) / max(atr5, 1e-12)
-            candidate_rank = (quality * 3 + lv.strength * 0.08 + touches * 1.5
-                              - min(12.0, distance_atr * 2.5)
-                              - max(0.0, 0.5 - vr) * 3.0
-                              - max(0.0, range_ratio - 1.0) * 2.0)
-            if candidate_rank > best_rank:
-                best_rank = candidate_rank
-                best = (direction, lv, entry, sl, preferred, pattern, reason, points, quality)
-
-    if not best:
-        return None
-    direction, lv, entry, sl, preferred, pattern, reason, points, quality = best
-    # For pre-breakout the zone is intentionally anchored BEFORE the level.
-    if direction == 'LONG':
-        width = max(atr5 * 0.10, entry * 0.0002)
-        lo, hi = entry - width, min(entry + width, lv.price - entry * 0.00015)
-    else:
-        width = max(atr5 * 0.10, entry * 0.0002)
-        lo, hi = max(entry - width, lv.price + entry * 0.00015), entry + width
-    if lo >= hi:
-        return None
-    tps = target_levels(
-        direction, (lo + hi) / 2, sl, c15, preferred, trigger_level=lv.price
+    lo, hi = entry_zone(entry, atr(c5), trend)
+    return make_setup(
+        iid, ticker, trend, 'TREND PULLBACK', 'ТРЕНДОВЫЙ ОТКАТ', level,
+        'PULLBACK LOW' if trend == 'LONG' else 'PULLBACK HIGH',
+        lo, hi, sl, tps, score, reason, c5, c15, vr,
+        [(len(c5[-96:]) - 1, entry, 'TRIGGER')], '1–8 ч'
     )
+
+
+# ============================================================
+# STRATEGY 4 — MEAN REVERSION
+# ============================================================
+def build_mean_reversion(iid, ticker, data) -> Optional[Setup]:
+    c5, c15 = closed_candles(data['5m']), closed_candles(data['15m'])
+    if len(c5) < 90 or len(c15) < 70:
+        return None
+    e20 = ema([c.close for c in c15], 20)[-1]
+    cur, prev = c5[-1], c5[-2]
+    deviation = (cur.close - e20) / max(e20, 1e-12) * 100
+    direction = 'LONG' if deviation <= -2.5 else 'SHORT' if deviation >= 2.5 else None
+    if not direction:
+        return None
+    vr = vol_ratio(c5)
+    if vr < MIN_VOLUME_RATIO:
+        return None
+    if direction == 'LONG':
+        if not (cur.close > cur.open and cur.close > prev.high and close_location(cur) >= 0.62):
+            return None
+        sl = min(c.low for c in c5[-8:]) - atr(c5) * 0.25
+    else:
+        if not (cur.close < cur.open and cur.close < prev.low and close_location(cur) <= 0.38):
+            return None
+        sl = max(c.high for c in c5[-8:]) + atr(c5) * 0.25
+    entry = cur.close
+    sl = normalize_stop(entry, sl, direction)
+    if sl is None:
+        return None
+    tps = target_levels(direction, entry, sl, c15)
     if not tps:
         return None
-    base = market_score(ticker, c5, c15, vr, c1h, direction, 'PRE-BREAKOUT')
-    pressure_bonus = min(8, max(0, quality - 3) * 1.5)
-    activity_bonus = 3 if vr >= 1.3 else 0
-    weak_trigger_penalty = 2 if vr < 0.25 else 0
-    ss = strategy_score(base, [pressure_bonus, activity_bonus], [weak_trigger_penalty])
-    setup = Setup(iid, get_coin(iid), direction, 'PRE-BREAKOUT', pattern,
-                  lv.price, 'HORIZONTAL LEVEL', lo, hi, sl, *tps, ss, ss, reason,
-                  ticker['vol24h_usd'], ticker['change24h_pct'], ticker['range24h_pct'],
-                  atr_pct(c5), atr_pct(c15), vr, c5[-96:], points, '1–6 ч')
-    return setup if common_validate(setup) else None
+    risk = abs(entry - sl)
+    tp1, tp2, tp3 = tps
+    if direction == 'LONG' and e20 > entry + risk:
+        tp1 = e20
+    elif direction == 'SHORT' and e20 < entry - risk:
+        tp1 = e20
+    tps = enforce_tp_order(direction, entry, risk, tp1, tp2, tp3)
+    score = final_score(base_score(ticker, c5, c15, vr), [6, 5 if abs(deviation) >= 4 else 0], [])
+    if score < MIN_SCORE:
+        return None
+    lo, hi = entry_zone(entry, atr(c5), direction)
+    return make_setup(
+        iid, ticker, direction, 'MEAN REVERSION', 'СИЛЬНОЕ ОТКЛОНЕНИЕ → ВОЗВРАТ', e20, '15M EMA20',
+        lo, hi, sl, tps, score,
+        f'цена отклонена от 15M EMA20 на {deviation:+.2f}% → 5M подтверждение возврата',
+        c5, c15, vr, [(len(c5[-96:]) - 1, entry, 'REVERSAL')], '1–6 ч'
+    )
 
+STRATEGIES = (build_reversal, build_breakout, build_pullback, build_mean_reversion)
 
-def upper_wick_rejection(c: Candle, level: float, direction: str) -> bool:
-    upper, lower = wick_ratio(c)
-    if direction == 'LONG':
-        return c.high >= level * 0.998 and upper > 0.42
-    return c.low <= level * 1.002 and lower > 0.42
-
-
-STRATEGIES: Tuple[Callable, ...] = (
-    build_pullback,
-    build_breakout_retest,
-    build_reversal,
-    build_pre_breakout,
-)
 
 # ============================================================
 # TELEGRAM VOTES
 # ============================================================
-
-VOTES = {'strong': '🔥', 'good': '👍', 'weak': '👎', 'miss': '❌', 'watch': '👀'}
-
+VOTES = {
+    'strong': '🔥', 'good': '👍', 'weak': '👎', 'miss': '❌', 'watch': '👀'
+}
 
 def vote_keyboard(signal_id: int):
-    labels = [('strong', '🔥 Сильный'), ('good', '👍 Норм'),
-              ('weak', '👎 Слабый'), ('miss', '❌ Мимо'), ('watch', '👀 Наблюдаю')]
-    buttons = []
+    labels = [('strong', '🔥 Сильный'), ('good', '👍 Норм'), ('weak', '👎 Слабый'), ('miss', '❌ Мимо'), ('watch', '👀 Наблюдаю')]
     with db_lock:
-        counts = dict(db.execute(
+        rows = db.execute(
             'SELECT vote, COUNT(*) FROM signal_votes WHERE signal_id=? GROUP BY vote',
-            (signal_id,)).fetchall())
-    for key, label in labels:
-        buttons.append(InlineKeyboardButton(f'{label} {counts.get(key, 0)}',
-                                            callback_data=f'vote:{signal_id}:{key}'))
+            (signal_id,)
+        ).fetchall()
+    counts = {k: n for k, n in rows}
+    buttons = [
+        InlineKeyboardButton(f'{label} {counts.get(key, 0)}', callback_data=f'vote:{signal_id}:{key}')
+        for key, label in labels
+    ]
     return InlineKeyboardMarkup([buttons[:2], buttons[2:4], buttons[4:]])
-
 
 @bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith('vote:')))
 def on_vote(call):
@@ -1381,16 +914,18 @@ def on_vote(call):
         if vote not in VOTES:
             raise ValueError('invalid vote')
         with db_lock:
-            db.execute('INSERT OR REPLACE INTO signal_votes(signal_id,user_id,vote,created_at) VALUES(?,?,?,?)',
-                       (sid, call.from_user.id, vote, now_ts()))
+            db.execute(
+                'INSERT OR REPLACE INTO signal_votes(signal_id,user_id,vote,created_at) VALUES(?,?,?,?)',
+                (sid, call.from_user.id, vote, now_ts())
+            )
             db.commit()
         try:
             bot.answer_callback_query(call.id, 'Голос учтён. Его можно изменить.')
         except Exception:
             pass
         try:
-            bot.edit_message_reply_markup(CHANNEL_ID, call.message.message_id,
-                                          reply_markup=vote_keyboard(sid))
+            chat_id = call.message.chat.id if call.message else CHANNEL_ID
+            bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=vote_keyboard(sid))
         except Exception:
             pass
     except Exception:
@@ -1399,16 +934,28 @@ def on_vote(call):
         except Exception:
             pass
 
-# ============================================================
-# CHART / MESSAGE
-# ============================================================
+def start_telegram_polling():
+    def runner():
+        try:
+            log.info('TELEGRAM POLLING START')
+            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+        except Exception:
+            log.exception('TELEGRAM POLLING STOPPED')
+    t = threading.Thread(target=runner, name='telegram-polling', daemon=True)
+    t.start()
 
+
+# ============================================================
+# CHART
+# ============================================================
 def make_chart(setup: Setup) -> str:
     cs = setup.candles_5m[-96:]
     if len(cs) < 35:
         raise RuntimeError('Not enough candles for chart')
-    path = f'/tmp/quantum_{setup.coin}_{int(time.time()*1000)}.png'
-    fig, ax = plt.subplots(figsize=(15, 8.5), dpi=140)
+    path = f'/tmp/quantum_{setup.coin}_{int(time.time() * 1000)}.png'
+    fig, ax = plt.subplots(figsize=(15, 8.5), dpi=150)
+    fig.patch.set_facecolor('white')
+    ax.set_facecolor('white')
     width = .58
     for i, c in enumerate(cs):
         rising = c.close >= c.open
@@ -1416,36 +963,33 @@ def make_chart(setup: Setup) -> str:
         ax.vlines(i, c.low, c.high, color=color, linewidth=1.1, zorder=2)
         y = min(c.open, c.close)
         h = max(abs(c.close - c.open), c.close * 0.00002)
-        ax.add_patch(Rectangle((i - width/2, y), width, h,
-                               facecolor=color, edgecolor=color, linewidth=.5, zorder=3))
+        ax.add_patch(Rectangle((i - width / 2, y), width, h, facecolor=color, edgecolor=color, linewidth=.5, zorder=3))
 
     def hline(price, color, label, lw=1.8, ls='--'):
         ax.axhline(price, color=color, linewidth=lw, linestyle=ls, zorder=4)
-        ax.text(len(cs)-1.2, price, f'  {label} {fmt_price(price)}', ha='right', va='bottom',
-                fontsize=9, fontweight='bold', color=color,
-                bbox=dict(facecolor='white', alpha=.82, edgecolor='none', pad=1.5))
+        ax.text(
+            len(cs) - 1.2, price, f'  {label} {fmt_price(price)}', ha='right', va='bottom',
+            fontsize=9, fontweight='bold', color=color,
+            bbox=dict(facecolor='white', alpha=.82, edgecolor='none', pad=1.5)
+        )
 
     hline(setup.level, '#7c3aed', setup.level_kind, 1.9, '-')
-    hline((setup.entry_low + setup.entry_high)/2, '#2563eb', 'ВХОД', 2.4, '-')
+    hline((setup.entry_low + setup.entry_high) / 2, '#2563eb', 'ВХОД', 2.4, '-')
     ax.axhspan(setup.entry_low, setup.entry_high, alpha=.10, color='#2563eb', zorder=1)
     hline(setup.sl, '#dc2626', 'СТОП', 2.1, '--')
     hline(setup.tp1, '#16a34a', 'TP1', 1.5, ':')
     hline(setup.tp2, '#16a34a', 'TP2', 1.7, ':')
     hline(setup.tp3, '#15803d', 'TP3', 1.9, '--')
-
     for idx, p, label in setup.points:
-        idx = int(clamp(idx, 0, len(cs)-1))
+        idx = int(clamp(idx, 0, len(cs) - 1))
         ax.scatter([idx], [p], s=48, marker='o', zorder=7, color='#111827')
-        offset = 16 if any(x in label for x in ('LOW', 'TRIGGER', 'PRE', 'RETEST')) else -20
-        ax.annotate(label, (idx, p), xytext=(0, offset), textcoords='offset points',
-                    ha='center', fontsize=9, fontweight='bold', color='#111827')
-
-    ax.set_title(f'{setup.coin}USDT · {setup.strategy} · {setup.direction} · 5M',
-                 fontsize=18, fontweight='bold', pad=14)
-    ax.text(.01, .965, f'15M structure · 1H context · {setup.pattern_name}',
-            transform=ax.transAxes, va='top', fontsize=10.5, fontweight='bold')
-    ax.grid(True, alpha=.14)
-    ax.tick_params(labelsize=9)
+        offset = 16 if 'LOW' in label or 'TRIGGER' in label or 'REVERSAL' in label else -20
+        ax.annotate(label, (idx, p), xytext=(0, offset), textcoords='offset points', ha='center', fontsize=9, fontweight='bold', color='#111827')
+    title = f'{setup.coin}USDT · {setup.strategy} · {setup.direction} · 5M'
+    ax.set_title(title, fontsize=18, fontweight='bold', pad=14, color='#111827')
+    ax.text(.01, .965, f'15M structure · 1H context · {setup.pattern_name}', transform=ax.transAxes, va='top', fontsize=10.5, fontweight='bold', color='#111827')
+    ax.grid(True, alpha=.14, color='#94a3b8')
+    ax.tick_params(labelsize=9, colors='#475569')
     ax.set_xlim(-1, len(cs))
     plt.tight_layout()
     fig.savefig(path, facecolor='white', bbox_inches='tight')
@@ -1453,13 +997,13 @@ def make_chart(setup: Setup) -> str:
     return path
 
 
+# ============================================================
+# SIGNAL MESSAGE
+# ============================================================
 def build_signal_text(s: Setup) -> str:
     entry = (s.entry_low + s.entry_high) / 2
-    worst_entry = s.entry_high if s.direction == 'LONG' else s.entry_low
-    risk = abs(worst_entry - s.sl) / max(worst_entry, 1e-12) * 100
-    worst_risk = abs(worst_entry - s.sl)
-    reward2 = (s.tp2 - worst_entry) if s.direction == 'LONG' else (worst_entry - s.tp2)
-    rr2 = reward2 / max(worst_risk, 1e-12)
+    risk = abs(entry - s.sl) / max(entry, 1e-12) * 100
+    rr2 = abs(s.tp2 - entry) / max(abs(entry - s.sl), 1e-12)
     side = '🟢 LONG' if s.direction == 'LONG' else '🔴 SHORT'
     return (
         f'<b>{side} · {s.coin}USDT</b>\n'
@@ -1467,9 +1011,9 @@ def build_signal_text(s: Setup) -> str:
         f'📌 <b>Сетап:</b> {s.pattern_name}\n'
         f'📈 <b>24H:</b> {s.change24:+.1f}% · Range {s.range24:.1f}%\n'
         f'⚡ <b>ATR:</b> 5M {s.atr5_pct:.2f}% · 15M {s.atr15_pct:.2f}%\n'
-        f'💧 <b>Volume:</b> x{s.volume_ratio:.2f} · Turnover ${s.volume_24h/1_000_000:.1f}M\n\n'
+        f'💧 <b>Volume:</b> x{s.volume_ratio:.2f} · Turnover ${s.volume_24h / 1_000_000:.1f}M\n\n'
         f'🎯 <b>Вход:</b> <code>{fmt_price(s.entry_low)} – {fmt_price(s.entry_high)}</code>\n'
-        f'🛑 <b>Стоп:</b> <code>{fmt_price(s.sl)}</code> · риск по краю зоны {risk:.2f}%\n'
+        f'🛑 <b>Стоп:</b> <code>{fmt_price(s.sl)}</code> · риск {risk:.2f}%\n'
         f'🎯 <b>TP1:</b> <code>{fmt_price(s.tp1)}</code>\n'
         f'🎯 <b>TP2:</b> <code>{fmt_price(s.tp2)}</code> · RR 1:{rr2:.1f}\n'
         f'🎯 <b>TP3:</b> <code>{fmt_price(s.tp3)}</code>\n\n'
@@ -1480,97 +1024,41 @@ def build_signal_text(s: Setup) -> str:
         f'🚫 Не догоняйте цену после ухода от зоны входа.'
     )
 
-# ============================================================
-# PERSISTENCE / RECOVERY
-# ============================================================
-
 def insert_signal(s: Setup) -> int:
     created = now_ts()
     with db_lock:
-        cur = db.execute('''INSERT INTO signals(
-            inst_id,direction,strategy,level,entry_low,entry_high,sl,tp1,tp2,tp3,
-            score,status,created_at,expires_at,coin,pattern_name,level_kind,reason,
-            volume_24h,change24,range24,atr5_pct,atr15_pct,volume_ratio,hold_hours,strategy_score
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-        (s.inst_id, s.direction, s.strategy, s.level, s.entry_low, s.entry_high,
-         s.sl, s.tp1, s.tp2, s.tp3, s.score, 'READY', created,
-         created + READY_TTL_MINUTES*60, s.coin, s.pattern_name, s.level_kind,
-         s.reason, s.volume_24h, s.change24, s.range24, s.atr5_pct,
-         s.atr15_pct, s.volume_ratio, s.hold_hours, s.strategy_score))
+        cur = db.execute(
+            '''INSERT INTO signals(
+                inst_id,direction,strategy,level,entry_low,entry_high,sl,tp1,tp2,tp3,score,status,
+                created_at,expires_at,pattern_name,reason
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (s.inst_id, s.direction, s.strategy, s.level, s.entry_low, s.entry_high, s.sl, s.tp1, s.tp2, s.tp3,
+             s.score, 'READY', created, created + READY_TTL_MINUTES * 60, s.pattern_name, s.reason)
+        )
         sid = cur.lastrowid
         db.commit()
     return sid
 
-
-def update_message_id(signal_id: int, message_id: int):
-    with db_lock:
-        db.execute('UPDATE signals SET message_id=? WHERE id=?', (message_id, signal_id))
-        db.commit()
-
-
-def setup_from_row(row) -> Setup:
-    return Setup(
-        inst_id=row['inst_id'], coin=row['coin'] or get_coin(row['inst_id']),
-        direction=row['direction'], strategy=row['strategy'],
-        pattern_name=row['pattern_name'] or row['strategy'], level=float(row['level']),
-        level_kind=row['level_kind'] or 'LEVEL', entry_low=float(row['entry_low']),
-        entry_high=float(row['entry_high']), sl=float(row['sl']), tp1=float(row['tp1']),
-        tp2=float(row['tp2']), tp3=float(row['tp3']), score=int(row['score'] or 0),
-        strategy_score=int(row['strategy_score'] or row['score'] or 0),
-        reason=row['reason'] or '', volume_24h=float(row['volume_24h'] or 0),
-        change24=float(row['change24'] or 0), range24=float(row['range24'] or 0),
-        atr5_pct=float(row['atr5_pct'] or 0), atr15_pct=float(row['atr15_pct'] or 0),
-        volume_ratio=float(row['volume_ratio'] or 0), candles_5m=[], points=[],
-        hold_hours=row['hold_hours'] or '1–8 ч')
-
-
-def recover_runtime_state():
-    with db_lock:
-        cols = [r[1] for r in db.execute('PRAGMA table_info(signals)').fetchall()]
-        rows = db.execute('SELECT * FROM signals WHERE status IN (\'READY\',\'ACTIVE\')').fetchall()
-        colmap = {c: i for i, c in enumerate(cols)}
-    recovered = 0
-    for raw in rows:
-        row = {k: raw[i] for k, i in colmap.items()}
-        try:
-            s = setup_from_row(row)
-            if row['status'] == 'READY':
-                pending[s.inst_id] = PendingSignal(s, int(row['id']), float(row['created_at']),
-                                                   float(row['expires_at']), int(row['message_id'] or 0))
-            else:
-                active[s.inst_id] = ActiveSignal(s, int(row['id']), float(row['activated_at'] or row['created_at']),
-                                                 int(row['message_id'] or 0), bool(row['tp1_hit']),
-                                                 bool(row['tp2_hit']), bool(row['tp3_hit']))
-            recovered += 1
-        except Exception:
-            log.exception('RECOVERY FAILED | row=%s', raw[:5])
-    log.info('RECOVERY | restored=%d pending=%d active=%d', recovered, len(pending), len(active))
-
-# ============================================================
-# SEND SIGNAL
-# ============================================================
+def send_photo_compat(photo, caption, reply_markup):
+    kwargs = dict(caption=caption, parse_mode='HTML', reply_markup=reply_markup)
+    try:
+        return bot.send_photo(CHANNEL_ID, photo, show_caption_above_media=True, **kwargs)
+    except TypeError:
+        return bot.send_photo(CHANNEL_ID, photo, **kwargs)
 
 def send_signal(s: Setup) -> bool:
     path = None
     sid = None
-    with sending_lock:
-        if s.inst_id in sending_symbols or s.inst_id in pending or s.inst_id in active:
-            log.info('DUPLICATE BLOCKED | %s | already sending/pending/active', s.inst_id)
-            return False
-        sending_symbols.add(s.inst_id)
     try:
         path = make_chart(s)
         sid = insert_signal(s)
         with open(path, 'rb') as f:
-            msg = bot.send_photo(
-                CHANNEL_ID, f, caption=build_signal_text(s), parse_mode='HTML',
-                show_caption_above_media=True, reply_markup=vote_keyboard(sid)
-            )
-        update_message_id(sid, msg.message_id)
-        created = now_ts()
-        pending[s.inst_id] = PendingSignal(s, sid, created, created + READY_TTL_MINUTES*60, msg.message_id)
-        log.info('SIGNAL SENT | %s | %s | %s | score=%s | id=%s',
-                 s.coin, s.direction, s.strategy, s.score, sid)
+            msg = send_photo_compat(f, build_signal_text(s), vote_keyboard(sid))
+        with db_lock:
+            db.execute('UPDATE signals SET message_id=? WHERE id=?', (msg.message_id, sid))
+            db.commit()
+        pending[s.inst_id] = PendingSignal(s, sid, now_ts(), now_ts() + READY_TTL_MINUTES * 60, msg.message_id)
+        log.info('SIGNAL SENT | %s | %s | %s | score=%s | id=%s', s.coin, s.direction, s.strategy, s.score, sid)
         return True
     except Exception:
         log.exception('SIGNAL SEND FAILED | %s', s.inst_id)
@@ -1580,8 +1068,6 @@ def send_signal(s: Setup) -> bool:
                 db.commit()
         return False
     finally:
-        with sending_lock:
-            sending_symbols.discard(s.inst_id)
         if path:
             try:
                 os.remove(path)
@@ -1589,352 +1075,239 @@ def send_signal(s: Setup) -> bool:
                 pass
 
 
+# ============================================================
+# SIGNAL LIFECYCLE
+# ============================================================
 def send_update(text: str):
     try:
         bot.send_message(CHANNEL_ID, text, parse_mode='HTML')
     except Exception:
         log.exception('TELEGRAM UPDATE FAILED')
 
-# ============================================================
-# LIFECYCLE
-# ============================================================
+def price_in_entry(s: Setup, candle: Candle) -> bool:
+    return candle.low <= s.entry_high and candle.high >= s.entry_low
 
-def price_in_entry(s: Setup, price: float) -> bool:
-    return s.entry_low <= price <= s.entry_high
+def setup_from_row(row) -> Setup:
+    (sid, inst_id, direction, strategy, level, entry_low, entry_high, sl, tp1, tp2, tp3,
+     score, created_at, activated_at, expires_at, tp1_hit, tp2_hit, tp3_hit, pattern_name, reason, message_id) = row
+    return Setup(
+        inst_id=inst_id, coin=get_coin(inst_id), direction=direction, strategy=strategy or '',
+        pattern_name=pattern_name or '', level=level or 0, level_kind='LEVEL',
+        entry_low=entry_low, entry_high=entry_high, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+        score=score or 0, reason=reason or '', volume_24h=0, change24=0, range24=0,
+        atr5_pct=0, atr15_pct=0, volume_ratio=0, candles_5m=[], message_id=message_id or 0
+    )
 
+def restore_open_signals():
+    with db_lock:
+        ready = db.execute(
+            '''SELECT id,inst_id,direction,strategy,level,entry_low,entry_high,sl,tp1,tp2,tp3,score,
+                      created_at,activated_at,expires_at,tp1_hit,tp2_hit,tp3_hit,pattern_name,reason,message_id
+               FROM signals WHERE status='READY' AND expires_at > ?''',
+            (now_ts(),)
+        ).fetchall()
+        live = db.execute(
+            '''SELECT id,inst_id,direction,strategy,level,entry_low,entry_high,sl,tp1,tp2,tp3,score,
+                      created_at,activated_at,expires_at,tp1_hit,tp2_hit,tp3_hit,pattern_name,reason,message_id
+               FROM signals WHERE status='ACTIVE' '''
+        ).fetchall()
+    for row in ready:
+        s = setup_from_row(row)
+        pending[s.inst_id] = PendingSignal(s, row[0], row[12] or now_ts(), row[14] or now_ts(), row[20] or 0)
+    for row in live:
+        s = setup_from_row(row)
+        active[s.inst_id] = ActiveSignal(
+            s, row[0], row[13] or now_ts(), row[20] or 0,
+            bool(row[15]), bool(row[16]), bool(row[17])
+        )
+    log.info('RESTORE | pending=%d active=%d', len(pending), len(active))
 
 def lifecycle_for_symbol(iid: str, cs: List[Candle]):
     if len(cs) < 3:
         return
-    live = cs[-1]
-    confirmed = confirmed_candles(cs)
-    if not confirmed:
-        return
-    last = confirmed[-1]
-
+    last = cs[-1]
     p = pending.get(iid)
     if p:
-        ticker = get_ticker(iid)
-        live_price = ticker['last'] if ticker else live.close
-        touched = price_in_entry(p.setup, live_price) or (live.low <= p.setup.entry_high and live.high >= p.setup.entry_low)
+        s = p.setup
         if now_ts() > p.expires_at:
             with db_lock:
                 db.execute("UPDATE signals SET status='EXPIRED' WHERE id=? AND status='READY'", (p.signal_id,))
                 db.commit()
             pending.pop(iid, None)
-        elif touched:
+        elif price_in_entry(s, last):
             with db_lock:
-                db.execute("UPDATE signals SET status='ACTIVE',activated_at=? WHERE id=? AND status='READY'",
-                           (now_ts(), p.signal_id))
+                db.execute(
+                    "UPDATE signals SET status='ACTIVE',activated_at=? WHERE id=? AND status='READY'",
+                    (now_ts(), p.signal_id)
+                )
                 db.commit()
-            active[iid] = ActiveSignal(p.setup, p.signal_id, now_ts(), p.message_id)
+            active[iid] = ActiveSignal(s, p.signal_id, now_ts(), p.message_id)
             pending.pop(iid, None)
-
     a = active.get(iid)
     if not a:
         return
     s = a.setup
-    # Candle timestamps are opening times in milliseconds. Do not let a candle
-    # that closed before entry activation retroactively hit TP/SL for this trade.
-    if last.ts / 1000.0 < a.activated_at:
+    if not last.confirmed:
         return
     long = s.direction == 'LONG'
     hit1 = last.high >= s.tp1 if long else last.low <= s.tp1
     hit2 = last.high >= s.tp2 if long else last.low <= s.tp2
     hit3 = last.high >= s.tp3 if long else last.low <= s.tp3
     stop = last.low <= s.sl if long else last.high >= s.sl
-
+    both = stop and hit1
     with db_lock:
-        row = db.execute('SELECT tp1_hit,tp2_hit,tp3_hit,status FROM signals WHERE id=?', (a.signal_id,)).fetchone()
+        row = db.execute('SELECT tp1_hit,tp2_hit,tp3_hit FROM signals WHERE id=?', (a.signal_id,)).fetchone()
     if not row:
         return
-    h1, h2, h3, status = row
-    if status not in ('ACTIVE', 'READY'):
-        active.pop(iid, None)
-        return
-
-    # Conservative candle rule: if stop and ANY not-yet-recorded target are
-    # both inside the same confirmed candle, assume stop happened first.
-    ambiguous = stop and (hit1 or hit2 or hit3)
-    if ambiguous:
+    h1, h2, h3 = row
+    if both and not h1:
         with db_lock:
-            db.execute("UPDATE signals SET status='CLOSED_LOSS',result='SL',closed_at=?,r_multiple=-1 WHERE id=?",
-                       (now_ts(), a.signal_id))
+            db.execute(
+                "UPDATE signals SET status='CLOSED_LOSS',result='SL',closed_at=?,r_multiple=-1 WHERE id=?",
+                (now_ts(), a.signal_id)
+            )
             db.commit()
-        send_update(f'🔴 <b>STOP — {s.coin}USDT</b>\nСтоп и цель оказались в одной подтверждённой свече. Результат засчитан консервативно по SL.')
+        send_update(
+            f'🔴 <b>STOP — {s.coin}USDT</b>\n'
+            'Стоп затронут в свече с неоднозначным пересечением целей. Результат засчитан консервативно по SL.'
+        )
         active.pop(iid, None)
         return
-
     if hit1 and not h1:
         with db_lock:
             db.execute('UPDATE signals SET tp1_hit=1 WHERE id=?', (a.signal_id,))
             db.commit()
         a.tp1_sent = True
-        send_update(f'🟢 <b>TP1 — {s.coin}USDT</b>\nЦена достигла <code>{fmt_price(s.tp1)}</code>.')
+        send_update(
+            f'🟢 <b>TP1 — {s.coin}USDT</b>\nЦена достигла <code>{fmt_price(s.tp1)}</code>.\n'
+            'Часть позиции можно зафиксировать по своему плану.'
+        )
     if hit2 and not h2:
         with db_lock:
             db.execute('UPDATE signals SET tp2_hit=1 WHERE id=?', (a.signal_id,))
             db.commit()
         a.tp2_sent = True
-        send_update(f'🚀 <b>TP2 — {s.coin}USDT</b>\nЦена достигла <code>{fmt_price(s.tp2)}</code>.')
+        send_update(
+            f'🚀 <b>TP2 — {s.coin}USDT</b>\nЦена достигла <code>{fmt_price(s.tp2)}</code>.\n'
+            'Остаток сопровождаем по плану.'
+        )
     if hit3 and not h3:
         entry = (s.entry_low + s.entry_high) / 2
         r = abs(s.tp3 - entry) / max(abs(entry - s.sl), 1e-12)
         with db_lock:
-            db.execute("UPDATE signals SET tp3_hit=1,status='CLOSED_WIN',result='TP3',closed_at=?,r_multiple=? WHERE id=?",
-                       (now_ts(), r, a.signal_id))
+            db.execute(
+                "UPDATE signals SET tp3_hit=1,status='CLOSED_WIN',result='TP3',closed_at=?,r_multiple=? WHERE id=?",
+                (now_ts(), r, a.signal_id)
+            )
             db.commit()
-        send_update(f'🏁 <b>TP3 — {s.coin}USDT</b>\nЦена достигла <code>{fmt_price(s.tp3)}</code>. Результат: TP3.')
+        send_update(
+            f'🏁 <b>TP3 — {s.coin}USDT</b>\nЦена достигла <code>{fmt_price(s.tp3)}</code>.\n'
+            'Результат зафиксирован: TP3.'
+        )
         active.pop(iid, None)
         return
     if stop:
+        result = 'SL_AFTER_TP1' if h1 else 'SL'
+        r_mult = 0 if h1 else -1
         with db_lock:
-            db.execute("UPDATE signals SET status='CLOSED_LOSS',result='SL',closed_at=?,r_multiple=-1 WHERE id=?",
-                       (now_ts(), a.signal_id))
+            db.execute(
+                "UPDATE signals SET status='CLOSED_LOSS',result=?,closed_at=?,r_multiple=? WHERE id=?",
+                (result, now_ts(), r_mult, a.signal_id)
+            )
             db.commit()
-        send_update(f'🔴 <b>STOP — {s.coin}USDT</b>\nЦена достигла <code>{fmt_price(s.sl)}</code>.')
+        send_update(
+            f'🔴 <b>STOP — {s.coin}USDT</b>\nЦена достигла стопа <code>{fmt_price(s.sl)}</code>.\n'
+            'Сделка закрыта по плановому риску.'
+        )
         active.pop(iid, None)
         return
-
     if now_ts() - a.activated_at > ACTIVE_MAX_HOURS * 3600:
         with db_lock:
-            db.execute("UPDATE signals SET status='TIMEOUT',result='TIMEOUT',closed_at=? WHERE id=?",
-                       (now_ts(), a.signal_id))
+            db.execute(
+                "UPDATE signals SET status='TIMEOUT',result='TIMEOUT',closed_at=? WHERE id=?",
+                (now_ts(), a.signal_id)
+            )
             db.commit()
-        send_update(f'⚪ <b>TIMEOUT — {s.coin}USDT</b>\nСделка закрыта по времени.')
+        send_update(
+            f'⚪ <b>TIMEOUT — {s.coin}USDT</b>\n'
+            'Сделка не дошла до TP3/SL в установленное время. Результат закрыт как TIMEOUT.'
+        )
         active.pop(iid, None)
-
 
 def update_signal_results():
     symbols = set(pending) | set(active)
     for iid in list(symbols):
         try:
-            lifecycle_for_symbol(iid, get_candles(iid, '5m', 90))
+            cs = get_candles(iid, '5m', 80)
+            lifecycle_for_symbol(iid, cs)
         except Exception:
             log.exception('LIFECYCLE FAILED | %s', iid)
 
-# ============================================================
-# ANTI-DUPLICATE — no daily signal cap
-# ============================================================
 
+# ============================================================
+# LIMITS / COOLDOWN
+# ============================================================
 def can_send(iid: str) -> bool:
-    # Block symbols that are currently being sent, READY, or ACTIVE. Also keep
-    # a DB-backed cooldown so a quick process restart cannot repost the same
-    # coin immediately. Cooldown prevents reposting the same symbol immediately. No global daily/hourly quota is applied.
-    with sending_lock:
-        if iid in sending_symbols:
-            return False
     if iid in pending or iid in active:
         return False
     with db_lock:
-        row = db.execute("SELECT created_at,status FROM signals WHERE inst_id=? AND status NOT IN ('SEND_FAILED') ORDER BY created_at DESC LIMIT 1",
-                         (iid,)).fetchone()
-    if not row:
-        return True
-    created_at, status = float(row[0]), str(row[1] or '')
-    if status in ('READY', 'ACTIVE'):
-        return False
-    return now_ts() - created_at >= COOLDOWN_MINUTES * 60
-
-
-def setup_quality_rank(setup: Setup, ticker: Optional[dict] = None) -> float:
-    """Cross-strategy rank: combine the strategy score with trade geometry.
-
-    This is a ranking function, not a signal quota or a new hard rejection gate.
-    It helps choose the best candidate when multiple strategies detect the same
-    instrument and orders candidates by quality before Telegram delivery.
-    """
-    ticker = ticker or {}
-    entry = (setup.entry_low + setup.entry_high) / 2.0
-    risk = abs(entry - setup.sl)
-    if entry <= 0 or risk <= 0:
-        return -1e9
-
-    sign = 1 if setup.direction == 'LONG' else -1
-    rr2 = sign * (setup.tp2 - entry) / risk
-    tp1_move = sign * (setup.tp1 - entry) / entry * 100.0
-    tp2_move = sign * (setup.tp2 - entry) / entry * 100.0
-    tp3_move = sign * (setup.tp3 - entry) / entry * 100.0
-    risk_pct = risk / entry * 100.0
-    zone_width_pct = (setup.entry_high - setup.entry_low) / entry * 100.0
-    rank = float(setup.score)
-
-    # Reward useful TP2 risk/reward but taper extreme values that often indicate
-    # a distant/poorly modelled target rather than a realistic edge.
-    rank += clamp((rr2 - 1.7) * 1.5, -4.0, 4.0)
-    if tp1_move <= 0 or tp2_move <= tp1_move or tp3_move <= tp2_move:
-        rank -= 18.0
-    if tp2_move > max(6.0, risk_pct * 12.0):
-        rank -= min(8.0, (tp2_move - max(6.0, risk_pct * 12.0)) * 0.6)
-    gap12 = tp2_move - tp1_move
-    gap23 = tp3_move - tp2_move
-    min_gap_pct = max(0.45, risk_pct * 0.55)
-    if gap12 < min_gap_pct:
-        rank -= 4.0
-    if gap23 < min_gap_pct:
-        rank -= 4.0
-    if zone_width_pct > max(0.30, setup.atr5_pct * 0.75):
-        rank -= min(5.0, (zone_width_pct - max(0.30, setup.atr5_pct * 0.75)) * 5.0)
-
-    spread = ticker.get('spread_pct')
-    if spread is not None:
-        rank -= clamp(float(spread) * 20.0, 0.0, 8.0)
-
-    # A PRE-BREAKOUT should not be rejected solely for quiet volume, but a nearly
-    # inactive trigger is less convincing than orderly contraction with activity.
-    if setup.strategy == 'PRE-BREAKOUT':
-        rank -= clamp((0.35 - setup.volume_ratio) * 8.0, 0.0, 4.0)
-        if 0.8 <= setup.volume_ratio <= 2.5:
-            rank += 1.5
-    return rank
+        row = db.execute(
+            "SELECT created_at FROM signals "
+            "WHERE inst_id=? AND status NOT IN ('SEND_FAILED') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (iid,)
+        ).fetchone()
+    return not row or now_ts() - float(row[0]) >= COOLDOWN_MINUTES * 60
 
 
 # ============================================================
-# SCANNER — four independent strategy searches
+# SCANNER
 # ============================================================
-
-_universe_last_scanned: Optional[str] = None
-
 def scan_market():
-    global _universe_last_scanned
     instruments = get_instruments()
     tickers = get_tickers()
-    ranked_universe = build_universe(instruments, tickers)
-    if ranked_universe:
-        # Two-lane discovery:
-        #   1) repeatedly inspect the best current opportunities,
-        #   2) rotate through the rest of the market so lower-ranked/newly active
-        #      symbols are not starved forever.
-        # DEEP_SCAN_LIMIT is only a per-cycle workload budget, never a signal cap.
-        batch_size = len(ranked_universe) if DEEP_SCAN_LIMIT <= 0 else min(DEEP_SCAN_LIMIT, len(ranked_universe))
-        priority = ranked_universe[:batch_size]
-        if len(ranked_universe) > batch_size:
-            if batch_size == 1:
-                # With a one-symbol work budget, pure priority selection would
-                # starve the rest of the market. Use fair round-robin instead.
-                coverage = sorted(ranked_universe, key=lambda item: item[0])
-                cursor = _universe_last_scanned
-                if not cursor:
-                    with db_lock:
-                        row = db.execute("SELECT value FROM bot_state WHERE key='universe_cursor'").fetchone()
-                    cursor = str(row[0]) if row else None
-                symbols = [item[0] for item in coverage]
-                if cursor in symbols:
-                    start = (symbols.index(cursor) + 1) % len(coverage)
-                else:
-                    from bisect import bisect_right
-                    start = bisect_right(symbols, cursor) % len(coverage) if cursor else 0
-                batch = (coverage[start:] + coverage[:start])[:1]
-                _universe_last_scanned = batch[-1][0]
-                with db_lock:
-                    db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES('universe_cursor',?)",
-                               (_universe_last_scanned,))
-                    db.commit()
-            else:
-                priority_count = max(1, min(batch_size - 1, int(round(batch_size * 0.65))))
-                priority = ranked_universe[:priority_count]
-                priority_ids = {item[0] for item in priority}
-                coverage = sorted((item for item in ranked_universe if item[0] not in priority_ids),
-                                  key=lambda item: item[0])
-                cursor = _universe_last_scanned
-                if not cursor:
-                    with db_lock:
-                        row = db.execute("SELECT value FROM bot_state WHERE key='universe_cursor'").fetchone()
-                    cursor = str(row[0]) if row else None
-                symbols = [item[0] for item in coverage]
-                if cursor in symbols:
-                    start = (symbols.index(cursor) + 1) % len(coverage)
-                else:
-                    from bisect import bisect_right
-                    start = bisect_right(symbols, cursor) % len(coverage) if cursor else 0
-                rotated = coverage[start:] + coverage[:start]
-                coverage_count = batch_size - len(priority)
-                coverage_batch = rotated[:coverage_count]
-                batch = priority + coverage_batch
-                if coverage_batch:
-                    _universe_last_scanned = coverage_batch[-1][0]
-                    with db_lock:
-                        db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES('universe_cursor',?)",
-                                   (_universe_last_scanned,))
-                        db.commit()
-        else:
-            batch = priority
-        candidates = sorted(batch, key=lambda item: item[2], reverse=True)
-    else:
-        candidates = []
-    raw: List[Setup] = []
-    ticker_by_symbol = {iid: ticker for iid, ticker, _ in ranked_universe}
-    strategy_counts = {fn.__name__: 0 for fn in STRATEGIES}
-
-    for iid, ticker, _ in candidates:
+    candidates = build_universe(instruments, tickers)
+    raw = []
+    for iid, t, _ in candidates:
         if not can_send(iid):
             continue
         try:
             data = load_symbol(iid)
-            if not market_data_is_fresh(data):
-                log.debug('SYMBOL SKIPPED | %s | stale or incomplete candle data', iid)
-                continue
-            # Common activity gate only. No strategy-specific pattern is filtered here.
-            c5 = confirmed_candles(data['5m'])
-            c15 = confirmed_candles(data['15m'])
-            if len(c5) < 80 or len(c15) < 80:
+            c5 = closed_candles(data['5m'])
+            c15 = closed_candles(data['15m'])
+            if len(c5) < 70 or len(c15) < 70:
                 continue
             if atr_pct(c5) < MIN_ATR_5M_PCT or atr_pct(c15) < MIN_ATR_15M_PCT:
                 continue
-
+            data = {'5m': c5, '15m': c15, '1h': closed_candles(data['1h'])}
             for builder in STRATEGIES:
                 try:
-                    setup = builder(iid, ticker, data)
-                    if setup:
-                        raw.append(setup)
-                        strategy_counts[builder.__name__] += 1
-                except Exception:
-                    log.exception('STRATEGY ERROR | %s | %s', iid, builder.__name__)
-        except Exception:
-            log.exception('SYMBOL SCAN FAILED | %s', iid)
-
-    # A symbol can have multiple valid strategies. Send only the best normalized
-    # candidate for that symbol to avoid competing instructions.
-    best: Dict[str, Setup] = {}
-    best_ranks: Dict[str, float] = {}
-    candidates_by_symbol: Dict[str, List[Setup]] = {}
-    for candidate in raw:
-        candidates_by_symbol.setdefault(candidate.inst_id, []).append(candidate)
-    for symbol, symbol_setups in candidates_by_symbol.items():
-        best_score_by_direction = {
-            direction: max(s.score for s in symbol_setups if s.direction == direction)
-            for direction in {s.direction for s in symbol_setups}
-        }
-        strongest_direction = max(best_score_by_direction, key=best_score_by_direction.get)
-        strongest_score = best_score_by_direction[strongest_direction]
-        for s in symbol_setups:
-            rank = setup_quality_rank(s, ticker_by_symbol.get(s.inst_id))
-            # If independent strategies disagree and their raw scores are close,
-            # treat that disagreement as uncertainty, not as another signal.
-            if s.direction != strongest_direction and strongest_score - s.score <= 8:
-                rank -= 6.0
-            if symbol not in best or rank > best_ranks[symbol]:
-                best[symbol] = s
-                best_ranks[symbol] = rank
-
-    final = sorted(best.values(),
-                   key=lambda s: (best_ranks.get(s.inst_id, float(s.score)), s.score),
-                   reverse=True)
-    log.info('SCAN | market=%d eligible=%d batch=%d raw=%d final=%d | %s',
-             len(tickers), len(ranked_universe), len(candidates), len(raw), len(final), strategy_counts)
-    if final:
-        log.info('TOP SETUPS | %s', ', '.join(
-            f'{s.coin}:{s.strategy}:{s.direction}:score={s.score}:rank={best_ranks.get(s.inst_id, 0):.1f}'
-            for s in final[:8]
-        ))
+                    s = builder(iid, t, data)
+                    if s:
+                        raw.append(s)
+                except Exception as exc:
+                    log.debug('STRATEGY FAILED | %s | %s | %s', iid, builder.__name__, exc)
+        except Exception as exc:
+            log.warning('CANDIDATE FAILED | %s | %s', iid, exc)
+    best = {}
+    for s in raw:
+        if s.inst_id not in best or s.score > best[s.inst_id].score:
+            best[s.inst_id] = s
+    final = sorted(best.values(), key=lambda x: x.score, reverse=True)
+    log.info('SCAN | market=%d candidates=%d raw=%d final=%d', len(tickers), len(candidates), len(raw), len(final))
+    sent = 0
     for s in final:
-        if can_send(s.inst_id):
-            send_signal(s)
+        if sent >= MAX_SIGNALS_PER_SCAN:
+            break
+        if not can_send(s.inst_id):
+            continue
+        if send_signal(s):
+            sent += 1
+
 
 # ============================================================
 # WEEKLY REPORT
 # ============================================================
-
 def weekly_report():
     n = local_now()
     if n.weekday() != 0 or n.hour < 9:
@@ -1944,128 +1317,39 @@ def weekly_report():
         row = db.execute("SELECT value FROM bot_state WHERE key='weekly_report'").fetchone()
     if row and row[0] == key:
         return
-
     since = (n - timedelta(days=7)).timestamp()
     with db_lock:
-        total = db.execute(
-            'SELECT COUNT(*) FROM signals WHERE created_at>=?', (since,)
+        total = db.execute('SELECT COUNT(*) FROM signals WHERE created_at>=?', (since,)).fetchone()[0]
+        wins = db.execute("SELECT COUNT(*) FROM signals WHERE created_at>=? AND result='TP3'", (since,)).fetchone()[0]
+        losses = db.execute(
+            "SELECT COUNT(*) FROM signals WHERE created_at>=? AND result IN ('SL','SL_AFTER_TP1')",
+            (since,)
         ).fetchone()[0]
-        rows = db.execute('''
-            SELECT strategy,
-                   COUNT(*) AS total,
-                   SUM(CASE WHEN activated_at IS NOT NULL THEN 1 ELSE 0 END) AS activated,
-                   SUM(COALESCE(tp1_hit, 0)),
-                   SUM(COALESCE(tp2_hit, 0)),
-                   SUM(COALESCE(tp3_hit, 0)),
-                   SUM(CASE WHEN result='SL' THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN result='SL' AND COALESCE(tp1_hit, 0)=1 THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN result='TIMEOUT' THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN status='EXPIRED' THEN 1 ELSE 0 END)
-            FROM signals
-            WHERE created_at>=?
-            GROUP BY strategy
-            ORDER BY total DESC
-        ''', (since,)).fetchall()
-
-    lines = [f'📊 <b>QUANTUM — 7 дней</b>', f'Сигналов отправлено: <b>{total}</b>']
-    for row in rows:
-        strategy, sent, activated, tp1, tp2, tp3, stops, stop_after_tp1, timeouts, expired = row
-        activated = int(activated or 0)
-        tp1, tp2, tp3 = int(tp1 or 0), int(tp2 or 0), int(tp3 or 0)
-        stops, stop_after_tp1 = int(stops or 0), int(stop_after_tp1 or 0)
-        timeouts, expired = int(timeouts or 0), int(expired or 0)
-        lines.append(
-            f'\n<b>{strategy or "UNKNOWN"}</b>: {sent} sent / {activated} activated'
-            f'\nTP1 {tp1} · TP2 {tp2} · TP3 {tp3}'
-            f'\nSL {stops} (после TP1: {stop_after_tp1}) · timeout {timeouts} · expired {expired}'
-        )
-    lines.append('\n<i>TP-цели — отдельные события и могут относиться к одной сделке; '
-                 'SL после TP1 показан отдельно.</i>')
-
+        tp1s = db.execute('SELECT COUNT(*) FROM signals WHERE created_at>=? AND tp1_hit=1', (since,)).fetchone()[0]
     try:
-        bot.send_message(CHANNEL_ID, '\n'.join(lines), parse_mode='HTML')
+        bot.send_message(
+            CHANNEL_ID,
+            f'📊 <b>QUANTUM — неделя</b>\n\n'
+            f'Сигналов: <b>{total}</b>\n'
+            f'TP1: <b>{tp1s}</b>\n'
+            f'Прибыльных закрытых (TP3): <b>{wins}</b>\n'
+            f'Убыточных закрытых: <b>{losses}</b>',
+            parse_mode='HTML'
+        )
         with db_lock:
             db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES('weekly_report',?)", (key,))
             db.commit()
     except Exception:
         log.exception('WEEKLY REPORT FAILED')
 
-# ============================================================
-# TELEGRAM POLLING — hardened against 409 / duplicate processes
-# ============================================================
-
-polling_stop = threading.Event()
-polling_lock_file = None
-
-
-def acquire_single_process_lock():
-    global polling_lock_file
-    try:
-        import fcntl
-    except ImportError:
-        log.warning('PROCESS LOCK | fcntl unavailable; relying on deployment single-instance setting')
-        return True
-    path = os.getenv('TELEGRAM_POLLING_LOCK', '/tmp/quantum_telegram_polling.lock')
-    polling_lock_file = open(path, 'w')
-    try:
-        fcntl.flock(polling_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        polling_lock_file.write(str(os.getpid()))
-        polling_lock_file.flush()
-        log.info('PROCESS LOCK | acquired | pid=%s', os.getpid())
-        return True
-    except BlockingIOError:
-        log.error('PROCESS LOCK | another QUANTUM process is already polling Telegram')
-        return False
-
-
-def start_telegram_polling():
-    if not acquire_single_process_lock():
-        # Keep the market scanner alive; this process must not compete for
-        # getUpdates if another local process already owns the lock.
-        log.error('TELEGRAM POLLING DISABLED | another local process owns the lock')
-        return
-    try:
-        bot.remove_webhook()
-        time.sleep(0.5)
-    except Exception:
-        log.exception('TELEGRAM WEBHOOK CLEANUP FAILED')
-
-    def runner():
-        backoff = 3
-        while not polling_stop.is_set():
-            try:
-                log.info('TELEGRAM POLLING START')
-                # polling(non_stop=False) lets a 409 escape to this handler;
-                # infinity_polling can internally reconnect forever on conflict.
-                bot.polling(non_stop=False, skip_pending=True, timeout=20,
-                            long_polling_timeout=20, allowed_updates=['callback_query'])
-                if not polling_stop.is_set():
-                    log.warning('TELEGRAM POLLING RETURNED | retrying in %ss', backoff)
-                    time.sleep(backoff)
-                    backoff = min(backoff * 2, 60)
-            except Exception as exc:
-                text = str(exc).lower()
-                is_409 = getattr(exc, 'error_code', None) == 409 or ('409' in text and 'conflict' in text) or 'terminated by other getupdates' in text
-                if is_409:
-                    # Do not create a polling tug-of-war. Market scanning and
-                    # outgoing messages may continue, but callbacks need the
-                    # one process that owns polling. Fix extra Render service.
-                    log.error('TELEGRAM 409 CONFLICT | polling stopped in this process. Stop every other service/instance using this token except one.')
-                    return
-                log.exception('TELEGRAM POLLING ERROR | %s', exc)
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-
-    threading.Thread(target=runner, name='telegram-polling', daemon=True).start()
 
 # ============================================================
-# STARTUP HEALTH
+# HEALTH / STARTUP
 # ============================================================
-
 def startup_healthcheck():
     try:
         payload = okx_get('/api/v5/public/time', {})
-        if str(payload.get('code')) != '0':
+        if str(payload.get('code', '')) != '0':
             raise RuntimeError('OKX time endpoint failed')
         log.info('HEALTH | OKX API OK')
     except Exception:
@@ -2076,21 +1360,19 @@ def startup_healthcheck():
     except Exception:
         log.exception('HEALTH | TELEGRAM FAILED')
 
+
 # ============================================================
 # MAIN
 # ============================================================
-
 def main():
     log.info('============================================================')
-    log.info('QUANTUM INTRADAY SWING ENGINE V3 STARTED')
-    log.info('Strategies: Trend Pullback | Breakout+Retest | Extreme Reversal | Pre-Breakout')
-    log.info('No daily signal cap; only duplicate/cooldown protection.')
+    log.info('QUANTUM INTRADAY SWING ENGINE V2 STARTED')
+    log.info('Strategies: Extreme Reversal | Breakout+Retest | Pullback | Mean Reversion')
+    log.info('Universe: gainers | losers | volatile | new active | small alts')
     log.info('============================================================')
-
     startup_healthcheck()
-    recover_runtime_state()
+    restore_open_signals()
     start_telegram_polling()
-
     while True:
         try:
             update_signal_results()
@@ -2098,12 +1380,10 @@ def main():
             scan_market()
         except KeyboardInterrupt:
             log.info('STOPPED')
-            polling_stop.set()
             break
         except Exception:
             log.exception('MAIN LOOP ERROR')
         time.sleep(SCAN_INTERVAL_SECONDS)
-
 
 if __name__ == '__main__':
     main()

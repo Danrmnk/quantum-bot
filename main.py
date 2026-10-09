@@ -384,6 +384,8 @@ def _ticker_from_row(x: dict) -> Optional[dict]:
         lo = float(x.get('low24h') or 0)
         vol = float(x.get('vol24h') or 0)
         vol_ccy = float(x.get('volCcy24h') or 0)
+        bid = float(x.get('bidPx') or 0)
+        ask = float(x.get('askPx') or 0)
         if last <= 0 or op <= 0 or not iid.endswith('-USDT-SWAP'):
             return None
         # OKX SWAP ticker units matter here:
@@ -395,8 +397,14 @@ def _ticker_from_row(x: dict) -> Optional[dict]:
         turnover = vol_ccy * last if vol_ccy > 0 else 0.0
         if not math.isfinite(turnover) or turnover < 0:
             turnover = 0.0
+        spread_pct = None
+        if 0 < bid <= ask:
+            mid = (bid + ask) / 2
+            if mid > 0:
+                spread_pct = (ask - bid) / mid * 100
         return {
             'last': last, 'open24h': op, 'high24h': hi, 'low24h': lo,
+            'bid': bid, 'ask': ask, 'spread_pct': spread_pct,
             'vol24h_usd': turnover,
             'change24h_pct': (last / op - 1) * 100,
             'range24h_pct': (hi - lo) / last * 100 if hi > lo else 0.0,
@@ -506,7 +514,11 @@ def build_universe(instruments: Dict[str, dict], tickers: Dict[str, dict]):
         movement = clamp(move * 0.85, 0, 18)
         active_range = clamp(day_range * 1.15, 0, 22)
         balanced_motion = max(0.0, 10.0 - abs(day_range - max(move, 3.0)) * 0.35)
-        score = liquidity + movement + active_range + balanced_motion
+        # Spread is a tradability-quality signal, not a hard universe exclusion.
+        # Wide-spread contracts rank lower even when their 24H move looks large.
+        spread = t.get('spread_pct')
+        spread_penalty = clamp(float(spread) * 25.0, 0.0, 12.0) if spread is not None else 1.5
+        score = liquidity + movement + active_range + balanced_motion - spread_penalty
         base.append((iid, t, score))
 
     # Rank the whole eligible universe. scan_market rotates through batches so
@@ -520,15 +532,25 @@ def build_universe(instruments: Dict[str, dict], tickers: Dict[str, dict]):
 # ============================================================
 
 def pivots(cs: List[Candle], left: int = 2, right: int = 2) -> List[Pivot]:
+    """Return confirmed swing points without counting flat plateaus repeatedly.
+
+    Ties are resolved consistently: a pivot must be strictly more extreme than
+    every candle on its left and at least as extreme as candles on its right.
+    This prevents a run of equal highs/lows from inflating level touch counts.
+    """
     out = []
     if len(cs) < left + right + 1:
         return out
     for i in range(left, len(cs) - right):
-        window = cs[i-left:i+right+1]
-        if cs[i].high >= max(c.high for c in window):
-            out.append(Pivot(i, cs[i].high, 'HIGH'))
-        if cs[i].low <= min(c.low for c in window):
-            out.append(Pivot(i, cs[i].low, 'LOW'))
+        current = cs[i]
+        left_window = cs[i-left:i]
+        right_window = cs[i+1:i+right+1]
+        if (all(current.high > c.high for c in left_window)
+                and all(current.high >= c.high for c in right_window)):
+            out.append(Pivot(i, current.high, 'HIGH'))
+        if (all(current.low < c.low for c in left_window)
+                and all(current.low <= c.low for c in right_window)):
+            out.append(Pivot(i, current.low, 'LOW'))
     return out
 
 
@@ -539,6 +561,10 @@ def recent_pivots(cs: List[Candle], lookback: int = 100) -> List[Pivot]:
 
 
 def cluster_levels(cs: List[Candle], tolerance_pct: float = 0.30) -> List[Level]:
+    # Level tolerance must scale with the instrument's volatility: a fixed 0.28%
+    # merges too much on quiet coins and splits the same structure on fast alts.
+    vol_adjusted_tolerance = min(0.80, max(tolerance_pct, atr_pct(cs) * 0.35))
+    tolerance_pct = vol_adjusted_tolerance
     ps = recent_pivots(cs, min(120, len(cs)))
     levels: List[Level] = []
     for p in ps:
@@ -622,7 +648,12 @@ def market_score(
     score += clamp(math.log10(turnover / max(MIN_24H_TURNOVER_USD, 1.0)) * 3.2, 0, 9)
     score += clamp(atr_pct(c5) / max(MIN_ATR_5M_PCT, 0.01), 0, 2.2) * 2.0
     score += clamp(atr_pct(c15) / max(MIN_ATR_15M_PCT, 0.01), 0, 2.0) * 2.0
-    score += clamp(math.log(max(vr, 0.05), 1.7) * 4.0, -5, 9)
+    if strategy == 'PRE-BREAKOUT':
+        # Quiet candles are allowed, but an almost inactive directional trigger
+        # should materially lower confidence instead of passing on bonuses alone.
+        score += clamp(math.log(max(vr, 0.05), 1.7) * 5.0, -8, 7)
+    else:
+        score += clamp(math.log(max(vr, 0.05), 1.7) * 4.0, -5, 9)
 
     # Reward aligned multi-timeframe structure; do not hard-reject a setup just
     # because a timeframe is neutral or mildly opposed.
@@ -659,6 +690,9 @@ def market_score(
     day_move = abs(float(ticker.get('change24h_pct', 0.0)))
     if day_move > 35 and strategy != 'EXTREME REVERSAL':
         score -= clamp((day_move - 35) * 0.10, 0, 5)
+    spread = ticker.get('spread_pct')
+    if spread is not None:
+        score -= clamp(float(spread) * 20.0, 0.0, 10.0)
     return int(clamp(round(score), 0, 99))
 
 
@@ -684,66 +718,77 @@ def target_levels(
     c15: List[Candle],
     preferred_targets: Optional[List[float]] = None,
     min_target_pcts: Optional[Tuple[float, float, float]] = None,
+    trigger_level: Optional[float] = None,
 ):
-    """Build ordered targets without accepting levels clustered right at entry.
+    """Create risk-based targets and use nearby structure only when it improves them.
 
-    min_target_pcts is used by PRE-BREAKOUT because the trigger level itself is
-    not a meaningful profit target; there must be room beyond that level.
+    Structural levels far away must not distort the target ladder (for example,
+    TP1 near entry followed by TP2/TP3 at almost the same distant price).
+    For PRE-BREAKOUT, all targets must sit beyond the trigger level.
     """
     risk = abs(entry - sl)
     if risk <= 0 or entry <= 0:
         return None
-    levels = cluster_levels(c15)
+
     sign = 1 if direction == 'LONG' else -1
-    structural = sorted(
-        [lv.price for lv in levels if sign * (lv.price - entry) > 0],
-        reverse=(direction == 'SHORT')
-    )
-    candidates = []
-    if preferred_targets:
-        candidates.extend(preferred_targets)
-    candidates.extend(structural)
-
-    # Baseline targets are risk-based, but for PRE-BREAKOUT also require enough
-    # absolute price movement to make the signal worthwhile.
     floors = min_target_pcts or (0.0, 0.0, 0.0)
-    targets = [
-        entry + sign * max(risk * TP1_R, entry * floors[0]),
-        entry + sign * max(risk * TP2_R, entry * floors[1]),
-        entry + sign * max(risk * TP3_R, entry * floors[2]),
-    ]
+    r_multiples = (TP1_R, TP2_R, TP3_R)
+    base_moves = [max(risk * r, entry * max(0.0, floors[i]))
+                  for i, r in enumerate(r_multiples)]
 
-    valid = []
-    target_r_multiples = (TP1_R, TP2_R, TP3_R)
-    for p in candidates:
-        move = sign * (p - entry)
-        slot = min(len(valid), 2)
-        required_move = max(risk * target_r_multiples[slot], entry * floors[slot])
-        if move < required_move:
-            continue
-        # Discard duplicate/near-identical levels; they create meaningless TP2/TP3.
-        if valid and abs(p - valid[-1]) / entry < 0.0035:
-            continue
-        valid.append(p)
-        if len(valid) == 3:
+    trigger_buffer = max(risk * 0.35, entry * 0.0015) if trigger_level is not None else 0.0
+    trigger_move = sign * (trigger_level - entry) + trigger_buffer if trigger_level is not None else 0.0
+    if trigger_level is not None:
+        base_moves = [max(move, trigger_move) for move in base_moves]
+
+    # Keep targets anchored to risk. Structure may refine a target, but should
+    # not stretch it to an unrelated level many ATRs away.
+    targets = [entry + sign * move for move in base_moves]
+    levels = cluster_levels(c15)
+    structural = [lv.price for lv in levels
+                  if sign * (lv.price - entry) > 0
+                  and (trigger_level is None or sign * (lv.price - trigger_level) > trigger_buffer)]
+    candidates = list(preferred_targets or []) + structural
+    candidates = [p for p in candidates
+                  if p > 0 and sign * (p - entry) > 0
+                  and (trigger_level is None or sign * (p - trigger_level) > trigger_buffer)]
+    # Crucial: preferred targets and pivots are mixed together, then sorted by
+    # distance from entry. Their original list order must not decide TP1/TP2/TP3.
+    candidates = sorted(set(candidates), key=lambda p: sign * (p - entry))
+
+    atr15_pct_value = atr_pct(c15) if c15 else 0.0
+    min_gap = max(risk * 0.55, entry * max(0.0045, atr15_pct_value / 100.0 * 0.35))
+    previous_target = None
+    for i, base_move in enumerate(base_moves):
+        required_move = max(risk * r_multiples[i], entry * max(0.0, floors[i]))
+        if trigger_level is not None:
+            required_move = max(required_move, trigger_move)
+        # Do not substitute a distant historical pivot for a sensible R target.
+        max_structural_move = max(base_move * 1.8, base_move + entry * 0.008)
+        for p in candidates:
+            move = sign * (p - entry)
+            if move < required_move:
+                continue
+            if move > max_structural_move:
+                break
+            if previous_target is not None and sign * (p - previous_target) < min_gap:
+                continue
+            targets[i] = p
             break
+        # Maintain a meaningful ladder without relying on near-identical pivots.
+        if previous_target is not None and sign * (targets[i] - previous_target) < min_gap:
+            targets[i] = previous_target + sign * min_gap
+        previous_target = targets[i]
 
-    for i in range(min(len(valid), 3)):
-        targets[i] = valid[i]
-
-    # Keep targets meaningfully separated. A tight cluster of structural levels
-    # must not produce three nearly identical exit prices.
-    min_gap = max(risk * 0.45, entry * 0.0035)
-    if direction == 'LONG':
-        targets[0] = max(targets[0], entry + max(risk, entry * floors[0]))
-        targets[1] = max(targets[1], targets[0] + min_gap, entry + entry * floors[1])
-        targets[2] = max(targets[2], targets[1] + min_gap, entry + entry * floors[2])
-    else:
-        targets[0] = min(targets[0], entry - max(risk, entry * floors[0]))
-        targets[1] = min(targets[1], targets[0] - min_gap, entry - entry * floors[1])
-        targets[2] = min(targets[2], targets[1] - min_gap, entry - entry * floors[2])
+    # Re-apply the trigger constraint and ordered ladder after structural choices.
+    if trigger_level is not None:
+        trigger_floor = trigger_level + sign * trigger_buffer
+        targets = [max(t, trigger_floor) if direction == 'LONG'
+                   else min(t, trigger_floor) for t in targets]
+    for i in range(1, 3):
+        if sign * (targets[i] - targets[i - 1]) < min_gap:
+            targets[i] = targets[i - 1] + sign * min_gap
     return tuple(targets)
-
 
 def common_validate(setup: Setup) -> bool:
     if not (setup.entry_low > 0 and setup.entry_high > 0 and setup.sl > 0):
@@ -1078,41 +1123,46 @@ def build_reversal(iid, ticker, data) -> Optional[Setup]:
 # ============================================================
 
 def _pressure_metrics(c5: List[Candle], level: float, direction: str):
+    """Measure repeated level tests, approach pressure and volatility contraction."""
     window = c5[-12:-1]
     if len(window) < 8:
         return None
     atr5 = atr(c5)
-    # Only count genuine interactions with the level, not candles far away.
     near_limit = max(atr5 * 0.85, level * 0.003)
     touches = 0
-    distances = []
     for c in window:
         if direction == 'LONG':
             d = level - c.high
             if d >= -near_limit and c.high <= level * 1.0015:
                 touches += 1
-                distances.append(max(0.0, d))
         else:
             d = c.low - level
             if d >= -near_limit and c.low >= level * 0.9985:
                 touches += 1
-                distances.append(max(0.0, d))
     if touches < 3:
         return None
-    # Compare early vs late distance to the level. Pressure requires price to
-    # get closer, not repeatedly reject by larger distances.
-    early = window[:max(3, len(window)//2)]
-    late = window[max(3, len(window)//2):]
-    def avg_distance(group):
-        vals = []
-        for c in group:
-            vals.append(abs(level - (c.close if direction == 'LONG' else c.close)))
-        return sum(vals) / len(vals) if vals else 0.0
-    early_d = avg_distance(early)
-    late_d = avg_distance(late)
-    compression = late_d < early_d * 0.82 if early_d > 0 else False
-    return touches, compression, early_d, late_d
 
+    split = max(3, len(window) // 2)
+    early, late = window[:split], window[split:]
+
+    def mean_distance(group):
+        values = [abs(level - c.close) for c in group]
+        return sum(values) / len(values) if values else float('inf')
+
+    def mean_range(group):
+        values = [max(c.high - c.low, 0.0) for c in group]
+        return sum(values) / len(values) if values else 0.0
+
+    early_d, late_d = mean_distance(early), mean_distance(late)
+    early_range, late_range = mean_range(early), mean_range(late)
+    price_compression = early_d > 0 and late_d < early_d * 0.82
+    range_ratio = late_range / early_range if early_range > 0 else 1.0
+    range_compression = range_ratio <= 0.88
+    # Either the closes progressively press the level or the candle ranges
+    # contract while repeated tests hold. This avoids calling mere proximity
+    # "compression" while retaining valid quiet pre-breakout structures.
+    pressure = price_compression or range_compression
+    return touches, pressure, price_compression, range_compression, early_d, late_d, range_ratio
 
 def build_pre_breakout(iid, ticker, data) -> Optional[Setup]:
     c5 = confirmed_candles(data['5m'])
@@ -1128,10 +1178,9 @@ def build_pre_breakout(iid, ticker, data) -> Optional[Setup]:
     vr = vol_ratio(c5)
     if not levels or atr5 <= 0:
         return None
-    # Quiet volume can precede a breakout, but an almost dead trigger is not
-    # enough evidence by itself. Compression is still checked separately.
-    if vr < float(os.getenv('MIN_PREBREAKOUT_VOLUME', '0.30')):
-        return None
+    # PRE-BREAKOUT volume is a continuous quality feature, not a hard gate:
+    # volume often contracts during valid pressure structures. Extremely weak
+    # activity is penalized in scoring, while price/structure still decide setup validity.
 
     candidates = []
     # This search is deliberately about an UNBROKEN horizontal level.
@@ -1149,7 +1198,7 @@ def build_pre_breakout(iid, ticker, data) -> Optional[Setup]:
 
     if not candidates:
         return None
-        # A pre-breakout needs a live trigger candle, not just a level and compression.
+    # A pre-breakout needs a live trigger candle, not just a level and compression.
     # Quiet compression is acceptable, but the latest closed candle must lean in
     # the proposed direction.
     candle_range = max(current.high - current.low, 1e-12)
@@ -1169,7 +1218,7 @@ def build_pre_breakout(iid, ticker, data) -> Optional[Setup]:
         metrics = _pressure_metrics(c5, lv.price, direction)
         if not metrics:
             continue
-        touches, compression, early_d, late_d = metrics
+        touches, compression, price_compression, range_compression, early_d, late_d, range_ratio = metrics
         if not compression:
             continue
 
@@ -1214,8 +1263,14 @@ def build_pre_breakout(iid, ticker, data) -> Optional[Setup]:
                       f'цена {distance:.2f}% под уровнем; вход ДО пробоя')
             points = [(len(c5[-96:]) - 8, lv.price, 'RESISTANCE'),
                       (len(c5[-96:]) - 1, entry, 'PRE-BREAKOUT')]
-            quality = touches + (3 if compression else 0) + (2 if vr >= 1.3 else 0)
-            candidate_rank = quality * 3 + lv.strength * 0.08 + touches * 1.5 - distance * 4.0
+            quality = (touches + (3 if price_compression else 0)
+                       + (2 if range_compression else 0)
+                       + (1 if vr >= 1.3 else 0) - (2 if vr < 0.25 else 0))
+            distance_atr = (distance / 100.0 * entry) / max(atr5, 1e-12)
+            candidate_rank = (quality * 3 + lv.strength * 0.08 + touches * 1.5
+                              - min(12.0, distance_atr * 2.5)
+                              - max(0.0, 0.5 - vr) * 3.0
+                              - max(0.0, range_ratio - 1.0) * 2.0)
             if candidate_rank > best_rank:
                 best_rank = candidate_rank
                 best = (direction, lv, entry, sl, preferred, pattern, reason, points, quality)
@@ -1242,8 +1297,14 @@ def build_pre_breakout(iid, ticker, data) -> Optional[Setup]:
                       f'цена {distance:.2f}% над уровнем; вход ДО пробоя')
             points = [(len(c5[-96:]) - 8, lv.price, 'SUPPORT'),
                       (len(c5[-96:]) - 1, entry, 'PRE-BREAKOUT')]
-            quality = touches + (3 if compression else 0) + (2 if vr >= 1.3 else 0)
-            candidate_rank = quality * 3 + lv.strength * 0.08 + touches * 1.5 - distance * 4.0
+            quality = (touches + (3 if price_compression else 0)
+                       + (2 if range_compression else 0)
+                       + (1 if vr >= 1.3 else 0) - (2 if vr < 0.25 else 0))
+            distance_atr = (distance / 100.0 * entry) / max(atr5, 1e-12)
+            candidate_rank = (quality * 3 + lv.strength * 0.08 + touches * 1.5
+                              - min(12.0, distance_atr * 2.5)
+                              - max(0.0, 0.5 - vr) * 3.0
+                              - max(0.0, range_ratio - 1.0) * 2.0)
             if candidate_rank > best_rank:
                 best_rank = candidate_rank
                 best = (direction, lv, entry, sl, preferred, pattern, reason, points, quality)
@@ -1260,11 +1321,16 @@ def build_pre_breakout(iid, ticker, data) -> Optional[Setup]:
         lo, hi = max(entry - width, lv.price + entry * 0.00015), entry + width
     if lo >= hi:
         return None
-    tps = target_levels(direction, (lo + hi) / 2, sl, c15, preferred)
+    tps = target_levels(
+        direction, (lo + hi) / 2, sl, c15, preferred, trigger_level=lv.price
+    )
     if not tps:
         return None
     base = market_score(ticker, c5, c15, vr, c1h, direction, 'PRE-BREAKOUT')
-    ss = strategy_score(base, [10, min(10, quality * 2), 5 if vr >= 1.4 else 0], [])
+    pressure_bonus = min(8, max(0, quality - 3) * 1.5)
+    activity_bonus = 3 if vr >= 1.3 else 0
+    weak_trigger_penalty = 2 if vr < 0.25 else 0
+    ss = strategy_score(base, [pressure_bonus, activity_bonus], [weak_trigger_penalty])
     setup = Setup(iid, get_coin(iid), direction, 'PRE-BREAKOUT', pattern,
                   lv.price, 'HORIZONTAL LEVEL', lo, hi, sl, *tps, ss, ss, reason,
                   ticker['vol24h_usd'], ticker['change24h_pct'], ticker['range24h_pct'],
@@ -1670,6 +1736,59 @@ def can_send(iid: str) -> bool:
         return False
     return now_ts() - created_at >= COOLDOWN_MINUTES * 60
 
+
+def setup_quality_rank(setup: Setup, ticker: Optional[dict] = None) -> float:
+    """Cross-strategy rank: combine the strategy score with trade geometry.
+
+    This is a ranking function, not a signal quota or a new hard rejection gate.
+    It helps choose the best candidate when multiple strategies detect the same
+    instrument and orders candidates by quality before Telegram delivery.
+    """
+    ticker = ticker or {}
+    entry = (setup.entry_low + setup.entry_high) / 2.0
+    risk = abs(entry - setup.sl)
+    if entry <= 0 or risk <= 0:
+        return -1e9
+
+    sign = 1 if setup.direction == 'LONG' else -1
+    rr2 = sign * (setup.tp2 - entry) / risk
+    tp1_move = sign * (setup.tp1 - entry) / entry * 100.0
+    tp2_move = sign * (setup.tp2 - entry) / entry * 100.0
+    tp3_move = sign * (setup.tp3 - entry) / entry * 100.0
+    risk_pct = risk / entry * 100.0
+    zone_width_pct = (setup.entry_high - setup.entry_low) / entry * 100.0
+    rank = float(setup.score)
+
+    # Reward useful TP2 risk/reward but taper extreme values that often indicate
+    # a distant/poorly modelled target rather than a realistic edge.
+    rank += clamp((rr2 - 1.7) * 1.5, -4.0, 4.0)
+    if tp1_move <= 0 or tp2_move <= tp1_move or tp3_move <= tp2_move:
+        rank -= 18.0
+    if tp2_move > max(6.0, risk_pct * 12.0):
+        rank -= min(8.0, (tp2_move - max(6.0, risk_pct * 12.0)) * 0.6)
+    gap12 = tp2_move - tp1_move
+    gap23 = tp3_move - tp2_move
+    min_gap_pct = max(0.45, risk_pct * 0.55)
+    if gap12 < min_gap_pct:
+        rank -= 4.0
+    if gap23 < min_gap_pct:
+        rank -= 4.0
+    if zone_width_pct > max(0.30, setup.atr5_pct * 0.75):
+        rank -= min(5.0, (zone_width_pct - max(0.30, setup.atr5_pct * 0.75)) * 5.0)
+
+    spread = ticker.get('spread_pct')
+    if spread is not None:
+        rank -= clamp(float(spread) * 20.0, 0.0, 8.0)
+
+    # A PRE-BREAKOUT should not be rejected solely for quiet volume, but a nearly
+    # inactive trigger is less convincing than orderly contraction with activity.
+    if setup.strategy == 'PRE-BREAKOUT':
+        rank -= clamp((0.35 - setup.volume_ratio) * 8.0, 0.0, 4.0)
+        if 0.8 <= setup.volume_ratio <= 2.5:
+            rank += 1.5
+    return rank
+
+
 # ============================================================
 # SCANNER — four independent strategy searches
 # ============================================================
@@ -1682,19 +1801,69 @@ def scan_market():
     tickers = get_tickers()
     ranked_universe = build_universe(instruments, tickers)
     if ranked_universe:
+        # Two-lane discovery:
+        #   1) repeatedly inspect the best current opportunities,
+        #   2) rotate through the rest of the market so lower-ranked/newly active
+        #      symbols are not starved forever.
+        # DEEP_SCAN_LIMIT is only a per-cycle workload budget, never a signal cap.
         batch_size = len(ranked_universe) if DEEP_SCAN_LIMIT <= 0 else min(DEEP_SCAN_LIMIT, len(ranked_universe))
-        start = 0
-        if _universe_last_scanned:
-            previous_positions = [i for i, item in enumerate(ranked_universe) if item[0] == _universe_last_scanned]
-            if previous_positions:
-                start = (previous_positions[0] + 1) % len(ranked_universe)
-        rotated = ranked_universe[start:] + ranked_universe[:start]
-        candidates = rotated[:batch_size]
-        if candidates:
-            _universe_last_scanned = candidates[-1][0]
+        priority = ranked_universe[:batch_size]
+        if len(ranked_universe) > batch_size:
+            if batch_size == 1:
+                # With a one-symbol work budget, pure priority selection would
+                # starve the rest of the market. Use fair round-robin instead.
+                coverage = sorted(ranked_universe, key=lambda item: item[0])
+                cursor = _universe_last_scanned
+                if not cursor:
+                    with db_lock:
+                        row = db.execute("SELECT value FROM bot_state WHERE key='universe_cursor'").fetchone()
+                    cursor = str(row[0]) if row else None
+                symbols = [item[0] for item in coverage]
+                if cursor in symbols:
+                    start = (symbols.index(cursor) + 1) % len(coverage)
+                else:
+                    from bisect import bisect_right
+                    start = bisect_right(symbols, cursor) % len(coverage) if cursor else 0
+                batch = (coverage[start:] + coverage[:start])[:1]
+                _universe_last_scanned = batch[-1][0]
+                with db_lock:
+                    db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES('universe_cursor',?)",
+                               (_universe_last_scanned,))
+                    db.commit()
+            else:
+                priority_count = max(1, min(batch_size - 1, int(round(batch_size * 0.65))))
+                priority = ranked_universe[:priority_count]
+                priority_ids = {item[0] for item in priority}
+                coverage = sorted((item for item in ranked_universe if item[0] not in priority_ids),
+                                  key=lambda item: item[0])
+                cursor = _universe_last_scanned
+                if not cursor:
+                    with db_lock:
+                        row = db.execute("SELECT value FROM bot_state WHERE key='universe_cursor'").fetchone()
+                    cursor = str(row[0]) if row else None
+                symbols = [item[0] for item in coverage]
+                if cursor in symbols:
+                    start = (symbols.index(cursor) + 1) % len(coverage)
+                else:
+                    from bisect import bisect_right
+                    start = bisect_right(symbols, cursor) % len(coverage) if cursor else 0
+                rotated = coverage[start:] + coverage[:start]
+                coverage_count = batch_size - len(priority)
+                coverage_batch = rotated[:coverage_count]
+                batch = priority + coverage_batch
+                if coverage_batch:
+                    _universe_last_scanned = coverage_batch[-1][0]
+                    with db_lock:
+                        db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES('universe_cursor',?)",
+                                   (_universe_last_scanned,))
+                        db.commit()
+        else:
+            batch = priority
+        candidates = sorted(batch, key=lambda item: item[2], reverse=True)
     else:
         candidates = []
     raw: List[Setup] = []
+    ticker_by_symbol = {iid: ticker for iid, ticker, _ in ranked_universe}
     strategy_counts = {fn.__name__: 0 for fn in STRATEGIES}
 
     for iid, ticker, _ in candidates:
@@ -1727,13 +1896,37 @@ def scan_market():
     # A symbol can have multiple valid strategies. Send only the best normalized
     # candidate for that symbol to avoid competing instructions.
     best: Dict[str, Setup] = {}
-    for s in raw:
-        if s.inst_id not in best or (s.score, s.strategy_score) > (best[s.inst_id].score, best[s.inst_id].strategy_score):
-            best[s.inst_id] = s
+    best_ranks: Dict[str, float] = {}
+    candidates_by_symbol: Dict[str, List[Setup]] = {}
+    for candidate in raw:
+        candidates_by_symbol.setdefault(candidate.inst_id, []).append(candidate)
+    for symbol, symbol_setups in candidates_by_symbol.items():
+        best_score_by_direction = {
+            direction: max(s.score for s in symbol_setups if s.direction == direction)
+            for direction in {s.direction for s in symbol_setups}
+        }
+        strongest_direction = max(best_score_by_direction, key=best_score_by_direction.get)
+        strongest_score = best_score_by_direction[strongest_direction]
+        for s in symbol_setups:
+            rank = setup_quality_rank(s, ticker_by_symbol.get(s.inst_id))
+            # If independent strategies disagree and their raw scores are close,
+            # treat that disagreement as uncertainty, not as another signal.
+            if s.direction != strongest_direction and strongest_score - s.score <= 8:
+                rank -= 6.0
+            if symbol not in best or rank > best_ranks[symbol]:
+                best[symbol] = s
+                best_ranks[symbol] = rank
 
-    final = sorted(best.values(), key=lambda x: (x.score, x.strategy_score), reverse=True)
+    final = sorted(best.values(),
+                   key=lambda s: (best_ranks.get(s.inst_id, float(s.score)), s.score),
+                   reverse=True)
     log.info('SCAN | market=%d eligible=%d batch=%d raw=%d final=%d | %s',
              len(tickers), len(ranked_universe), len(candidates), len(raw), len(final), strategy_counts)
+    if final:
+        log.info('TOP SETUPS | %s', ', '.join(
+            f'{s.coin}:{s.strategy}:{s.direction}:score={s.score}:rank={best_ranks.get(s.inst_id, 0):.1f}'
+            for s in final[:8]
+        ))
     for s in final:
         if can_send(s.inst_id):
             send_signal(s)
@@ -1751,17 +1944,46 @@ def weekly_report():
         row = db.execute("SELECT value FROM bot_state WHERE key='weekly_report'").fetchone()
     if row and row[0] == key:
         return
+
     since = (n - timedelta(days=7)).timestamp()
     with db_lock:
-        total = db.execute('SELECT COUNT(*) FROM signals WHERE created_at>=?', (since,)).fetchone()[0]
-        wins = db.execute("SELECT COUNT(*) FROM signals WHERE created_at>=? AND result='TP3'", (since,)).fetchone()[0]
-        losses = db.execute("SELECT COUNT(*) FROM signals WHERE created_at>=? AND result='SL'", (since,)).fetchone()[0]
-        timeouts = db.execute("SELECT COUNT(*) FROM signals WHERE created_at>=? AND result='TIMEOUT'", (since,)).fetchone()[0]
+        total = db.execute(
+            'SELECT COUNT(*) FROM signals WHERE created_at>=?', (since,)
+        ).fetchone()[0]
+        rows = db.execute('''
+            SELECT strategy,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN activated_at IS NOT NULL THEN 1 ELSE 0 END) AS activated,
+                   SUM(COALESCE(tp1_hit, 0)),
+                   SUM(COALESCE(tp2_hit, 0)),
+                   SUM(COALESCE(tp3_hit, 0)),
+                   SUM(CASE WHEN result='SL' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN result='SL' AND COALESCE(tp1_hit, 0)=1 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN result='TIMEOUT' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN status='EXPIRED' THEN 1 ELSE 0 END)
+            FROM signals
+            WHERE created_at>=?
+            GROUP BY strategy
+            ORDER BY total DESC
+        ''', (since,)).fetchall()
+
+    lines = [f'📊 <b>QUANTUM — 7 дней</b>', f'Сигналов отправлено: <b>{total}</b>']
+    for row in rows:
+        strategy, sent, activated, tp1, tp2, tp3, stops, stop_after_tp1, timeouts, expired = row
+        activated = int(activated or 0)
+        tp1, tp2, tp3 = int(tp1 or 0), int(tp2 or 0), int(tp3 or 0)
+        stops, stop_after_tp1 = int(stops or 0), int(stop_after_tp1 or 0)
+        timeouts, expired = int(timeouts or 0), int(expired or 0)
+        lines.append(
+            f'\n<b>{strategy or "UNKNOWN"}</b>: {sent} sent / {activated} activated'
+            f'\nTP1 {tp1} · TP2 {tp2} · TP3 {tp3}'
+            f'\nSL {stops} (после TP1: {stop_after_tp1}) · timeout {timeouts} · expired {expired}'
+        )
+    lines.append('\n<i>TP-цели — отдельные события и могут относиться к одной сделке; '
+                 'SL после TP1 показан отдельно.</i>')
+
     try:
-        bot.send_message(CHANNEL_ID,
-            f'📊 <b>QUANTUM — неделя</b>\n\nСигналов: <b>{total}</b>\n'
-            f'TP3: <b>{wins}</b>\nSTOP: <b>{losses}</b>\nTIMEOUT: <b>{timeouts}</b>',
-            parse_mode='HTML')
+        bot.send_message(CHANNEL_ID, '\n'.join(lines), parse_mode='HTML')
         with db_lock:
             db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES('weekly_report',?)", (key,))
             db.commit()

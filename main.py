@@ -682,43 +682,43 @@ def final_score(base: int, bonuses: List[int], penalties: List[int]) -> int:
 def build_reversal(iid, ticker, data) -> Optional[Setup]:
     c5, c15, c1h = data['5m'], data['15m'], data['1h']
     if min(len(c5), len(c15), len(c1h)) < 70:
-        return None
+        return _diag_reject('build_reversal', 685)
     ch = ticker['change24h_pct']
     if abs(ch) < MIN_24H_MOVE_FOR_REVERSAL:
-        return None
+        return _diag_reject('build_reversal', 688)
     if atr_pct(c5) < MIN_ATR_5M_PCT or atr_pct(c15) < MIN_ATR_15M_PCT:
-        return None
+        return _diag_reject('build_reversal', 690)
 
     m1h, m2h, _ = impulse_stats(c5)
     direction = 'SHORT' if ch > 0 else 'LONG'
     if direction == 'SHORT' and m2h < MIN_2H_IMPULSE:
-        return None
+        return _diag_reject('build_reversal', 695)
     if direction == 'LONG' and m2h > -MIN_2H_IMPULSE:
-        return None
+        return _diag_reject('build_reversal', 697)
 
     extreme = local_extreme(c5, 'SHORT' if direction == 'SHORT' else 'LONG', 60)
     if extreme is None:
-        return None
+        return _diag_reject('build_reversal', 701)
     cur = c5[-1]
     prev = c5[-2]
     if true_range_pct(cur) > max(0.75, atr_pct(c5) * 2.5):
-        return None
+        return _diag_reject('build_reversal', 705)
     vr = vol_ratio(c5)
     if vr < MIN_REVERSAL_VOLUME_RATIO:
-        return None
+        return _diag_reject('build_reversal', 708)
 
     if direction == 'SHORT':
         retrace = pct_move(extreme.high, cur.close)
         upper, lower = wick_ratio(cur)
         # Strong rejection from the high + bearish confirmation.
         if retrace < 0.55:
-            return None
+            return _diag_reject('build_reversal', 715)
         if not (cur.close < cur.open and cur.close < prev.low * 1.001):
-            return None
+            return _diag_reject('build_reversal', 717)
         if body_ratio(cur) < 0.42 or close_location(cur) > 0.48:
-            return None
+            return _diag_reject('build_reversal', 719)
         if upper < 0.10 and cur.high < max(c.high for c in c5[-6:-1]):
-            return None
+            return _diag_reject('build_reversal', 721)
         sl = max(extreme.high, max(c.high for c in c5[-4:])) + atr(c5) * 0.28
         level = extreme.high
         point_label = 'EXTREME HIGH'
@@ -729,13 +729,13 @@ def build_reversal(iid, ticker, data) -> Optional[Setup]:
         retrace = pct_move(cur.close, extreme.low)
         upper, lower = wick_ratio(cur)
         if retrace < 0.55:
-            return None
+            return _diag_reject('build_reversal', 732)
         if not (cur.close > cur.open and cur.close > prev.high * 0.999):
-            return None
+            return _diag_reject('build_reversal', 734)
         if body_ratio(cur) < 0.42 or close_location(cur) < 0.52:
-            return None
+            return _diag_reject('build_reversal', 736)
         if lower < 0.10 and cur.low > min(c.low for c in c5[-6:-1]):
-            return None
+            return _diag_reject('build_reversal', 738)
         sl = min(extreme.low, min(c.low for c in c5[-4:])) - atr(c5) * 0.28
         level = extreme.low
         point_label = 'EXTREME LOW'
@@ -745,22 +745,22 @@ def build_reversal(iid, ticker, data) -> Optional[Setup]:
 
     entry = cur.close
     if abs(entry - level) / max(entry, 1e-12) * 100 > MAX_ENTRY_CHASE_PCT * 1.8:
-        return None
+        return _diag_reject('build_reversal', 748)
     if not validate_risk(entry, sl):
-        return None
+        return _diag_reject('build_reversal', 750)
     tps = target_levels(direction, entry, sl, c15)
     if not tps:
-        return None
+        return _diag_reject('build_reversal', 753)
     score = final_score(base_score(ticker, c5, c15, vr), bonuses, [])
     # Higher-timeframe agreement adds quality but does not create the setup.
     tstate = trend_state(c15)
     if (direction == 'LONG' and tstate == 'LONG') or (direction == 'SHORT' and tstate == 'SHORT'):
         score = min(99, score + 3)
     if score < MIN_SCORE:
-        return None
+        return _diag_reject('build_reversal', 760)
     lo, hi = entry_zone(entry, atr(c5), direction)
     if not validate_setup_geometry(direction, lo, hi, sl, *tps):
-        return None
+        return _diag_reject('build_reversal', 763)
     chart = c5[-96:]
     ext_index = max(0, len(chart) - 2 - 60)
     return Setup(iid, get_coin(iid), direction, 'EXTREME REVERSAL', pattern,
@@ -777,17 +777,17 @@ def build_reversal(iid, ticker, data) -> Optional[Setup]:
 def build_breakout(iid, ticker, data) -> Optional[Setup]:
     c5, c15, c1h = data['5m'], data['15m'], data['1h']
     if min(len(c5), len(c15), len(c1h)) < 70:
-        return None
+        return _diag_reject('build_breakout', 780)
     vr = vol_ratio(c5)
     if vr < MIN_BREAKOUT_VOLUME:
-        return None
+        return _diag_reject('build_breakout', 783)
 
     levels = cluster_levels(c15, 0.30)
     if not levels:
-        return None
+        return _diag_reject('build_breakout', 787)
     cur, prev = c5[-1], c5[-2]
     if true_range_pct(cur) > max(0.75, atr_pct(c5) * 2.5):
-        return None
+        return _diag_reject('build_breakout', 790)
     direction = None
     level = None
     touches = 0
@@ -812,47 +812,47 @@ def build_breakout(iid, ticker, data) -> Optional[Setup]:
         level, touches = min(short_candidates, key=lambda x: x[0])
         direction = 'SHORT'
     else:
-        return None
+        return _diag_reject('build_breakout', 815)
 
     if direction == 'LONG':
         # Separate retest: candle trades into the level and closes bullish above it.
         if not (cur.low <= level * 1.003 and cur.low >= level * 0.992):
-            return None
+            return _diag_reject('build_breakout', 820)
         if not (cur.close > level and cur.close > cur.open and close_location(cur) >= 0.58):
-            return None
+            return _diag_reject('build_breakout', 822)
         if abs(cur.close - level) / level * 100 > MAX_ENTRY_CHASE_PCT:
-            return None
+            return _diag_reject('build_breakout', 824)
         sl = min(level, cur.low) - atr(c5) * 0.30
         reason = f'15M сопротивление {touches}× → отдельный закрытый пробой → ретест уровня → бычье 5M подтверждение; объём x{vr:.2f}'
     else:
         if not (cur.high >= level * 0.997 and cur.high <= level * 1.008):
-            return None
+            return _diag_reject('build_breakout', 829)
         if not (cur.close < level and cur.close < cur.open and close_location(cur) <= 0.42):
-            return None
+            return _diag_reject('build_breakout', 831)
         if abs(cur.close - level) / level * 100 > MAX_ENTRY_CHASE_PCT:
-            return None
+            return _diag_reject('build_breakout', 833)
         sl = max(level, cur.high) + atr(c5) * 0.30
         reason = f'15M поддержка {touches}× → отдельный закрытый пробой → ретест уровня → медвежье 5M подтверждение; объём x{vr:.2f}'
 
     # Do not trade a counter-trend retest against a clearly established 1H trend.
     htf = trend_state(c1h)
     if htf and htf != direction:
-        return None
+        return _diag_reject('build_breakout', 840)
 
     entry = cur.close
     if not validate_risk(entry, sl):
-        return None
+        return _diag_reject('build_breakout', 844)
     tps = target_levels(direction, entry, sl, c15)
     if not tps:
-        return None
+        return _diag_reject('build_breakout', 847)
     score = final_score(base_score(ticker, c5, c15, vr),
                         [10, min(8, touches * 2), 6 if vr >= 1.8 else 2,
                          3 if htf == direction else 0], [])
     if score < MIN_SCORE:
-        return None
+        return _diag_reject('build_breakout', 852)
     lo, hi = entry_zone(entry, atr(c5), direction)
     if not validate_setup_geometry(direction, lo, hi, sl, *tps):
-        return None
+        return _diag_reject('build_breakout', 855)
     return Setup(iid, get_coin(iid), direction, 'BREAKOUT + RETEST', 'ПРОБОЙ + РЕТЕСТ',
                  level, 'BROKEN LEVEL', lo, hi, sl, *tps, score, reason,
                  ticker['vol24h_usd'], ticker['change24h_pct'], ticker['range24h_pct'],
@@ -868,68 +868,68 @@ def build_breakout(iid, ticker, data) -> Optional[Setup]:
 def build_pullback(iid, ticker, data) -> Optional[Setup]:
     c5,c15,c1h=data['5m'],data['15m'],data['1h']
     if min(len(c5),len(c15),len(c1h))<70:
-        return None
+        return _diag_reject('build_pullback', 871)
     trend=trend_state(c1h)
     if not trend:
-        return None
+        return _diag_reject('build_pullback', 874)
     e20_15=ema([c.close for c in c15],20)
     if len(e20_15)<10:
-        return None
+        return _diag_reject('build_pullback', 877)
     cur,prev=c5[-1],c5[-2]
     vr=vol_ratio(c5)
     if vr < MIN_PULLBACK_VOLUME_RATIO:
-        return None
+        return _diag_reject('build_pullback', 881)
     recent=c15[-10:-2]
     if len(recent)<5:
-        return None
+        return _diag_reject('build_pullback', 884)
 
     if trend=='LONG':
         pull_low=min(c.low for c in recent)
         # Pullback must test EMA20 but not become a deep structural breakdown.
         if not any(c.low <= e20_15[-3]*1.003 for c in recent):
-            return None
+            return _diag_reject('build_pullback', 890)
         pull_depth_pct = abs(pull_low - e20_15[-3]) / max(e20_15[-3], 1e-12) * 100
         max_pull_depth_pct = min(2.0, max(0.75, atr_pct(c15) * 1.75))
         if pull_depth_pct > max_pull_depth_pct:
-            return None
+            return _diag_reject('build_pullback', 894)
         if not (cur.close > e20_15[-1] and cur.close > prev.high and cur.close > cur.open):
-            return None
+            return _diag_reject('build_pullback', 896)
         # Reject an oversized trigger candle that would make the entry late.
         if true_range_pct(cur) > max(0.60, atr_pct(c5) * 2.2):
-            return None
+            return _diag_reject('build_pullback', 899)
         level=pull_low
         sl=pull_low-atr(c5)*0.30
         reason=f'1H восходящий тренд → контролируемый 15M откат к EMA20 → 5M reclaim/подтверждение; объём x{vr:.2f}'
     else:
         pull_high=max(c.high for c in recent)
         if not any(c.high >= e20_15[-3]*0.997 for c in recent):
-            return None
+            return _diag_reject('build_pullback', 906)
         pull_depth_pct = abs(pull_high - e20_15[-3]) / max(e20_15[-3], 1e-12) * 100
         max_pull_depth_pct = min(2.0, max(0.75, atr_pct(c15) * 1.75))
         if pull_depth_pct > max_pull_depth_pct:
-            return None
+            return _diag_reject('build_pullback', 910)
         if not (cur.close < e20_15[-1] and cur.close < prev.low and cur.close < cur.open):
-            return None
+            return _diag_reject('build_pullback', 912)
         if true_range_pct(cur) > max(0.60, atr_pct(c5) * 2.2):
-            return None
+            return _diag_reject('build_pullback', 914)
         level=pull_high
         sl=pull_high+atr(c5)*0.30
         reason=f'1H нисходящий тренд → контролируемый 15M откат к EMA20 → 5M reclaim/подтверждение; объём x{vr:.2f}'
 
     entry=cur.close
     if not validate_risk(entry,sl):
-        return None
+        return _diag_reject('build_pullback', 921)
     if abs(entry-level)/max(entry,1e-12)*100>MAX_ENTRY_CHASE_PCT*1.5:
-        return None
+        return _diag_reject('build_pullback', 923)
     tps=target_levels(trend,entry,sl,c15)
     if not tps:
-        return None
+        return _diag_reject('build_pullback', 926)
     score=final_score(base_score(ticker,c5,c15,vr),[10,7 if vr>=1.2 else 3,5,3],[])
     if score<MIN_SCORE:
-        return None
+        return _diag_reject('build_pullback', 929)
     lo,hi=entry_zone(entry,atr(c5),trend)
     if not validate_setup_geometry(trend, lo, hi, sl, *tps):
-        return None
+        return _diag_reject('build_pullback', 932)
     return Setup(iid,get_coin(iid),trend,'TREND PULLBACK','ТРЕНДОВЫЙ ОТКАТ',level,'PULLBACK LOW' if trend=='LONG' else 'PULLBACK HIGH',lo,hi,sl,*tps,score,reason,
                  ticker['vol24h_usd'],ticker['change24h_pct'],ticker['range24h_pct'],atr_pct(c5),atr_pct(c15),vr,c5[-96:],
                  [(len(c5[-96:])-1,entry,'TRIGGER')],'1–8 ч')
@@ -941,23 +941,23 @@ def build_pullback(iid, ticker, data) -> Optional[Setup]:
 def build_prebreakout(iid, ticker, data) -> Optional[Setup]:
     c5, c15, c1h = data['5m'], data['15m'], data['1h']
     if min(len(c5), len(c15), len(c1h)) < 70:
-        return None
+        return _diag_reject('build_prebreakout', 944)
     if atr_pct(c5) < MIN_ATR_5M_PCT or atr_pct(c15) < MIN_ATR_15M_PCT:
-        return None
+        return _diag_reject('build_prebreakout', 946)
 
     levels = cluster_levels(c15, 0.30)
     if not levels:
-        return None
+        return _diag_reject('build_prebreakout', 950)
     cur = c5[-1]
     vr = vol_ratio(c5)
     if vr < max(0.85, MIN_VOLUME_RATIO * 0.75):
-        return None
+        return _diag_reject('build_prebreakout', 954)
 
     # Use the nearest repeatedly tested horizontal level on the correct side.
     support, resistance = nearest_support_resistance(cur.close, levels)
     recent = c5[-6:]
     if len(recent) < 6:
-        return None
+        return _diag_reject('build_prebreakout', 960)
 
     # Compression means recent bars are not expanding into a late, chase-prone move.
     prior_ranges = [max(c.high-c.low, 0.0) for c in recent[:3]]
@@ -993,44 +993,44 @@ def build_prebreakout(iid, ticker, data) -> Optional[Setup]:
             direction, level, touches = 'SHORT', candidate, actual_touches
 
     if not direction:
-        return None
+        return _diag_reject('build_prebreakout', 996)
 
     # Avoid pre-breakout entries directly against an established 1H trend.
     htf = trend_state(c1h)
     if htf and htf != direction:
-        return None
+        return _diag_reject('build_prebreakout', 1001)
 
     if direction == 'LONG':
         # Price must be pressing resistance, but no 5M close may have broken it.
         if cur.close >= level or cur.high >= level * 1.0015:
-            return None
+            return _diag_reject('build_prebreakout', 1006)
         sl = min(c.low for c in recent[-4:]) - atr(c5) * 0.22
         reason = (f'горизонтальное сопротивление {touches}× → сжатие под уровнем → '
                   f'повышающиеся минимумы → PRE-BREAKOUT до подтверждённого пробоя; объём x{vr:.2f}')
     else:
         if cur.close <= level or cur.low <= level * 0.9985:
-            return None
+            return _diag_reject('build_prebreakout', 1012)
         sl = max(c.high for c in recent[-4:]) + atr(c5) * 0.22
         reason = (f'горизонтальная поддержка {touches}× → сжатие над уровнем → '
                   f'понижающиеся максимумы → PRE-BREAKOUT до подтверждённого пробоя; объём x{vr:.2f}')
 
     entry = cur.close
     if abs(entry - level) / max(entry, 1e-12) * 100 > MAX_ENTRY_CHASE_PCT:
-        return None
+        return _diag_reject('build_prebreakout', 1019)
     if not validate_risk(entry, sl):
-        return None
+        return _diag_reject('build_prebreakout', 1021)
 
     # For PRE-BREAKOUT the horizontal level is the trigger barrier, not an
     # opposing obstacle to TP1. Targets must sit beyond that barrier.
     risk = abs(entry - sl)
     if risk <= 0:
-        return None
+        return _diag_reject('build_prebreakout', 1027)
     level_r = abs(level - entry) / risk
     tp1_r = max(TP1_R, level_r + 0.25)
     tp2_r = max(TP2_R, tp1_r + 0.45)
     tp3_r = max(TP3_R, tp2_r + 0.45)
     if tp1_r > MAX_TP1_R or tp2_r > MAX_TP2_R or tp3_r > MAX_TP3_R:
-        return None
+        return _diag_reject('build_prebreakout', 1033)
     sign = 1 if direction == 'LONG' else -1
     tps = (entry + sign * risk * tp1_r,
            entry + sign * risk * tp2_r,
@@ -1043,14 +1043,14 @@ def build_prebreakout(iid, ticker, data) -> Optional[Setup]:
         []
     )
     if score < MIN_SCORE:
-        return None
+        return _diag_reject('build_prebreakout', 1046)
     lo, hi = entry_zone(entry, atr(c5), direction)
     if direction == 'LONG' and hi >= level:
-        return None
+        return _diag_reject('build_prebreakout', 1049)
     if direction == 'SHORT' and lo <= level:
-        return None
+        return _diag_reject('build_prebreakout', 1051)
     if not validate_setup_geometry(direction, lo, hi, sl, *tps):
-        return None
+        return _diag_reject('build_prebreakout', 1053)
 
     return Setup(
         iid, get_coin(iid), direction, 'PRE-BREAKOUT', 'СЖАТИЕ У ГОРИЗОНТАЛЬНОГО УРОВНЯ',
@@ -1064,6 +1064,14 @@ def build_prebreakout(iid, ticker, data) -> Optional[Setup]:
 
 
 STRATEGIES=(build_reversal,build_breakout,build_pullback,build_prebreakout)
+
+# Counts exact strategy exit lines so persistent raw=0 can be diagnosed from logs.
+strategy_reject_counts = {}
+
+def _diag_reject(strategy_name: str, source_line: int):
+    key = (strategy_name, source_line)
+    strategy_reject_counts[key] = strategy_reject_counts.get(key, 0) + 1
+    return None
 
 # ============================================================
 # TELEGRAM VOTES
@@ -1544,53 +1552,125 @@ def live_entry_viable(s: Setup, live_price: float) -> bool:
 
 
 def scan_market():
-    instruments=get_instruments()
-    tickers=get_tickers()
-    candidates=build_universe(instruments,tickers)
-    raw=[]
+    strategy_reject_counts.clear()
+    instruments = get_instruments()
+    tickers = get_tickers()
+    candidates = build_universe(instruments, tickers)
+    raw = []
 
-    for iid,t,_ in candidates:
+    # Diagnostics are observational only: they do not change strategy rules.
+    diag = {
+        'cooldown_or_active': 0,
+        'load_errors': 0,
+        'short_history': 0,
+        'empty_5m': 0,
+        'stale_candles': 0,
+        'low_atr': 0,
+        'eligible': 0,
+    }
+    strategy_diag = {
+        builder.__name__: {
+            'evaluated': 0,
+            'no_setup': 0,
+            'built': 0,
+            'live_reject': 0,
+            'exceptions': 0,
+        }
+        for builder in STRATEGIES
+    }
+
+    for iid, ticker, _ in candidates:
         if not can_send(iid):
+            diag['cooldown_or_active'] += 1
             continue
+
         try:
-            loaded=load_symbol(iid)
-            # Setup discovery uses CLOSED candles only; the forming 5M candle
-            # must not create a signal that disappears before candle close.
-            data={tf:[c for c in candles if c.confirmed] for tf,candles in loaded.items()}
-            c5=data['5m']; c15=data['15m']
-            if min(len(c5),len(c15),len(data['1h']))<70:
+            loaded = load_symbol(iid)
+            # Only closed candles are allowed to create setups.
+            data = {
+                tf: [c for c in candles if c.confirmed]
+                for tf, candles in loaded.items()
+            }
+            c5, c15, c1h = data['5m'], data['15m'], data['1h']
+
+            if min(len(c5), len(c15), len(c1h)) < 70:
+                diag['short_history'] += 1
                 continue
             if not c5:
+                diag['empty_5m'] += 1
                 continue
-            # Candle timestamps are candle-open times; 10 minutes allows the most
-            # recent completed 5M candle plus ordinary API/scanner latency.
+
+            # Candle timestamps are candle-open times. Allow the latest closed
+            # 5M candle plus ordinary API/scanner latency.
             candle_age = now_ts() - (c5[-1].ts / 1000.0)
             if candle_age > 600 or candle_age < -30:
+                diag['stale_candles'] += 1
                 continue
-            if atr_pct(c5)<MIN_ATR_5M_PCT or atr_pct(c15)<MIN_ATR_15M_PCT:
+
+            if atr_pct(c5) < MIN_ATR_5M_PCT or atr_pct(c15) < MIN_ATR_15M_PCT:
+                diag['low_atr'] += 1
                 continue
+
+            diag['eligible'] += 1
             for builder in STRATEGIES:
+                name = builder.__name__
+                stats = strategy_diag[name]
+                stats['evaluated'] += 1
                 try:
-                    s=builder(iid,t,data)
-                    if s and live_entry_viable(s, float(t.get('last') or 0)):
-                        raw.append(s)
-                except Exception as exc:
-                    log.debug('STRATEGY FAILED | %s | %s | %s',iid,builder.__name__,exc)
-        except Exception as exc:
-            log.warning('CANDIDATE FAILED | %s | %s',iid,exc)
+                    setup = builder(iid, ticker, data)
+                    if setup is None:
+                        stats['no_setup'] += 1
+                        continue
 
-    # Only one setup per instrument. This avoids sending four competing signals.
-    best={}
-    for s in raw:
-        if s.inst_id not in best or s.score>best[s.inst_id].score:
-            best[s.inst_id]=s
-    final=sorted(best.values(),key=lambda x:x.score,reverse=True)
-    log.info('SCAN | market=%d candidates=%d raw=%d final=%d',len(tickers),len(candidates),len(raw),len(final))
+                    stats['built'] += 1
+                    if live_entry_viable(setup, float(ticker.get('last') or 0)):
+                        raw.append(setup)
+                    else:
+                        stats['live_reject'] += 1
+                except Exception:
+                    stats['exceptions'] += 1
+                    log.exception('STRATEGY FAILED | %s | %s', iid, name)
+        except Exception:
+            diag['load_errors'] += 1
+            log.exception('CANDIDATE FAILED | %s', iid)
 
-    for s in final:
-        if not can_send(s.inst_id):
+    # One setup per instrument; no global hourly/daily signal cap is applied.
+    best = {}
+    for setup in raw:
+        if setup.inst_id not in best or setup.score > best[setup.inst_id].score:
+            best[setup.inst_id] = setup
+    final = sorted(best.values(), key=lambda setup: setup.score, reverse=True)
+
+    log.info(
+        'SCAN | market=%d candidates=%d eligible=%d raw=%d final=%d',
+        len(tickers), len(candidates), diag['eligible'], len(raw), len(final)
+    )
+    log.info(
+        'SCAN DIAG | cooldown_or_active=%d short_history=%d empty_5m=%d '
+        'stale_candles=%d low_atr=%d load_errors=%d',
+        diag['cooldown_or_active'], diag['short_history'], diag['empty_5m'],
+        diag['stale_candles'], diag['low_atr'], diag['load_errors']
+    )
+    for name, stats in strategy_diag.items():
+        log.info(
+            'STRATEGY DIAG | %s | evaluated=%d no_setup=%d built=%d '
+            'live_reject=%d exceptions=%d',
+            name, stats['evaluated'], stats['no_setup'], stats['built'],
+            stats['live_reject'], stats['exceptions']
+        )
+        rejects = sorted(
+            ((line_no, count) for (strategy, line_no), count in strategy_reject_counts.items()
+             if strategy == name),
+            key=lambda item: item[1], reverse=True
+        )[:5]
+        if rejects:
+            summary = ','.join(f'L{line_no}:{count}' for line_no, count in rejects)
+            log.info('STRATEGY REJECT LINES | %s | %s', name, summary)
+
+    for setup in final:
+        if not can_send(setup.inst_id):
             continue
-        send_signal(s)
+        send_signal(setup)
 
 # ============================================================
 # WEEKLY REPORT

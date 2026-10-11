@@ -281,12 +281,24 @@ def atr_pct(cs: List[Candle], period: int = 14) -> float:
     return atr(cs, period) / max(cs[-1].close, 1e-12) * 100 if cs else 0.0
 
 
-def vol_ratio(cs: List[Candle], lookback: int = 20) -> float:
-    if len(cs) < lookback + 1:
+def vol_ratio_at(cs: List[Candle], index: int, lookback: int = 20) -> float:
+    """Volume of one candle relative to the preceding closed candles only."""
+    if index < 0:
+        index += len(cs)
+    if index < lookback or index >= len(cs):
         return 0.0
-    cur = cs[-1].quote_volume
-    hist = [c.quote_volume for c in cs[-lookback-1:-1] if c.quote_volume > 0]
-    return cur / (sum(hist) / len(hist)) if hist else 0.0
+    cur = cs[index].quote_volume
+    hist = [
+        c.quote_volume for c in cs[max(0, index - lookback):index]
+        if c.quote_volume > 0
+    ]
+    if cur <= 0 or not hist:
+        return 0.0
+    return cur / (sum(hist) / len(hist))
+
+
+def vol_ratio(cs: List[Candle], lookback: int = 20) -> float:
+    return vol_ratio_at(cs, len(cs) - 1, lookback)
 
 
 def avg_volume(cs: List[Candle], n: int = 20) -> float:
@@ -778,14 +790,16 @@ def build_breakout(iid, ticker, data) -> Optional[Setup]:
     c5, c15, c1h = data['5m'], data['15m'], data['1h']
     if min(len(c5), len(c15), len(c1h)) < 70:
         return _diag_reject('build_breakout', 780)
-    vr = vol_ratio(c5)
+    # In a breakout + retest setup, volume confirmation belongs to the
+    # breakout candle (the previous candle), not the retest candle (current).
+    cur, prev = c5[-1], c5[-2]
+    vr = vol_ratio_at(c5, len(c5) - 2)
     if vr < MIN_BREAKOUT_VOLUME:
         return _diag_reject('build_breakout', 783)
 
     levels = cluster_levels(c15, 0.30)
     if not levels:
         return _diag_reject('build_breakout', 787)
-    cur, prev = c5[-1], c5[-2]
     if true_range_pct(cur) > max(0.75, atr_pct(c5) * 2.5):
         return _diag_reject('build_breakout', 790)
     direction = None
@@ -993,6 +1007,40 @@ def build_prebreakout(iid, ticker, data) -> Optional[Setup]:
             direction, level, touches = 'SHORT', candidate, actual_touches
 
     if not direction:
+        # Record which independent PRE-BREAKOUT conditions failed. These counters
+        # make the next tuning decision evidence-based rather than loosening all filters.
+        if resistance and resistance[2] >= 2:
+            candidate = resistance[0]
+            actual_touches = count_level_touches(c15, candidate, 'HIGH', lookback=80, tolerance_pct=0.22)
+            distance_pct = (candidate - cur.close) / candidate * 100
+            recent4 = recent[-4:]
+            reasons = {
+                'resistance_touches': actual_touches >= 3,
+                'resistance_distance': 0.08 <= distance_pct <= 0.55,
+                'higher_lows': monotonic_pressure([c.low for c in recent4], 'UP'),
+                'bull_pressure': cur.close > sum(c.close for c in recent[-3:]) / 3.0 and cur.close >= recent[-2].close,
+                'below_resistance': all(c.close < candidate for c in recent4),
+                'compression': compressed,
+            }
+            for reason_name, passed in reasons.items():
+                if not passed:
+                    _diag_reject('prebreakout_' + reason_name, 996)
+        if support and support[2] >= 2:
+            candidate = support[0]
+            actual_touches = count_level_touches(c15, candidate, 'LOW', lookback=80, tolerance_pct=0.22)
+            distance_pct = (cur.close - candidate) / candidate * 100
+            recent4 = recent[-4:]
+            reasons = {
+                'support_touches': actual_touches >= 3,
+                'support_distance': 0.08 <= distance_pct <= 0.55,
+                'lower_highs': monotonic_pressure([c.high for c in recent4], 'DOWN'),
+                'bear_pressure': cur.close < sum(c.close for c in recent[-3:]) / 3.0 and cur.close <= recent[-2].close,
+                'above_support': all(c.close > candidate for c in recent4),
+                'compression': compressed,
+            }
+            for reason_name, passed in reasons.items():
+                if not passed:
+                    _diag_reject('prebreakout_' + reason_name, 996)
         return _diag_reject('build_prebreakout', 996)
 
     # Avoid pre-breakout entries directly against an established 1H trend.
@@ -1117,7 +1165,23 @@ def on_vote(call):
             pass
 
 
+_polling_lock = threading.Lock()
+_polling_started = False
+
+
 def start_telegram_polling():
+    """Start at most one polling thread in this process.
+
+    Telegram 409 conflicts across separate Render instances cannot be solved by a
+    process-local lock: deploy exactly one running instance/replica for this token.
+    """
+    global _polling_started
+    with _polling_lock:
+        if _polling_started:
+            log.warning('TELEGRAM POLLING ALREADY STARTED IN THIS PROCESS; skipping duplicate')
+            return
+        _polling_started = True
+
     def runner():
         try:
             log.info('TELEGRAM POLLING START')
@@ -1660,7 +1724,7 @@ def scan_market():
         )
         rejects = sorted(
             ((line_no, count) for (strategy, line_no), count in strategy_reject_counts.items()
-             if strategy == name),
+             if strategy == name or (name == 'build_prebreakout' and strategy.startswith('prebreakout_'))),
             key=lambda item: item[1], reverse=True
         )[:5]
         if rejects:

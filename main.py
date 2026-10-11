@@ -69,7 +69,7 @@ MIN_VOLUME_RATIO = float(os.getenv('MIN_VOLUME_RATIO', '1.20'))
 MIN_REVERSAL_VOLUME_RATIO = float(os.getenv('MIN_REVERSAL_VOLUME_RATIO', '1.15'))
 
 # ---------------- strategy/risk ----------------
-MIN_BREAKOUT_VOLUME = float(os.getenv('MIN_BREAKOUT_VOLUME', '1.35'))
+MIN_BREAKOUT_VOLUME = float(os.getenv('MIN_BREAKOUT_VOLUME', '1.20'))
 MAX_ENTRY_CHASE_PCT = float(os.getenv('MAX_ENTRY_CHASE_PCT', '1.00'))
 MAX_RISK_PCT = float(os.getenv('MAX_RISK_PCT', '1.00'))
 MIN_RISK_PCT = float(os.getenv('MIN_RISK_PCT', '0.20'))
@@ -77,7 +77,7 @@ TP1_R = float(os.getenv('TP1_R', '1.20'))
 TP2_R = float(os.getenv('TP2_R', '2.00'))
 TP3_R = float(os.getenv('TP3_R', '3.00'))
 MIN_SCORE = int(os.getenv('MIN_SCORE', '85'))
-MIN_PULLBACK_VOLUME_RATIO = float(os.getenv('MIN_PULLBACK_VOLUME_RATIO', '1.05'))
+MIN_PULLBACK_VOLUME_RATIO = float(os.getenv('MIN_PULLBACK_VOLUME_RATIO', '0.95'))
 MAX_TP1_R = float(os.getenv('MAX_TP1_R', '2.5'))
 MAX_TP2_R = float(os.getenv('MAX_TP2_R', '5.0'))
 MAX_TP3_R = float(os.getenv('MAX_TP3_R', '6.0'))
@@ -964,11 +964,37 @@ def build_prebreakout(iid, ticker, data) -> Optional[Setup]:
         return _diag_reject('build_prebreakout', 950)
     cur = c5[-1]
     vr = vol_ratio(c5)
-    if vr < max(0.85, MIN_VOLUME_RATIO * 0.75):
+    if vr < max(0.80, MIN_VOLUME_RATIO * 0.70):
         return _diag_reject('build_prebreakout', 954)
 
-    # Use the nearest repeatedly tested horizontal level on the correct side.
-    support, resistance = nearest_support_resistance(cur.close, levels)
+    # Prefer the nearest level that passes touch-count and distance checks.
+    # If none qualifies, retain the nearest repeated pivot as a diagnostic fallback
+    # so logs explain whether touches or distance are blocking the setup.
+    support_candidates = []
+    resistance_candidates = []
+    valid_supports = []
+    valid_resistances = []
+    for price, kind, cluster_touches in levels:
+        if cluster_touches < 2:
+            continue
+        if kind == 'HIGH' and price > cur.close:
+            distance_pct = (price - cur.close) / price * 100
+            actual_touches = count_level_touches(c15, price, 'HIGH', lookback=80, tolerance_pct=0.22)
+            item = (price, kind, actual_touches)
+            resistance_candidates.append(item)
+            if actual_touches >= 3 and 0.08 <= distance_pct <= 0.55:
+                valid_resistances.append(item)
+        elif kind == 'LOW' and price < cur.close:
+            distance_pct = (cur.close - price) / price * 100
+            actual_touches = count_level_touches(c15, price, 'LOW', lookback=80, tolerance_pct=0.22)
+            item = (price, kind, actual_touches)
+            support_candidates.append(item)
+            if actual_touches >= 3 and 0.08 <= distance_pct <= 0.55:
+                valid_supports.append(item)
+    resistance = (min(valid_resistances, key=lambda x: x[0]) if valid_resistances
+                  else min(resistance_candidates, key=lambda x: x[0]) if resistance_candidates else None)
+    support = (max(valid_supports, key=lambda x: x[0]) if valid_supports
+               else max(support_candidates, key=lambda x: x[0]) if support_candidates else None)
     recent = c5[-6:]
     if len(recent) < 6:
         return _diag_reject('build_prebreakout', 960)
@@ -978,12 +1004,12 @@ def build_prebreakout(iid, ticker, data) -> Optional[Setup]:
     recent_ranges = [max(c.high-c.low, 0.0) for c in recent[3:]]
     prior_avg = sum(prior_ranges) / max(len(prior_ranges), 1)
     recent_avg = sum(recent_ranges) / max(len(recent_ranges), 1)
-    compressed = prior_avg > 0 and recent_avg <= prior_avg * 0.95
+    compressed = prior_avg > 0 and recent_avg <= prior_avg * 1.05
 
     direction = None
     level = None
     touches = 0
-    if resistance and resistance[2] >= 2:
+    if resistance:
         candidate = resistance[0]
         actual_touches = count_level_touches(c15, candidate, 'HIGH', lookback=80, tolerance_pct=0.22)
         distance_pct = (candidate - cur.close) / candidate * 100
@@ -995,7 +1021,7 @@ def build_prebreakout(iid, ticker, data) -> Optional[Setup]:
                 higher_lows and pressure and below_level and compressed):
             direction, level, touches = 'LONG', candidate, actual_touches
 
-    if direction is None and support and support[2] >= 2:
+    if direction is None and support:
         candidate = support[0]
         actual_touches = count_level_touches(c15, candidate, 'LOW', lookback=80, tolerance_pct=0.22)
         distance_pct = (cur.close - candidate) / candidate * 100
@@ -1009,7 +1035,7 @@ def build_prebreakout(iid, ticker, data) -> Optional[Setup]:
     if not direction:
         # Record which independent PRE-BREAKOUT conditions failed. These counters
         # make the next tuning decision evidence-based rather than loosening all filters.
-        if resistance and resistance[2] >= 2:
+        if resistance:
             candidate = resistance[0]
             actual_touches = count_level_touches(c15, candidate, 'HIGH', lookback=80, tolerance_pct=0.22)
             distance_pct = (candidate - cur.close) / candidate * 100
@@ -1025,7 +1051,7 @@ def build_prebreakout(iid, ticker, data) -> Optional[Setup]:
             for reason_name, passed in reasons.items():
                 if not passed:
                     _diag_reject('prebreakout_' + reason_name, 996)
-        if support and support[2] >= 2:
+        if support:
             candidate = support[0]
             actual_touches = count_level_touches(c15, candidate, 'LOW', lookback=80, tolerance_pct=0.22)
             distance_pct = (cur.close - candidate) / candidate * 100
@@ -1723,12 +1749,20 @@ def scan_market():
             stats['live_reject'], stats['exceptions']
         )
         rejects = sorted(
-            ((line_no, count) for (strategy, line_no), count in strategy_reject_counts.items()
+            ((strategy, line_no, count) for (strategy, line_no), count in strategy_reject_counts.items()
              if strategy == name or (name == 'build_prebreakout' and strategy.startswith('prebreakout_'))),
-            key=lambda item: item[1], reverse=True
-        )[:5]
+            key=lambda item: item[2], reverse=True
+        )[:8]
         if rejects:
-            summary = ','.join(f'L{line_no}:{count}' for line_no, count in rejects)
+            if name == 'build_prebreakout':
+                # Reason-specific labels matter here: every composite-condition failure
+                # shares the same source line, so line numbers alone hide the cause.
+                summary = ','.join(
+                    f'{strategy.removeprefix("prebreakout_") if strategy.startswith("prebreakout_") else "setup"}:{count}'
+                    for strategy, _line_no, count in rejects
+                )
+            else:
+                summary = ','.join(f'L{line_no}:{count}' for _strategy, line_no, count in rejects)
             log.info('STRATEGY REJECT LINES | %s | %s', name, summary)
 
     for setup in final:

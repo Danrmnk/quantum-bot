@@ -183,7 +183,7 @@ SIGNAL_COLUMNS = {
     'score':'INTEGER', 'status':'TEXT', 'created_at':'REAL', 'activated_at':'REAL',
     'expires_at':'REAL', 'tp1_hit':'INTEGER DEFAULT 0', 'tp2_hit':'INTEGER DEFAULT 0',
     'tp3_hit':'INTEGER DEFAULT 0', 'result':'TEXT DEFAULT \'\'', 'closed_at':'REAL',
-    'tp1_at':'REAL', 'tp2_at':'REAL', 'r_multiple':'REAL DEFAULT 0'
+    'r_multiple':'REAL DEFAULT 0'
 }
 
 
@@ -196,7 +196,7 @@ def init_db():
             score INTEGER, status TEXT, created_at REAL, activated_at REAL,
             expires_at REAL, tp1_hit INTEGER DEFAULT 0, tp2_hit INTEGER DEFAULT 0,
             tp3_hit INTEGER DEFAULT 0, result TEXT DEFAULT '', closed_at REAL,
-            tp1_at REAL, tp2_at REAL, r_multiple REAL DEFAULT 0
+            r_multiple REAL DEFAULT 0
         )''')
         cols = {r[1] for r in db.execute('PRAGMA table_info(signals)').fetchall()}
         for name, typ in SIGNAL_COLUMNS.items():
@@ -1040,6 +1040,13 @@ def send_signal(s:Setup)->bool:
 # SIGNAL LIFECYCLE
 # ============================================================
 
+def send_update(text:str):
+    try:
+        bot.send_message(CHANNEL_ID,text,parse_mode='HTML')
+    except Exception:
+        log.exception('TELEGRAM UPDATE FAILED')
+
+
 def price_in_entry(s:Setup, price:float)->bool:
     return s.entry_low <= price <= s.entry_high
 
@@ -1053,106 +1060,73 @@ def lifecycle_for_symbol(iid:str, cs:List[Candle]):
     if p:
         s=p.setup
         if now_ts()>p.expires_at:
-            expired_at=now_ts()
             with db_lock:
-                db.execute(
-                    "UPDATE signals SET status='EXPIRED',closed_at=? WHERE id=? AND status='READY'",
-                    (expired_at,p.signal_id)
-                )
-                db.commit()
+                db.execute("UPDATE signals SET status='EXPIRED' WHERE id=? AND status='READY'",(p.signal_id,)); db.commit()
             pending.pop(iid,None)
         elif price_in_entry(s,last.close) or (last.low<=s.entry_high and last.high>=s.entry_low):
-            activated=now_ts()
             with db_lock:
-                db.execute("UPDATE signals SET status='ACTIVE',activated_at=? WHERE id=? AND status='READY'",(activated,p.signal_id))
-                db.commit()
-            active[iid]=ActiveSignal(s,p.signal_id,activated,p.message_id)
+                db.execute("UPDATE signals SET status='ACTIVE',activated_at=? WHERE id=? AND status='READY'",(now_ts(),p.signal_id)); db.commit()
+            active[iid]=ActiveSignal(s,p.signal_id,now_ts(),p.message_id)
             pending.pop(iid,None)
 
     a=active.get(iid)
     if not a:
         return
     s=a.setup
-    # Use the latest confirmed candle. If TP and the original stop are both
-    # inside the same candle before TP1 was recorded, conservatively count SL.
+    # Use the latest confirmed candle. If TP and SL are both inside the same
+    # candle, the exact intrabar order is unknown; conservatively count SL first.
     if not last.confirmed:
         return
     long=s.direction=='LONG'
     hit1=last.high>=s.tp1 if long else last.low<=s.tp1
     hit2=last.high>=s.tp2 if long else last.low<=s.tp2
     hit3=last.high>=s.tp3 if long else last.low<=s.tp3
-    entry=(s.entry_low+s.entry_high)/2
+    stop=last.low<=s.sl if long else last.high>=s.sl
+    both=stop and hit1
 
     with db_lock:
         row=db.execute('SELECT tp1_hit,tp2_hit,tp3_hit FROM signals WHERE id=?',(a.signal_id,)).fetchone()
     if not row:
         return
-    h1,h2,h3=(int(v or 0) for v in row)
+    h1,h2,h3=row
 
-    # Once TP1 was reached on a previous confirmed candle, the tracked stop
-    # moves to entry (breakeven). This is signal accounting, not an exchange order.
-    if h1:
-        be_hit=last.low<=entry if long else last.high>=entry
-        if be_hit:
-            with db_lock:
-                db.execute(
-                    "UPDATE signals SET status='CLOSED_BE',result='BE',closed_at=?,r_multiple=0 WHERE id=?",
-                    (now_ts(),a.signal_id)
-                )
-                db.commit()
-            active.pop(iid,None)
-            return
-    else:
-        original_stop=last.low<=s.sl if long else last.high>=s.sl
-        if original_stop and hit1:
-            # Same candle touches TP1 and SL: exact order is unknown, count SL first.
-            with db_lock:
-                db.execute(
-                    "UPDATE signals SET status='CLOSED_LOSS',result='SL',closed_at=?,r_multiple=-1 WHERE id=?",
-                    (now_ts(),a.signal_id)
-                )
-                db.commit()
-            active.pop(iid,None)
-            return
-        if original_stop:
-            with db_lock:
-                db.execute(
-                    "UPDATE signals SET status='CLOSED_LOSS',result='SL',closed_at=?,r_multiple=-1 WHERE id=?",
-                    (now_ts(),a.signal_id)
-                )
-                db.commit()
-            active.pop(iid,None)
-            return
+    if both and not h1:
+        # Conservative handling for an ambiguous candle.
+        with db_lock:
+            db.execute("UPDATE signals SET status='CLOSED_LOSS',result='SL',closed_at=?,r_multiple=-1 WHERE id=?",(now_ts(),a.signal_id)); db.commit()
+        send_update(f'🔴 <b>STOP — {s.coin}USDT</b>\nСтоп затронут в свече с неоднозначным пересечением целей. Результат засчитан консервативно по SL.')
+        active.pop(iid,None)
+        return
 
     if hit1 and not h1:
         with db_lock:
-            db.execute("UPDATE signals SET tp1_hit=1,tp1_at=? WHERE id=?",(now_ts(),a.signal_id))
-            db.commit()
+            db.execute("UPDATE signals SET tp1_hit=1 WHERE id=?",(a.signal_id,)); db.commit()
         a.tp1_sent=True
+        send_update(f'🟢 <b>TP1 — {s.coin}USDT</b>\nЦена достигла <code>{fmt_price(s.tp1)}</code>.\nЧасть позиции можно зафиксировать по своему плану.')
     if hit2 and not h2:
         with db_lock:
-            db.execute("UPDATE signals SET tp2_hit=1,tp2_at=? WHERE id=?",(now_ts(),a.signal_id))
-            db.commit()
+            db.execute("UPDATE signals SET tp2_hit=1 WHERE id=?",(a.signal_id,)); db.commit()
         a.tp2_sent=True
+        send_update(f'🚀 <b>TP2 — {s.coin}USDT</b>\nЦена достигла <code>{fmt_price(s.tp2)}</code>.\nОстаток сопровождаем по плану.')
     if hit3 and not h3:
-        risk=max(abs(entry-s.sl),1e-12)
-        r=abs(s.tp3-entry)/risk
+        entry=(s.entry_low+s.entry_high)/2
+        r=abs(s.tp3-entry)/max(abs(entry-s.sl),1e-12)
         with db_lock:
-            db.execute(
-                "UPDATE signals SET tp3_hit=1,status='CLOSED_WIN',result='TP3',closed_at=?,r_multiple=? WHERE id=?",
-                (now_ts(),r,a.signal_id)
-            )
-            db.commit()
+            db.execute("UPDATE signals SET tp3_hit=1,status='CLOSED_WIN',result='TP3',closed_at=?,r_multiple=? WHERE id=?",(now_ts(),r,a.signal_id)); db.commit()
+        send_update(f'🏁 <b>TP3 — {s.coin}USDT</b>\nЦена достигла <code>{fmt_price(s.tp3)}</code>.\nРезультат зафиксирован: TP3.')
+        active.pop(iid,None)
+        return
+    if stop:
+        with db_lock:
+            db.execute("UPDATE signals SET status='CLOSED_LOSS',result='SL',closed_at=?,r_multiple=-1 WHERE id=?",(now_ts(),a.signal_id)); db.commit()
+        send_update(f'🔴 <b>STOP — {s.coin}USDT</b>\nЦена достигла стопа <code>{fmt_price(s.sl)}</code>.\nСделка закрыта по плановому риску.')
         active.pop(iid,None)
         return
 
     if now_ts()-a.activated_at > ACTIVE_MAX_HOURS*3600:
         with db_lock:
-            db.execute(
-                "UPDATE signals SET status='TIMEOUT',result='TIMEOUT',closed_at=?,r_multiple=0 WHERE id=?",
-                (now_ts(),a.signal_id)
-            )
-            db.commit()
+            db.execute("UPDATE signals SET status='TIMEOUT',result='TIMEOUT',closed_at=? WHERE id=?",(now_ts(),a.signal_id)); db.commit()
+        send_update(f'⚪ <b>TIMEOUT — {s.coin}USDT</b>\nСделка не дошла до TP3/SL в установленное время. Результат закрыт как TIMEOUT.')
         active.pop(iid,None)
 
 
@@ -1232,153 +1206,107 @@ def scan_market():
 
 def daily_report():
     n = local_now()
-    # Strict daily delivery window: 21:00–21:04 in configured local timezone.
-    # If Telegram fails, retry on each scan during this window only.
-    if n.hour != 21 or n.minute > 4:
+    # Send at/after 21:00 on the first main-loop pass that day. If the bot
+    # restarts or Telegram is temporarily unavailable around 21:00, retry on
+    # subsequent scans until delivery succeeds. Successful delivery is once/day.
+    if n.hour < 21:
         return
 
     day_key = n.date().isoformat()
     state_key = 'daily_report_21'
     with db_lock:
-        sent = db.execute("SELECT value FROM bot_state WHERE key=?", (state_key,)).fetchone()
-    if sent and sent[0] == day_key:
+        row = db.execute("SELECT value FROM bot_state WHERE key=?", (state_key,)).fetchone()
+    if row and row[0] == day_key:
         return
 
-    until = n.timestamp()
     since = (n - timedelta(hours=24)).timestamp()
+    until = n.timestamp()
     with db_lock:
         rows = db.execute(
             """SELECT id, inst_id, direction, strategy, status, result,
-                      tp1_hit, tp2_hit, tp3_hit, created_at, activated_at,
-                      expires_at, tp1_at, tp2_at, closed_at, r_multiple
+                      tp1_hit, tp2_hit, tp3_hit, created_at, closed_at, r_multiple
                FROM signals
-               WHERE status != 'SEND_FAILED'
-                 AND (
-                     (created_at >= ? AND created_at <= ?)
-                     OR (tp1_at >= ? AND tp1_at <= ?)
-                     OR (tp2_at >= ? AND tp2_at <= ?)
-                     OR (closed_at >= ? AND closed_at <= ?)
-                 )
+               WHERE created_at >= ? AND created_at <= ?
+                 AND status != 'SEND_FAILED'
                ORDER BY created_at ASC""",
-            (since, until, since, until, since, until, since, until)
-        ).fetchall()
-        open_row = db.execute(
-            "SELECT COUNT(*) FROM signals WHERE status IN ('READY','ACTIVE')"
-        ).fetchone()
-        open_signals = db.execute(
-            """SELECT inst_id,direction,strategy,status,created_at
-               FROM signals WHERE status IN ('READY','ACTIVE')
-               ORDER BY created_at ASC"""
+            (since, until)
         ).fetchall()
 
-    def in_window(value):
-        return value is not None and since <= float(value) <= until
-
-    new_count = sum(1 for r in rows if in_window(r[9]))
-    tp1_count = sum(1 for r in rows if in_window(r[12]))
-    tp2_count = sum(1 for r in rows if in_window(r[13]))
-    tp3_count = sum(1 for r in rows if r[5] == 'TP3' and in_window(r[14]))
-    stop_count = sum(1 for r in rows if r[5] == 'SL' and in_window(r[14]))
-    be_count = sum(1 for r in rows if r[5] == 'BE' and in_window(r[14]))
-    timeout_count = sum(1 for r in rows if r[5] == 'TIMEOUT' and in_window(r[14]))
-    expired_count = sum(1 for r in rows if r[4] == 'EXPIRED' and in_window(r[14]))
-    closed_count = tp3_count + stop_count + be_count + timeout_count
-
+    total = len(rows)
+    tp1_count = sum(1 for r in rows if int(r[6] or 0) == 1)
+    tp2_count = sum(1 for r in rows if int(r[7] or 0) == 1)
+    tp3_count = sum(1 for r in rows if int(r[8] or 0) == 1 or r[5] == 'TP3')
+    stop_count = sum(1 for r in rows if r[5] == 'SL' or r[4] == 'CLOSED_LOSS')
+    timeout_count = sum(1 for r in rows if r[4] == 'TIMEOUT' or r[5] == 'TIMEOUT')
+    expired_count = sum(1 for r in rows if r[4] == 'EXPIRED')
+    open_count = sum(1 for r in rows if r[4] in ('READY', 'ACTIVE'))
     lines = [
-        '📊 <b>QUANTUM — ежедневная статистика</b>',
-        f'🕘 <b>Период:</b> {escape((n - timedelta(hours=24)).strftime("%d.%m %H:%M"))} — {escape(n.strftime("%d.%m %H:%M"))} ({escape(TIMEZONE)})',
+        '📊 <b>QUANTUM — отчёт за 24 часа</b>',
+        f'🕘 Период: {escape((n - timedelta(hours=24)).strftime("%d.%m %H:%M"))} — {escape(n.strftime("%d.%m %H:%M"))} ({escape(TIMEZONE)})',
         '',
-        '<b>События за последние 24 часа</b>',
-        f'📨 Новых сигналов: <b>{new_count}</b>',
+        f'📨 Всего сигналов: <b>{total}</b>',
         f'🟢 Достигли TP1: <b>{tp1_count}</b>',
         f'🚀 Достигли TP2: <b>{tp2_count}</b>',
-        f'🏁 Закрыты по TP3: <b>{tp3_count}</b>',
+        f'🏁 Достигли TP3: <b>{tp3_count}</b>',
         f'🔴 Закрыты по стопу: <b>{stop_count}</b>',
-        f'⚪ Закрыты в безубыток после TP1: <b>{be_count}</b>',
-        f'⌛ Закрыты по времени: <b>{timeout_count}</b>',
-        f'⏳ Истекли без входа: <b>{expired_count}</b>',
-        f'🔄 Сейчас ожидают входа / в работе: <b>{int(open_row[0] or 0)}</b>',
+        f'⚪ Закрыты по времени: <b>{timeout_count}</b>',
+        f'⌛ Истекли без входа: <b>{expired_count}</b>',
+        f'🔄 Ещё в работе / ожидают входа: <b>{open_count}</b>',
         '',
-        '<b>Результаты по стратегиям (закрытые сделки за период)</b>'
+        '<b>По стратегиям</b>',
     ]
 
-    closed_by_strategy = {}
+    strategy_stats = {}
     for r in rows:
-        sid, inst_id, direction, strategy, status, result, h1, h2, h3, created_at, activated_at, expires_at, tp1_at, tp2_at, closed_at, r_multiple = r
-        if not in_window(closed_at) or result not in ('TP3', 'SL', 'BE', 'TIMEOUT'):
-            continue
-        name = strategy or 'Без названия'
-        st = closed_by_strategy.setdefault(name, {'closed': 0, 'tp3': 0, 'sl': 0, 'be': 0, 'timeout': 0, 'r': 0.0})
-        st['closed'] += 1
-        st['tp3'] += int(result == 'TP3')
-        st['sl'] += int(result == 'SL')
-        st['be'] += int(result == 'BE')
-        st['timeout'] += int(result == 'TIMEOUT')
-        st['r'] += float(r_multiple or 0)
+        name = r[3] or 'Без названия'
+        stats = strategy_stats.setdefault(name, {'total': 0, 'tp1': 0, 'tp3': 0, 'sl': 0})
+        stats['total'] += 1
+        stats['tp1'] += int(r[6] or 0)
+        stats['tp3'] += int(bool(int(r[8] or 0) or r[5] == 'TP3'))
+        stats['sl'] += int(bool(r[5] == 'SL' or r[4] == 'CLOSED_LOSS'))
 
-    if closed_by_strategy:
-        for name, st in sorted(closed_by_strategy.items(), key=lambda item: (item[1]['r'], item[1]['tp3']), reverse=True):
-            win_rate = st['tp3'] / st['closed'] * 100 if st['closed'] else 0
+    if strategy_stats:
+        for name, stats in sorted(strategy_stats.items()):
             lines.append(
-                f'• <b>{escape(str(name))}</b>: закрыто {st["closed"]} · TP3 {st["tp3"]} · '
-                f'стоп {st["sl"]} · BE {st["be"]} · тайм-аут {st["timeout"]} · '
-                f'ΣR {st["r"]:+.2f} · TP3 {win_rate:.0f}%'
+                f'• {escape(str(name))}: {stats["total"]} сигналов · '
+                f'TP1 {stats["tp1"]} · TP3 {stats["tp3"]} · стоп {stats["sl"]}'
             )
-        eligible = [(name, st) for name, st in closed_by_strategy.items() if st['closed'] > 0]
-        if eligible:
-            best_name, best = max(eligible, key=lambda item: (item[1]['r'], item[1]['tp3'], -item[1]['sl']))
-            lines.extend([
-                '',
-                f'🏆 <b>Лучшая стратегия по ΣR:</b> {escape(str(best_name))}',
-                f'Результат: <b>{best["r"]:+.2f}R</b> на {best["closed"]} закрытых сделках '
-                f'(TP3 {best["tp3"]}, стоп {best["sl"]}, BE {best["be"]}, тайм-аут {best["timeout"]}).'
-            ])
     else:
-        lines.append('За период нет закрытых сделок для сравнения стратегий.')
+        lines.append('За последние 24 часа сигналов не было.')
 
-    # List every event that happened in the period, including signals created earlier.
-    event_lines = []
-    for r in rows:
-        sid, inst_id, direction, strategy, status, result, h1, h2, h3, created_at, activated_at, expires_at, tp1_at, tp2_at, closed_at, r_multiple = r
-        coin = escape(get_coin(inst_id or ''))
-        side = '🟢 LONG' if direction == 'LONG' else '🔴 SHORT'
-        strat = escape(str(strategy or '—'))
-        events = []
-        if in_window(created_at):
-            events.append((float(created_at), 'сигнал опубликован'))
-        if in_window(tp1_at):
-            events.append((float(tp1_at), 'TP1'))
-        if in_window(tp2_at):
-            events.append((float(tp2_at), 'TP2'))
-        if in_window(closed_at):
-            outcome = {
-                'TP3': 'TP3 — цель достигнута',
-                'SL': 'СТОП',
-                'BE': 'БЕЗУБЫТОК',
-                'TIMEOUT': 'ЗАКРЫТА ПО ВРЕМЕНИ',
-            }.get(result, 'ИСТЁК БЕЗ ВХОДА' if status == 'EXPIRED' else (result or status or 'закрытие'))
-            events.append((float(closed_at), outcome))
-        for ts, event in events:
-            when = datetime.fromtimestamp(ts, ZoneInfo(TIMEZONE)).strftime('%d.%m %H:%M')
-            suffix = f' · {float(r_multiple or 0):+.2f}R' if event in ('TP3 — цель достигнута', 'СТОП', 'БЕЗУБЫТОК', 'ЗАКРЫТА ПО ВРЕМЕНИ') else ''
-            event_lines.append((ts, f'• {when} · {coin} · {side} · {strat} · <b>{escape(event)}</b>{suffix}'))
-
-    lines.extend(['', '<b>Хронология событий за период</b>'])
-    if event_lines:
-        lines.extend(line for _, line in sorted(event_lines, key=lambda item: item[0]))
-    else:
-        lines.append('За последние 24 часа событий не было.')
-
-    if open_signals:
-        lines.extend(['', '<b>Сигналы, которые ещё не закрыты</b>'])
-        for inst_id, direction, strategy, status, created_at in open_signals:
+    lines.extend(['', '<b>Список сигналов</b>'])
+    if rows:
+        for r in rows:
+            sid, inst_id, direction, strategy, status, result, h1, h2, h3, created_at, closed_at, r_multiple = r
             coin = escape(get_coin(inst_id or ''))
-            side = 'LONG' if direction == 'LONG' else 'SHORT'
-            status_text = 'ожидает входа' if status == 'READY' else 'в работе'
-            created = datetime.fromtimestamp(float(created_at), ZoneInfo(TIMEZONE)).strftime('%d.%m %H:%M')
-            lines.append(f'• {created} · {coin} · {side} · {escape(str(strategy or "—"))} · {status_text}')
+            side = '🟢 LONG' if direction == 'LONG' else '🔴 SHORT'
+            created = datetime.fromtimestamp(float(created_at), ZoneInfo(TIMEZONE)).strftime('%H:%M')
+            if result == 'TP3' or int(h3 or 0):
+                outcome = 'TP3'
+            elif result == 'SL' or status == 'CLOSED_LOSS':
+                outcome = 'СТОП'
+            elif result == 'TIMEOUT' or status == 'TIMEOUT':
+                outcome = 'ПО ВРЕМЕНИ'
+            elif status == 'EXPIRED':
+                outcome = 'БЕЗ ВХОДА'
+            elif status == 'ACTIVE':
+                outcome = 'В РАБОТЕ'
+            elif status == 'READY':
+                outcome = 'ОЖИДАЕТ ВХОДА'
+            elif int(h2 or 0):
+                outcome = 'ДОСТИГНУТ TP2'
+            elif int(h1 or 0):
+                outcome = 'ДОСТИГНУТ TP1'
+            else:
+                outcome = status or 'НЕИЗВЕСТНО'
+            lines.append(
+                f'• {created} · {coin} · {side} · {escape(str(strategy or "—"))} · '
+                f'<b>{escape(str(outcome))}</b>'
+            )
+    else:
+        lines.append('Нет сигналов.')
 
-    # Telegram has a message size limit; split only at line boundaries.
+    # Telegram messages have a length limit. Split only at line boundaries.
     chunks = []
     current = ''
     for line in lines:
@@ -1401,10 +1329,8 @@ def daily_report():
                 (state_key, day_key)
             )
             db.commit()
-        log.info(
-            'DAILY REPORT SENT | date=%s | new=%d | tp3=%d | stop=%d | be=%d | timeout=%d',
-            day_key, new_count, tp3_count, stop_count, be_count, timeout_count
-        )
+        log.info('DAILY REPORT SENT | date=%s | signals=%d | tp3=%d | stop=%d',
+                 day_key, total, tp3_count, stop_count)
     except Exception:
         log.exception('DAILY REPORT FAILED')
 

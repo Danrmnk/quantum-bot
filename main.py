@@ -1206,10 +1206,10 @@ def scan_market():
 
 def daily_report():
     n = local_now()
-    # The main loop calls this every scan. Allow a 5-minute window after
-    # 21:00 so a slightly delayed scan/restart does not miss the report.
-    # The reporting window is rolling 24h; successful delivery is once per day.
-    if n.hour != 21 or n.minute >= 5:
+    # Send at/after 21:00 on the first main-loop pass that day. If the bot
+    # restarts or Telegram is temporarily unavailable around 21:00, retry on
+    # subsequent scans until delivery succeeds. Successful delivery is once/day.
+    if n.hour < 21:
         return
 
     day_key = n.date().isoformat()
@@ -1242,7 +1242,7 @@ def daily_report():
     open_count = sum(1 for r in rows if r[4] in ('READY', 'ACTIVE'))
     lines = [
         '📊 <b>QUANTUM — отчёт за 24 часа</b>',
-        f'🕘 Период: {escape((n - timedelta(hours=24)).strftime("%d.%m %H:%M"))} — {escape(n.strftime("%d.%m %H:%M"))} (Киев)',
+        f'🕘 Период: {escape((n - timedelta(hours=24)).strftime("%d.%m %H:%M"))} — {escape(n.strftime("%d.%m %H:%M"))} ({escape(TIMEZONE)})',
         '',
         f'📨 Всего сигналов: <b>{total}</b>',
         f'🟢 Достигли TP1: <b>{tp1_count}</b>',

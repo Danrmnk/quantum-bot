@@ -3,6 +3,7 @@ import time
 import math
 import logging
 import sqlite3
+from html import escape
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -1200,32 +1201,139 @@ def scan_market():
         send_signal(s)
 
 # ============================================================
-# WEEKLY REPORT
+# DAILY REPORT — once a day at 21:00, rolling last 24 hours
 # ============================================================
 
-def weekly_report():
-    n=local_now()
-    # Monday after 09:00, exactly once per week.
-    if n.weekday()!=0 or n.hour<9:
+def daily_report():
+    n = local_now()
+    # The main loop calls this every scan. Allow a 5-minute window after
+    # 21:00 so a slightly delayed scan/restart does not miss the report.
+    # The reporting window is rolling 24h; successful delivery is once per day.
+    if n.hour != 21 or n.minute >= 5:
         return
-    key=n.date().isoformat()
+
+    day_key = n.date().isoformat()
+    state_key = 'daily_report_21'
     with db_lock:
-        row=db.execute("SELECT value FROM bot_state WHERE key='weekly_report'").fetchone()
-    if row and row[0]==key:
+        row = db.execute("SELECT value FROM bot_state WHERE key=?", (state_key,)).fetchone()
+    if row and row[0] == day_key:
         return
-    since=(n-timedelta(days=7)).timestamp()
+
+    since = (n - timedelta(hours=24)).timestamp()
+    until = n.timestamp()
     with db_lock:
-        total=db.execute('SELECT COUNT(*) FROM signals WHERE created_at>=?',(since,)).fetchone()[0]
-        wins=db.execute("SELECT COUNT(*) FROM signals WHERE created_at>=? AND result='TP3'",(since,)).fetchone()[0]
-        losses=db.execute("SELECT COUNT(*) FROM signals WHERE created_at>=? AND result='SL'",(since,)).fetchone()[0]
+        rows = db.execute(
+            """SELECT id, inst_id, direction, strategy, status, result,
+                      tp1_hit, tp2_hit, tp3_hit, created_at, closed_at, r_multiple
+               FROM signals
+               WHERE created_at >= ? AND created_at <= ?
+                 AND status != 'SEND_FAILED'
+               ORDER BY created_at ASC""",
+            (since, until)
+        ).fetchall()
+
+    total = len(rows)
+    tp1_count = sum(1 for r in rows if int(r[6] or 0) == 1)
+    tp2_count = sum(1 for r in rows if int(r[7] or 0) == 1)
+    tp3_count = sum(1 for r in rows if int(r[8] or 0) == 1 or r[5] == 'TP3')
+    stop_count = sum(1 for r in rows if r[5] == 'SL' or r[4] == 'CLOSED_LOSS')
+    timeout_count = sum(1 for r in rows if r[4] == 'TIMEOUT' or r[5] == 'TIMEOUT')
+    expired_count = sum(1 for r in rows if r[4] == 'EXPIRED')
+    open_count = sum(1 for r in rows if r[4] in ('READY', 'ACTIVE'))
+    lines = [
+        '📊 <b>QUANTUM — отчёт за 24 часа</b>',
+        f'🕘 Период: {escape((n - timedelta(hours=24)).strftime("%d.%m %H:%M"))} — {escape(n.strftime("%d.%m %H:%M"))} (Киев)',
+        '',
+        f'📨 Всего сигналов: <b>{total}</b>',
+        f'🟢 Достигли TP1: <b>{tp1_count}</b>',
+        f'🚀 Достигли TP2: <b>{tp2_count}</b>',
+        f'🏁 Достигли TP3: <b>{tp3_count}</b>',
+        f'🔴 Закрыты по стопу: <b>{stop_count}</b>',
+        f'⚪ Закрыты по времени: <b>{timeout_count}</b>',
+        f'⌛ Истекли без входа: <b>{expired_count}</b>',
+        f'🔄 Ещё в работе / ожидают входа: <b>{open_count}</b>',
+        '',
+        '<b>По стратегиям</b>',
+    ]
+
+    strategy_stats = {}
+    for r in rows:
+        name = r[3] or 'Без названия'
+        stats = strategy_stats.setdefault(name, {'total': 0, 'tp1': 0, 'tp3': 0, 'sl': 0})
+        stats['total'] += 1
+        stats['tp1'] += int(r[6] or 0)
+        stats['tp3'] += int(bool(int(r[8] or 0) or r[5] == 'TP3'))
+        stats['sl'] += int(bool(r[5] == 'SL' or r[4] == 'CLOSED_LOSS'))
+
+    if strategy_stats:
+        for name, stats in sorted(strategy_stats.items()):
+            lines.append(
+                f'• {escape(str(name))}: {stats["total"]} сигналов · '
+                f'TP1 {stats["tp1"]} · TP3 {stats["tp3"]} · стоп {stats["sl"]}'
+            )
+    else:
+        lines.append('За последние 24 часа сигналов не было.')
+
+    lines.extend(['', '<b>Список сигналов</b>'])
+    if rows:
+        for r in rows:
+            sid, inst_id, direction, strategy, status, result, h1, h2, h3, created_at, closed_at, r_multiple = r
+            coin = escape(get_coin(inst_id or ''))
+            side = '🟢 LONG' if direction == 'LONG' else '🔴 SHORT'
+            created = datetime.fromtimestamp(float(created_at), ZoneInfo(TIMEZONE)).strftime('%H:%M')
+            if result == 'TP3' or int(h3 or 0):
+                outcome = 'TP3'
+            elif result == 'SL' or status == 'CLOSED_LOSS':
+                outcome = 'СТОП'
+            elif result == 'TIMEOUT' or status == 'TIMEOUT':
+                outcome = 'ПО ВРЕМЕНИ'
+            elif status == 'EXPIRED':
+                outcome = 'БЕЗ ВХОДА'
+            elif status == 'ACTIVE':
+                outcome = 'В РАБОТЕ'
+            elif status == 'READY':
+                outcome = 'ОЖИДАЕТ ВХОДА'
+            elif int(h2 or 0):
+                outcome = 'ДОСТИГНУТ TP2'
+            elif int(h1 or 0):
+                outcome = 'ДОСТИГНУТ TP1'
+            else:
+                outcome = status or 'НЕИЗВЕСТНО'
+            lines.append(
+                f'• {created} · {coin} · {side} · {escape(str(strategy or "—"))} · '
+                f'<b>{escape(str(outcome))}</b>'
+            )
+    else:
+        lines.append('Нет сигналов.')
+
+    # Telegram messages have a length limit. Split only at line boundaries.
+    chunks = []
+    current = ''
+    for line in lines:
+        candidate = line if not current else current + '\n' + line
+        if len(candidate) > 3800 and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
     try:
-        bot.send_message(CHANNEL_ID,
-            f'📊 <b>QUANTUM — неделя</b>\n\nСигналов: <b>{total}</b>\nПрибыльных закрытых: <b>{wins}</b>\nУбыточных закрытых: <b>{losses}</b>',
-            parse_mode='HTML')
+        for index, chunk in enumerate(chunks, start=1):
+            prefix = f'<b>Часть {index}/{len(chunks)}</b>\n' if len(chunks) > 1 else ''
+            bot.send_message(CHANNEL_ID, prefix + chunk, parse_mode='HTML')
         with db_lock:
-            db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES('weekly_report',?)",(key,)); db.commit()
+            db.execute(
+                "INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)",
+                (state_key, day_key)
+            )
+            db.commit()
+        log.info('DAILY REPORT SENT | date=%s | signals=%d | tp3=%d | stop=%d',
+                 day_key, total, tp3_count, stop_count)
     except Exception:
-        log.exception('WEEKLY REPORT FAILED')
+        log.exception('DAILY REPORT FAILED')
+
 
 # ============================================================
 # HEALTH / STARTUP
@@ -1261,7 +1369,7 @@ def main():
     while True:
         try:
             update_signal_results()
-            weekly_report()
+            daily_report()
             scan_market()
         except KeyboardInterrupt:
             log.info('STOPPED')

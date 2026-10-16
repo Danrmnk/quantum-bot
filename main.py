@@ -1206,31 +1206,22 @@ def scan_market():
 
 def daily_report():
     """
-    Единственный ежедневный отчёт канала.
+    Единственный публичный дневной отчёт.
 
-    ВАЖНО: этот блок отвечает только за дневную статистику и аудит
-    уже опубликованных сигналов. Поиск монет, стратегии, scoring,
-    cooldown и отправка новых сигналов находятся вне него.
+    ВАЖНО: этот блок НЕ участвует в поиске монет, построении сетапов,
+    scoring, cooldown или отправке новых сигналов. Он работает только
+    с уже сохранёнными сигналами из таблицы signals.
 
-    В 21:00 Europe/Kyiv формируется ОДИН PDF-файл за последние 24 часа:
-      - сводка по всем опубликованным сигналам;
-      - фактический вход / без входа;
-      - TP1 / TP2 / TP3;
-      - безубыток после TP1;
-      - стоп / timeout;
-      - результат в R;
-      - статистика по каждой стратегии;
-      - отдельная страница с графиком для каждого сигнала.
-
-    Перед формированием отчёта незакрытые записи повторно сверяются
-    с подтверждёнными 5M свечами OKX, чтобы после рестарта не получать
-    ложное "всё в работе".
+    В 21:00 Europe/Kyiv один раз формируется rolling-отчёт за последние
+    24 часа. Перед подсчётом незакрытые сделки повторно сверяются с
+    подтверждёнными 5M свечами OKX, чтобы отчёт не показывал сделку
+    "в работе", если по факту она уже дошла до TP/SL/BE.
     """
     n = local_now()
 
-    # Один отчёт на календарный день. Если процесс был перезапущен,
-    # отчёт после 21:00 будет отправлен один раз после восстановления.
-    if n.hour < 21:
+    # Отчёт отправляется только в 21:00. Окно 21:00–21:04 нужно лишь
+    # чтобы не потерять отправку из-за 30-секундного цикла или задержки.
+    if n.hour != 21 or n.minute > 4:
         return
 
     day_key = n.date().isoformat()
@@ -1238,10 +1229,10 @@ def daily_report():
 
     with db_lock:
         row = db.execute(
-            "SELECT value FROM bot_state WHERE key=?",
-            (state_key,)
+            "SELECT value FROM bot_state WHERE key=?", (state_key,)
         ).fetchone()
 
+    # Ровно один отчёт за календарный день.
     if row and row[0] == day_key:
         return
 
@@ -1249,7 +1240,7 @@ def daily_report():
     since = since_dt.timestamp()
     until = n.timestamp()
 
-    # Только сигналы, опубликованные за последние 24 часа.
+    # Только опубликованные сигналы за последние 24 часа.
     with db_lock:
         rows = db.execute(
             """SELECT id, inst_id, direction, strategy, status, result,
@@ -1266,8 +1257,8 @@ def daily_report():
     # ------------------------------------------------------------
     # REPORT-ONLY RECONCILIATION
     # ------------------------------------------------------------
-    # Ничего из поиска новых сигналов здесь не вызывается.
-    # Мы только проверяем уже существующие записи signals.
+    # Здесь НИКОГДА не вызывается scan_market() и не запускается поиск
+    # новых монет. Проверяются только уже существующие signal_id.
     def reconcile_row(r):
         (sid, inst_id, direction, strategy, status, result,
          h1, h2, h3, created_at, activated_at, expires_at,
@@ -1279,12 +1270,11 @@ def daily_report():
         }
         terminal_results = {'TP2', 'TP3', 'BE', 'SL', 'TIMEOUT', 'NO_ENTRY'}
 
+        # Уже окончательно закрытые записи не пересчитываем.
         if status in terminal_statuses or result in terminal_results:
             return r
 
         try:
-            # 300 x 5M = до 25 часов — достаточно для rolling 24h отчёта
-            # плюс небольшой запас.
             candles = get_candles(inst_id, '5m', 300)
             if len(candles) < 3:
                 return r
@@ -1292,7 +1282,7 @@ def daily_report():
             long = direction == 'LONG'
             entry = (float(entry_low) + float(entry_high)) / 2.0
 
-            # Сначала ищем фактическое касание зоны входа.
+            # Ищем фактический вход только после публикации сигнала.
             entered = bool(activated_at)
             activation_ts = float(activated_at) if activated_at else None
 
@@ -1346,8 +1336,8 @@ def daily_report():
                 hit_tp3 = c.high >= float(tp3) if long else c.low <= float(tp3)
                 hit_sl = c.low <= float(sl) if long else c.high >= float(sl)
 
-                # Если TP1 и SL находятся в одной подтверждённой свече,
-                # порядок внутри свечи неизвестен — считаем SL первым.
+                # До TP1 порядок внутри одной свечи неизвестен.
+                # Для статистики используем консервативное правило: SL первым.
                 if not hit1 and hit_tp1 and hit_sl:
                     terminal_status = 'CLOSED_LOSS'
                     terminal_result = 'SL'
@@ -1371,6 +1361,7 @@ def daily_report():
                 if hit2 and hit_tp3:
                     hit3 = True
 
+                # После TP3 сделка полностью положительная.
                 if hit3:
                     risk = abs(entry - float(sl))
                     terminal_status = 'CLOSED_WIN'
@@ -1379,17 +1370,7 @@ def daily_report():
                     terminal_r = abs(float(tp3) - entry) / max(risk, 1e-12)
                     break
 
-                # После TP1 стоп считается перенесённым в безубыток.
-                if hit1 and not hit2:
-                    returned_to_entry = c.low <= entry if long else c.high >= entry
-                    if returned_to_entry:
-                        terminal_status = 'CLOSED_BE'
-                        terminal_result = 'BE'
-                        terminal_closed_at = c.ts / 1000.0
-                        terminal_r = 0.0
-                        break
-
-                # TP2 — положительное закрытие по плану.
+                # TP2 — тоже положительное закрытие по плану.
                 if hit2:
                     risk = abs(entry - float(sl))
                     terminal_status = 'CLOSED_WIN'
@@ -1398,7 +1379,17 @@ def daily_report():
                     terminal_r = abs(float(tp2) - entry) / max(risk, 1e-12)
                     break
 
-            # Если закрывающего события нет — результат не придумываем.
+                # После TP1 стоп считается перенесённым в BE.
+                if hit1:
+                    returned_to_entry = c.low <= entry if long else c.high >= entry
+                    if returned_to_entry:
+                        terminal_status = 'CLOSED_BE'
+                        terminal_result = 'BE'
+                        terminal_closed_at = c.ts / 1000.0
+                        terminal_r = 0.0
+                        break
+
+            # Если фактического закрытия нет — не придумываем результат.
             if terminal_result not in ('TP2', 'TP3', 'BE', 'SL', 'TIMEOUT'):
                 terminal_status = 'ACTIVE'
                 terminal_result = ''
@@ -1410,6 +1401,17 @@ def daily_report():
                     terminal_result = 'TIMEOUT'
                     terminal_closed_at = until
 
+            updated = (
+                sid, inst_id, direction, strategy,
+                terminal_status, terminal_result,
+                int(hit1), int(hit2), int(hit3),
+                created_at, activation_ts, expires_at,
+                terminal_closed_at, terminal_r,
+                entry_low, entry_high, sl, tp1, tp2, tp3
+            )
+
+            # Сохраняем только результат существующего сигнала.
+            # Поиск монет/сигналов этим блоком не затрагивается.
             with db_lock:
                 db.execute(
                     """UPDATE signals
@@ -1425,24 +1427,15 @@ def daily_report():
                 )
                 db.commit()
 
-            return (
-                sid, inst_id, direction, strategy,
-                terminal_status, terminal_result,
-                int(hit1), int(hit2), int(hit3),
-                created_at, activation_ts, expires_at,
-                terminal_closed_at, terminal_r,
-                entry_low, entry_high, sl, tp1, tp2, tp3
-            )
+            return updated
 
         except Exception:
-            log.exception('DAILY REPORT RECONCILIATION FAILED | id=%s | %s', sid, inst_id)
+            log.exception(
+                'DAILY REPORT RECONCILIATION FAILED | id=%s | %s', sid, inst_id
+            )
             return r
 
     reconciled_rows = [reconcile_row(r) for r in rows]
-
-    # ------------------------------------------------------------
-    # FINAL STATISTICS
-    # ------------------------------------------------------------
     total = len(reconciled_rows)
 
     def is_entry(r):
@@ -1496,6 +1489,7 @@ def daily_report():
         if r[5] in ('TP2', 'TP3', 'BE', 'SL'):
             st['r'] += float(r[13] or 0.0)
 
+    # Сначала суммарный R, затем количество плюсовых при равенстве.
     ranked = sorted(
         strategy_stats.items(),
         key=lambda x: (x[1]['r'], x[1]['positive'], -x[1]['sl']),
@@ -1503,7 +1497,7 @@ def daily_report():
     )
 
     # ------------------------------------------------------------
-    # PDF REPORT WITH ONE CHART PAGE PER SIGNAL
+    # PDF REPORT — SUMMARY + ONE PAGE PER SIGNAL
     # ------------------------------------------------------------
     pdf_path = f'/tmp/quantum_daily_{day_key}.pdf'
     pdf_created = False
@@ -1512,11 +1506,10 @@ def daily_report():
         from matplotlib.backends.backend_pdf import PdfPages
 
         with PdfPages(pdf_path) as pdf:
-            # Summary page.
             fig = plt.figure(figsize=(11.7, 8.3), dpi=110)
             fig.patch.set_facecolor('white')
             fig.text(0.06, 0.93, 'QUANTUM | VIP SCANNER', fontsize=22, fontweight='bold')
-            fig.text(0.06, 0.885, 'ДНЕВНОЙ АУДИТ СИГНАЛОВ · 24 ЧАСА', fontsize=14, fontweight='bold')
+            fig.text(0.06, 0.885, 'ДНЕВНОЙ АУДИТ СИГНАЛОВ · ПОСЛЕДНИЕ 24 ЧАСА', fontsize=14, fontweight='bold')
             fig.text(0.06, 0.845, f'{since_dt:%d.%m.%Y %H:%M} — {n:%d.%m.%Y %H:%M} · {TIMEZONE}', fontsize=9.5)
 
             summary = (
@@ -1528,8 +1521,11 @@ def daily_report():
                 f'TIMEOUT: {timeout_count}\n'
                 f'Без входа: {no_entry_count}\n'
                 f'Остались в работе: {open_count}\n\n'
-                f'TP1 достигнут: {tp1_count}\nTP2 достигнут: {tp2_count}\nTP3 достигнут: {tp3_count}\n'
-                f'Win rate закрытых: {win_rate:.1f}%\nСуммарный результат: {total_r:+.2f}R'
+                f'TP1 достигнут: {tp1_count}\n'
+                f'TP2 достигнут: {tp2_count}\n'
+                f'TP3 достигнут: {tp3_count}\n'
+                f'Win rate закрытых: {win_rate:.1f}%\n'
+                f'Суммарный результат: {total_r:+.2f}R'
             )
             fig.text(0.07, 0.74, summary, fontsize=13, va='top', linespacing=1.65)
 
@@ -1553,13 +1549,17 @@ def daily_report():
             else:
                 fig.text(0.52, y, 'За последние 24 часа сигналов не было.', fontsize=11)
 
-            fig.text(0.06, 0.055, 'Аудит закрытия: подтверждённые 5M свечи OKX. Если TP и SL попали в одну свечу до TP1 — консервативно засчитывается SL.', fontsize=8.5)
+            fig.text(
+                0.06, 0.055,
+                'Аудит: только существующие сигналы из БД + подтверждённые 5M свечи OKX. '
+                'Если TP и SL попали в одну свечу до TP1 — консервативно засчитывается SL.',
+                fontsize=8.5
+            )
             pdf.savefig(fig, bbox_inches='tight')
             plt.close(fig)
 
-            # One page per signal. The candles are taken around the signal time,
-            # not from the current chart, so the report preserves the market context
-            # that existed when the signal was published.
+            # Отдельная страница для каждого сигнала: точка входа, стоп,
+            # TP1/TP2/TP3 и фактический исход.
             for r in reconciled_rows:
                 (sid, inst_id, direction, strategy, status, result,
                  h1, h2, h3, created_at, activated_at, expires_at,
@@ -1600,9 +1600,12 @@ def daily_report():
 
                     def report_hline(price, label, color, ls='--', lw=1.5):
                         ax.axhline(float(price), color=color, linewidth=lw, linestyle=ls, zorder=4)
-                        ax.text(len(chart_candles)-1.0, float(price), f' {label} {fmt_price(float(price))}',
-                                ha='right', va='bottom', fontsize=8.5, fontweight='bold', color=color,
-                                bbox=dict(facecolor='white', alpha=.82, edgecolor='none', pad=1.2))
+                        ax.text(
+                            len(chart_candles)-1.0, float(price),
+                            f' {label} {fmt_price(float(price))}',
+                            ha='right', va='bottom', fontsize=8.5, fontweight='bold', color=color,
+                            bbox=dict(facecolor='white', alpha=.82, edgecolor='none', pad=1.2)
+                        )
 
                     report_hline(entry, 'ВХОД', '#2563eb', '-', 2.0)
                     report_hline(sl, 'СТОП', '#dc2626', '--', 1.8)
@@ -1671,12 +1674,22 @@ def daily_report():
 
                 r_text = f'{float(r_multiple or 0):+.2f}R' if result in ('TP2','TP3','BE','SL') else '—'
 
-                ax.set_title(f'#{sid} · {coin}USDT · {side} · {strategy}', fontsize=14, fontweight='bold', pad=10)
-                fig.text(0.08, 0.955, f'Сигнал {datetime.fromtimestamp(created_ts, ZoneInfo(TIMEZONE)):%d.%m.%Y %H:%M} · {outcome}', fontsize=10.5, fontweight='bold')
-                fig.text(0.08, 0.025,
-                         f'Вход {fmt_price(entry_low)}–{fmt_price(entry_high)} · Стоп {fmt_price(sl)} · '
-                         f'TP1 {fmt_price(tp1)} · TP2 {fmt_price(tp2)} · TP3 {fmt_price(tp3)} · '
-                         f'Удержание {duration} · Результат {r_text}', fontsize=8.5)
+                ax.set_title(
+                    f'#{sid} · {coin}USDT · {side} · {strategy}',
+                    fontsize=14, fontweight='bold', pad=10
+                )
+                fig.text(
+                    0.08, 0.955,
+                    f'Сигнал {datetime.fromtimestamp(created_ts, ZoneInfo(TIMEZONE)):%d.%m.%Y %H:%M} · {outcome}',
+                    fontsize=10.5, fontweight='bold'
+                )
+                fig.text(
+                    0.08, 0.025,
+                    f'Вход {fmt_price(entry_low)}–{fmt_price(entry_high)} · Стоп {fmt_price(sl)} · '
+                    f'TP1 {fmt_price(tp1)} · TP2 {fmt_price(tp2)} · TP3 {fmt_price(tp3)} · '
+                    f'Удержание {duration} · Результат {r_text}',
+                    fontsize=8.5
+                )
                 plt.tight_layout(rect=[0.03, 0.06, 0.97, 0.92])
                 pdf.savefig(fig, bbox_inches='tight')
                 plt.close(fig)
@@ -1691,9 +1704,6 @@ def daily_report():
         except OSError:
             pass
 
-    # ------------------------------------------------------------
-    # SEND ONE DAILY REPORT MESSAGE
-    # ------------------------------------------------------------
     if not pdf_created:
         log.error('DAILY REPORT NOT SENT | PDF generation failed')
         return
@@ -1717,17 +1727,12 @@ def daily_report():
         f'📈 Win rate закрытых: <b>{win_rate:.1f}%</b>\n'
         f'💰 Результат: <b>{total_r:+.2f}R</b>'
         f'{best_line}\n\n'
-        f'📎 Вложение содержит полный аудит и график каждого сигнала за 24 часа.'
+        f'📎 PDF содержит полный аудит и отдельный график каждого сигнала за 24 часа.'
     )
 
     try:
         with open(pdf_path, 'rb') as f:
-            bot.send_document(
-                CHANNEL_ID,
-                f,
-                caption=caption,
-                parse_mode='HTML'
-            )
+            bot.send_document(CHANNEL_ID, f, caption=caption, parse_mode='HTML')
 
         with db_lock:
             db.execute(

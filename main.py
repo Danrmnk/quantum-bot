@@ -1208,22 +1208,28 @@ def daily_report():
     """
     Единственный ежедневный отчёт канала.
 
-    Этот блок отвечает ТОЛЬКО за статистику.
-    Поиск монет, стратегии, scoring, cooldown и отправка сигналов
-    находятся вне этого блока и здесь не изменяются.
+    ВАЖНО: этот блок отвечает только за дневную статистику и аудит
+    уже опубликованных сигналов. Поиск монет, стратегии, scoring,
+    cooldown и отправка новых сигналов находятся вне него.
 
-    Отчёт:
-      - отправляется один раз в сутки после 21:00 Europe/Kyiv;
-      - анализирует скользящие последние 24 часа;
-      - самостоятельно сверяет незакрытые сигналы с 5M свечами OKX;
-      - различает TP2/TP3, BE, SL, TIMEOUT, отсутствие входа и сделки,
-        которые ещё реально находятся в работе;
-      - показывает результат каждой сделки и статистику по стратегиям.
+    В 21:00 Europe/Kyiv формируется ОДИН PDF-файл за последние 24 часа:
+      - сводка по всем опубликованным сигналам;
+      - фактический вход / без входа;
+      - TP1 / TP2 / TP3;
+      - безубыток после TP1;
+      - стоп / timeout;
+      - результат в R;
+      - статистика по каждой стратегии;
+      - отдельная страница с графиком для каждого сигнала.
+
+    Перед формированием отчёта незакрытые записи повторно сверяются
+    с подтверждёнными 5M свечами OKX, чтобы после рестарта не получать
+    ложное "всё в работе".
     """
     n = local_now()
 
-    # Один отчёт на календарный день. Если процесс был перезапущен до/после
-    # 21:00, после восстановления он отправит отчёт только один раз.
+    # Один отчёт на календарный день. Если процесс был перезапущен,
+    # отчёт после 21:00 будет отправлен один раз после восстановления.
     if n.hour < 21:
         return
 
@@ -1243,7 +1249,7 @@ def daily_report():
     since = since_dt.timestamp()
     until = n.timestamp()
 
-    # В отчёт попадают именно сигналы, опубликованные за последние 24 часа.
+    # Только сигналы, опубликованные за последние 24 часа.
     with db_lock:
         rows = db.execute(
             """SELECT id, inst_id, direction, strategy, status, result,
@@ -1260,30 +1266,25 @@ def daily_report():
     # ------------------------------------------------------------
     # REPORT-ONLY RECONCILIATION
     # ------------------------------------------------------------
-    # Если lifecycle не успел закрыть сделку (например, из-за рестарта),
-    # отчёт сам проверяет рынок. Этот код находится внутри daily_report
-    # и не участвует в поиске/отборе новых сигналов.
+    # Ничего из поиска новых сигналов здесь не вызывается.
+    # Мы только проверяем уже существующие записи signals.
     def reconcile_row(r):
         (sid, inst_id, direction, strategy, status, result,
          h1, h2, h3, created_at, activated_at, expires_at,
          closed_at, r_multiple, entry_low, entry_high, sl,
          tp1, tp2, tp3) = r
 
-        terminal = {
-            'CLOSED_WIN': ('TP2', 'TP3'),
-            'CLOSED_LOSS': ('SL',),
-            'CLOSED_BE': ('BE',),
-            'TIMEOUT': ('TIMEOUT',),
-            'EXPIRED': ('NO_ENTRY',),
+        terminal_statuses = {
+            'CLOSED_WIN', 'CLOSED_LOSS', 'CLOSED_BE', 'TIMEOUT', 'EXPIRED'
         }
+        terminal_results = {'TP2', 'TP3', 'BE', 'SL', 'TIMEOUT', 'NO_ENTRY'}
 
-        # Уже закрытая сделка не пересчитывается.
-        if status in terminal:
-            return r
-        if result in ('TP2', 'TP3', 'BE', 'SL', 'TIMEOUT', 'NO_ENTRY'):
+        if status in terminal_statuses or result in terminal_results:
             return r
 
         try:
+            # 300 x 5M = до 25 часов — достаточно для rolling 24h отчёта
+            # плюс небольшой запас.
             candles = get_candles(inst_id, '5m', 300)
             if len(candles) < 3:
                 return r
@@ -1291,7 +1292,7 @@ def daily_report():
             long = direction == 'LONG'
             entry = (float(entry_low) + float(entry_high)) / 2.0
 
-            # Для сигнала без входа сначала ищем фактическое касание зоны.
+            # Сначала ищем фактическое касание зоны входа.
             entered = bool(activated_at)
             activation_ts = float(activated_at) if activated_at else None
 
@@ -1304,10 +1305,7 @@ def daily_report():
                 for c in signal_candles:
                     touched = (
                         float(entry_low) <= c.close <= float(entry_high)
-                        or (
-                            c.low <= float(entry_high)
-                            and c.high >= float(entry_low)
-                        )
+                        or (c.low <= float(entry_high) and c.high >= float(entry_low))
                     )
                     if touched:
                         entered = True
@@ -1325,8 +1323,7 @@ def daily_report():
                             'EXPIRED', 'NO_ENTRY',
                             int(h1 or 0), int(h2 or 0), int(h3 or 0),
                             created_at, activated_at, expires_at, closed_at,
-                            r_multiple, entry_low, entry_high, sl,
-                            tp1, tp2, tp3
+                            r_multiple, entry_low, entry_high, sl, tp1, tp2, tp3
                         )
                     return r
 
@@ -1338,7 +1335,6 @@ def daily_report():
             hit1 = bool(h1)
             hit2 = bool(h2)
             hit3 = bool(h3)
-
             terminal_status = status
             terminal_result = result or ''
             terminal_closed_at = closed_at
@@ -1350,9 +1346,8 @@ def daily_report():
                 hit_tp3 = c.high >= float(tp3) if long else c.low <= float(tp3)
                 hit_sl = c.low <= float(sl) if long else c.high >= float(sl)
 
-                # До TP1 первоначальный SL является стопом.
-                # Если TP1 и SL были в одной 5M свече, порядок неизвестен —
-                # консервативно засчитываем SL.
+                # Если TP1 и SL находятся в одной подтверждённой свече,
+                # порядок внутри свечи неизвестен — считаем SL первым.
                 if not hit1 and hit_tp1 and hit_sl:
                     terminal_status = 'CLOSED_LOSS'
                     terminal_result = 'SL'
@@ -1381,17 +1376,12 @@ def daily_report():
                     terminal_status = 'CLOSED_WIN'
                     terminal_result = 'TP3'
                     terminal_closed_at = c.ts / 1000.0
-                    terminal_r = (
-                        abs(float(tp3) - entry) / max(risk, 1e-12)
-                    )
+                    terminal_r = abs(float(tp3) - entry) / max(risk, 1e-12)
                     break
 
-                # После TP1 стоп считается перенесённым в BE.
-                # Возврат к цене входа закрывает сделку в безубыток.
+                # После TP1 стоп считается перенесённым в безубыток.
                 if hit1 and not hit2:
-                    returned_to_entry = (
-                        c.low <= entry if long else c.high >= entry
-                    )
+                    returned_to_entry = c.low <= entry if long else c.high >= entry
                     if returned_to_entry:
                         terminal_status = 'CLOSED_BE'
                         terminal_result = 'BE'
@@ -1399,29 +1389,23 @@ def daily_report():
                         terminal_r = 0.0
                         break
 
-                # TP2 — уже положительное закрытие по плану.
+                # TP2 — положительное закрытие по плану.
                 if hit2:
                     risk = abs(entry - float(sl))
                     terminal_status = 'CLOSED_WIN'
                     terminal_result = 'TP2'
                     terminal_closed_at = c.ts / 1000.0
-                    terminal_r = (
-                        abs(float(tp2) - entry) / max(risk, 1e-12)
-                    )
+                    terminal_r = abs(float(tp2) - entry) / max(risk, 1e-12)
                     break
 
-            # Если закрывающего события нет — не придумываем результат.
+            # Если закрывающего события нет — результат не придумываем.
             if terminal_result not in ('TP2', 'TP3', 'BE', 'SL', 'TIMEOUT'):
                 terminal_status = 'ACTIVE'
                 terminal_result = ''
                 terminal_closed_at = None
                 terminal_r = 0.0
 
-                # Лимит удержания применяется только после фактического входа.
-                if (
-                    activation_ts
-                    and until - activation_ts > ACTIVE_MAX_HOURS * 3600
-                ):
+                if activation_ts and until - activation_ts > ACTIVE_MAX_HOURS * 3600:
                     terminal_status = 'TIMEOUT'
                     terminal_result = 'TIMEOUT'
                     terminal_closed_at = until
@@ -1434,15 +1418,9 @@ def daily_report():
                            closed_at=?, r_multiple=?
                        WHERE id=?""",
                     (
-                        terminal_status,
-                        terminal_result,
-                        activation_ts,
-                        int(hit1),
-                        int(hit2),
-                        int(hit3),
-                        terminal_closed_at,
-                        float(terminal_r or 0.0),
-                        sid
+                        terminal_status, terminal_result, activation_ts,
+                        int(hit1), int(hit2), int(hit3),
+                        terminal_closed_at, float(terminal_r or 0.0), sid
                     )
                 )
                 db.commit()
@@ -1457,10 +1435,7 @@ def daily_report():
             )
 
         except Exception:
-            log.exception(
-                'DAILY REPORT RECONCILIATION FAILED | id=%s | %s',
-                sid, inst_id
-            )
+            log.exception('DAILY REPORT RECONCILIATION FAILED | id=%s | %s', sid, inst_id)
             return r
 
     reconciled_rows = [reconcile_row(r) for r in rows]
@@ -1473,48 +1448,22 @@ def daily_report():
     def is_entry(r):
         return (
             r[10] is not None
-            or r[4] in ('ACTIVE', 'CLOSED_WIN', 'CLOSED_LOSS',
-                        'CLOSED_BE', 'TIMEOUT')
+            or r[4] in ('ACTIVE', 'CLOSED_WIN', 'CLOSED_LOSS', 'CLOSED_BE', 'TIMEOUT')
         )
 
     entries = sum(1 for r in reconciled_rows if is_entry(r))
-
     tp1_count = sum(1 for r in reconciled_rows if int(r[6] or 0))
-    tp2_count = sum(
-        1 for r in reconciled_rows
-        if r[5] == 'TP2' or int(r[7] or 0)
-    )
-    tp3_count = sum(
-        1 for r in reconciled_rows
-        if r[5] == 'TP3' or int(r[8] or 0)
-    )
+    tp2_count = sum(1 for r in reconciled_rows if r[5] == 'TP2' or int(r[7] or 0))
+    tp3_count = sum(1 for r in reconciled_rows if r[5] == 'TP3' or int(r[8] or 0))
     be_count = sum(1 for r in reconciled_rows if r[5] == 'BE')
-    stop_count = sum(
-        1 for r in reconciled_rows
-        if r[5] == 'SL' or r[4] == 'CLOSED_LOSS'
-    )
-    timeout_count = sum(
-        1 for r in reconciled_rows
-        if r[4] == 'TIMEOUT' or r[5] == 'TIMEOUT'
-    )
-    no_entry_count = sum(
-        1 for r in reconciled_rows
-        if r[4] == 'EXPIRED' or r[5] == 'NO_ENTRY'
-    )
-    open_count = sum(
-        1 for r in reconciled_rows
-        if r[4] in ('READY', 'ACTIVE')
-    )
+    stop_count = sum(1 for r in reconciled_rows if r[5] == 'SL' or r[4] == 'CLOSED_LOSS')
+    timeout_count = sum(1 for r in reconciled_rows if r[4] == 'TIMEOUT' or r[5] == 'TIMEOUT')
+    no_entry_count = sum(1 for r in reconciled_rows if r[4] == 'EXPIRED' or r[5] == 'NO_ENTRY')
+    open_count = sum(1 for r in reconciled_rows if r[4] in ('READY', 'ACTIVE'))
 
     positive_count = tp2_count + tp3_count
     closed_count = positive_count + be_count + stop_count + timeout_count
-
-    # Win rate — только среди реально закрытых сделок.
-    win_rate = (
-        positive_count / closed_count * 100
-        if closed_count else 0.0
-    )
-
+    win_rate = positive_count / closed_count * 100 if closed_count else 0.0
     total_r = sum(
         float(r[13] or 0.0)
         for r in reconciled_rows
@@ -1522,60 +1471,18 @@ def daily_report():
     )
 
     # ------------------------------------------------------------
-    # REPORT TEXT
+    # STRATEGY STATISTICS
     # ------------------------------------------------------------
-    lines = [
-        '📊 <b>QUANTUM — ДНЕВНОЙ ОТЧЁТ</b>',
-        f'🕘 <b>Период:</b> '
-        f'{escape(since_dt.strftime("%d.%m.%Y %H:%M"))} — '
-        f'{escape(n.strftime("%d.%m.%Y %H:%M"))}',
-        f'🌍 <b>Часовой пояс:</b> {escape(TIMEZONE)}',
-        '',
-        '━━━━━━━━━━━━━━━━━━━━',
-        '<b>ИТОГ ЗА 24 ЧАСА</b>',
-        '━━━━━━━━━━━━━━━━━━━━',
-        f'📨 Сигналов опубликовано: <b>{total}</b>',
-        f'🎯 Реальных входов: <b>{entries}</b>',
-        f'🟢 Плюсовых закрытий: <b>{positive_count}</b>',
-        f'⚖️ Закрыто в безубыток: <b>{be_count}</b>',
-        f'🔴 Закрыто по стопу: <b>{stop_count}</b>',
-        f'⚪ Закрыто по времени: <b>{timeout_count}</b>',
-        f'⌛ Без входа: <b>{no_entry_count}</b>',
-        f'🔄 Всё ещё в работе: <b>{open_count}</b>',
-        '',
-        f'🟢 TP1 достигнут: <b>{tp1_count}</b>',
-        f'🚀 TP2 достигнут: <b>{tp2_count}</b>',
-        f'🏁 TP3 достигнут: <b>{tp3_count}</b>',
-        f'📈 Win rate закрытых: <b>{win_rate:.1f}%</b>',
-        f'💰 Суммарный результат: <b>{total_r:+.2f}R</b>',
-        '',
-        '━━━━━━━━━━━━━━━━━━━━',
-        '<b>РЕЗУЛЬТАТ ПО СТРАТЕГИЯМ</b>',
-        '━━━━━━━━━━━━━━━━━━━━',
-    ]
-
     strategy_stats = {}
     for r in reconciled_rows:
         name = r[3] or 'Без названия'
-        st = strategy_stats.setdefault(
-            name,
-            {
-                'signals': 0,
-                'entries': 0,
-                'positive': 0,
-                'be': 0,
-                'sl': 0,
-                'timeout': 0,
-                'no_entry': 0,
-                'r': 0.0
-            }
-        )
-
+        st = strategy_stats.setdefault(name, {
+            'signals': 0, 'entries': 0, 'positive': 0, 'be': 0,
+            'sl': 0, 'timeout': 0, 'no_entry': 0, 'r': 0.0
+        })
         st['signals'] += 1
-
         if is_entry(r):
             st['entries'] += 1
-
         if r[5] in ('TP2', 'TP3'):
             st['positive'] += 1
         if r[5] == 'BE':
@@ -1586,163 +1493,239 @@ def daily_report():
             st['timeout'] += 1
         if r[4] == 'EXPIRED' or r[5] == 'NO_ENTRY':
             st['no_entry'] += 1
-
         if r[5] in ('TP2', 'TP3', 'BE', 'SL'):
             st['r'] += float(r[13] or 0.0)
 
-    if strategy_stats:
-        ranked = sorted(
-            strategy_stats.items(),
-            key=lambda x: (
-                x[1]['r'],
-                x[1]['positive'],
-                -x[1]['sl']
-            ),
-            reverse=True
-        )
-
-        for name, st in ranked:
-            closed = (
-                st['positive']
-                + st['be']
-                + st['sl']
-                + st['timeout']
-            )
-            wr = st['positive'] / closed * 100 if closed else 0.0
-
-            lines.append(
-                f'• <b>{escape(str(name))}</b>\n'
-                f'  Сигналов: {st["signals"]} · '
-                f'входов: {st["entries"]}\n'
-                f'  🟢 плюс: {st["positive"]} · '
-                f'⚖️ BE: {st["be"]} · '
-                f'🔴 стоп: {st["sl"]} · '
-                f'⚪ время: {st["timeout"]} · '
-                f'⌛ без входа: {st["no_entry"]}\n'
-                f'  Win rate: {wr:.1f}% · '
-                f'Результат: {st["r"]:+.2f}R'
-            )
-
-    if strategy_stats:
-        best_name, best = max(
-            strategy_stats.items(),
-            key=lambda x: (
-                x[1]['r'],
-                x[1]['positive'],
-                -x[1]['sl']
-            )
-        )
-        lines.extend([
-            '',
-            '🏆 <b>ЛУЧШАЯ СТРАТЕГИЯ ЗА 24 ЧАСА</b>',
-            f'<b>{escape(str(best_name))}</b>',
-            f'Результат: <b>{best["r"]:+.2f}R</b> · '
-            f'плюсовых: <b>{best["positive"]}</b> · '
-            f'стопов: <b>{best["sl"]}</b>'
-        ])
-    else:
-        lines.append('За последние 24 часа сигналов не было.')
+    ranked = sorted(
+        strategy_stats.items(),
+        key=lambda x: (x[1]['r'], x[1]['positive'], -x[1]['sl']),
+        reverse=True
+    )
 
     # ------------------------------------------------------------
-    # DEAL-BY-DEAL AUDIT
+    # PDF REPORT WITH ONE CHART PAGE PER SIGNAL
     # ------------------------------------------------------------
-    lines.extend([
-        '',
-        '━━━━━━━━━━━━━━━━━━━━',
-        '<b>ДЕТАЛЬНАЯ СВЕРКА СДЕЛОК</b>',
-        '━━━━━━━━━━━━━━━━━━━━'
-    ])
-
-    if reconciled_rows:
-        for r in reconciled_rows:
-            (sid, inst_id, direction, strategy, status, result,
-             h1, h2, h3, created_at, activated_at, expires_at,
-             closed_at, r_multiple, entry_low, entry_high,
-             sl, tp1, tp2, tp3) = r
-
-            coin = escape(get_coin(inst_id or ''))
-            side = '🟢 LONG' if direction == 'LONG' else '🔴 SHORT'
-
-            created = datetime.fromtimestamp(
-                float(created_at),
-                ZoneInfo(TIMEZONE)
-            ).strftime('%H:%M')
-
-            if result == 'TP3' or int(h3 or 0):
-                outcome = '🏁 TP3 · ПЛЮС'
-            elif result == 'TP2':
-                outcome = '🚀 TP2 · ПЛЮС'
-            elif result == 'BE':
-                outcome = '⚖️ БЕЗУБЫТОК'
-            elif result == 'SL' or status == 'CLOSED_LOSS':
-                outcome = '🔴 СТОП'
-            elif result == 'TIMEOUT' or status == 'TIMEOUT':
-                outcome = '⚪ TIMEOUT'
-            elif status == 'EXPIRED':
-                outcome = '⌛ БЕЗ ВХОДА'
-            elif status == 'ACTIVE':
-                if int(h2 or 0):
-                    outcome = '🚀 TP2 · В РАБОТЕ'
-                elif int(h1 or 0):
-                    outcome = '🟢 TP1 · В РАБОТЕ'
-                else:
-                    outcome = '🔄 В РАБОТЕ'
-            elif status == 'READY':
-                outcome = '⏳ ОЖИДАЕТ ВХОДА'
-            elif int(h2 or 0):
-                outcome = '🚀 TP2 ДОСТИГНУТ'
-            elif int(h1 or 0):
-                outcome = '🟢 TP1 ДОСТИГНУТ'
-            else:
-                outcome = escape(str(result or status or 'НЕ ОПРЕДЕЛЕНО'))
-
-            duration = ''
-            if activated_at:
-                end_ts = float(closed_at) if closed_at else until
-                minutes = max(
-                    0,
-                    int((end_ts - float(activated_at)) / 60)
-                )
-                duration = (
-                    f' · {minutes // 60}ч {minutes % 60:02d}м'
-                )
-
-            r_text = ''
-            if result in ('TP2', 'TP3', 'BE', 'SL'):
-                r_text = f' · {float(r_multiple or 0):+.2f}R'
-
-            lines.append(
-                f'#{sid} · {created} · <b>{coin}</b> · {side} · '
-                f'{escape(str(strategy or "—"))} · '
-                f'<b>{outcome}</b>{duration}{r_text}'
-            )
-    else:
-        lines.append('Нет сигналов за последние 24 часа.')
-
-    # Telegram: разбиваем отчёт только между строками, не теряя сделки.
-    chunks = []
-    current = ''
-
-    for line in lines:
-        candidate = line if not current else current + '\n' + line
-        if len(candidate) > 3800 and current:
-            chunks.append(current)
-            current = line
-        else:
-            current = candidate
-
-    if current:
-        chunks.append(current)
+    pdf_path = f'/tmp/quantum_daily_{day_key}.pdf'
+    pdf_created = False
 
     try:
-        for index, chunk in enumerate(chunks, start=1):
-            prefix = (
-                f'<b>Часть {index}/{len(chunks)}</b>\n'
-                if len(chunks) > 1 else ''
+        from matplotlib.backends.backend_pdf import PdfPages
+
+        with PdfPages(pdf_path) as pdf:
+            # Summary page.
+            fig = plt.figure(figsize=(11.7, 8.3), dpi=110)
+            fig.patch.set_facecolor('white')
+            fig.text(0.06, 0.93, 'QUANTUM | VIP SCANNER', fontsize=22, fontweight='bold')
+            fig.text(0.06, 0.885, 'ДНЕВНОЙ АУДИТ СИГНАЛОВ · 24 ЧАСА', fontsize=14, fontweight='bold')
+            fig.text(0.06, 0.845, f'{since_dt:%d.%m.%Y %H:%M} — {n:%d.%m.%Y %H:%M} · {TIMEZONE}', fontsize=9.5)
+
+            summary = (
+                f'Сигналов опубликовано: {total}\n'
+                f'Фактических входов: {entries}\n'
+                f'Плюсовых закрытий (TP2/TP3): {positive_count}\n'
+                f'Безубыток после TP1: {be_count}\n'
+                f'Стоп: {stop_count}\n'
+                f'TIMEOUT: {timeout_count}\n'
+                f'Без входа: {no_entry_count}\n'
+                f'Остались в работе: {open_count}\n\n'
+                f'TP1 достигнут: {tp1_count}\nTP2 достигнут: {tp2_count}\nTP3 достигнут: {tp3_count}\n'
+                f'Win rate закрытых: {win_rate:.1f}%\nСуммарный результат: {total_r:+.2f}R'
             )
-            bot.send_message(
+            fig.text(0.07, 0.74, summary, fontsize=13, va='top', linespacing=1.65)
+
+            y = 0.72
+            fig.text(0.52, y, 'РЕЗУЛЬТАТ ПО СТРАТЕГИЯМ', fontsize=13, fontweight='bold')
+            y -= 0.055
+            if ranked:
+                for name, st in ranked:
+                    closed = st['positive'] + st['be'] + st['sl'] + st['timeout']
+                    wr = st['positive'] / closed * 100 if closed else 0.0
+                    block = (
+                        f'{name}\n'
+                        f'  сигналов {st["signals"]} · входов {st["entries"]} · '
+                        f'плюс {st["positive"]} · BE {st["be"]} · стоп {st["sl"]}\n'
+                        f'  Win rate {wr:.1f}% · результат {st["r"]:+.2f}R'
+                    )
+                    fig.text(0.52, y, block, fontsize=10.5, va='top', linespacing=1.35)
+                    y -= 0.12
+                best_name, best = ranked[0]
+                fig.text(0.52, max(0.08, y), f'ЛУЧШАЯ: {best_name} · {best["r"]:+.2f}R', fontsize=12, fontweight='bold')
+            else:
+                fig.text(0.52, y, 'За последние 24 часа сигналов не было.', fontsize=11)
+
+            fig.text(0.06, 0.055, 'Аудит закрытия: подтверждённые 5M свечи OKX. Если TP и SL попали в одну свечу до TP1 — консервативно засчитывается SL.', fontsize=8.5)
+            pdf.savefig(fig, bbox_inches='tight')
+            plt.close(fig)
+
+            # One page per signal. The candles are taken around the signal time,
+            # not from the current chart, so the report preserves the market context
+            # that existed when the signal was published.
+            for r in reconciled_rows:
+                (sid, inst_id, direction, strategy, status, result,
+                 h1, h2, h3, created_at, activated_at, expires_at,
+                 closed_at, r_multiple, entry_low, entry_high,
+                 sl, tp1, tp2, tp3) = r
+
+                coin = get_coin(inst_id or '')
+                entry = (float(entry_low) + float(entry_high)) / 2.0
+                created_ts = float(created_at)
+                close_ts = float(closed_at) if closed_at else None
+
+                try:
+                    candles = get_candles(inst_id, '5m', 300)
+                    idx = min(
+                        range(len(candles)),
+                        key=lambda i: abs(candles[i].ts / 1000.0 - created_ts)
+                    ) if candles else 0
+                    lo_i = max(0, idx - 60)
+                    hi_i = min(len(candles), idx + 36)
+                    chart_candles = candles[lo_i:hi_i]
+                except Exception:
+                    chart_candles = []
+
+                fig, ax = plt.subplots(figsize=(11.7, 7.2), dpi=110)
+                fig.patch.set_facecolor('white')
+                ax.set_facecolor('white')
+
+                if chart_candles:
+                    width = 0.58
+                    for i, c in enumerate(chart_candles):
+                        rising = c.close >= c.open
+                        candle_color = '#16a34a' if rising else '#dc2626'
+                        ax.vlines(i, c.low, c.high, color=candle_color, linewidth=0.9)
+                        y0 = min(c.open, c.close)
+                        hh = max(abs(c.close-c.open), c.close*0.00002)
+                        ax.add_patch(Rectangle((i-width/2, y0), width, hh,
+                                               facecolor=candle_color, edgecolor=candle_color, linewidth=.4))
+
+                    def report_hline(price, label, color, ls='--', lw=1.5):
+                        ax.axhline(float(price), color=color, linewidth=lw, linestyle=ls, zorder=4)
+                        ax.text(len(chart_candles)-1.0, float(price), f' {label} {fmt_price(float(price))}',
+                                ha='right', va='bottom', fontsize=8.5, fontweight='bold', color=color,
+                                bbox=dict(facecolor='white', alpha=.82, edgecolor='none', pad=1.2))
+
+                    report_hline(entry, 'ВХОД', '#2563eb', '-', 2.0)
+                    report_hline(sl, 'СТОП', '#dc2626', '--', 1.8)
+                    report_hline(tp1, 'TP1', '#16a34a', ':', 1.3)
+                    report_hline(tp2, 'TP2', '#16a34a', ':', 1.5)
+                    report_hline(tp3, 'TP3', '#15803d', '--', 1.7)
+                    ax.axhspan(float(entry_low), float(entry_high), alpha=.08, color='#2563eb', zorder=1)
+
+                    signal_idx = min(
+                        range(len(chart_candles)),
+                        key=lambda i: abs(chart_candles[i].ts / 1000.0 - created_ts)
+                    )
+                    ax.scatter([signal_idx], [entry], s=48, marker='o', zorder=7, color='#111827')
+                    ax.annotate('СИГНАЛ', (signal_idx, entry), xytext=(0, 16),
+                                textcoords='offset points', ha='center', fontsize=8.5, fontweight='bold')
+
+                    if close_ts:
+                        close_idx = min(
+                            range(len(chart_candles)),
+                            key=lambda i: abs(chart_candles[i].ts / 1000.0 - close_ts)
+                        )
+                        close_price = (
+                            float(tp3) if result == 'TP3' else
+                            float(tp2) if result == 'TP2' else
+                            entry if result == 'BE' else
+                            float(sl) if result == 'SL' else
+                            entry
+                        )
+                        ax.scatter([close_idx], [close_price], s=58, marker='X', zorder=8, color='#111827')
+                        ax.annotate('ЗАКРЫТИЕ', (close_idx, close_price), xytext=(0, -20),
+                                    textcoords='offset points', ha='center', fontsize=8.5, fontweight='bold')
+
+                    ax.set_xlim(-1, len(chart_candles))
+                    ax.grid(True, alpha=.14)
+                    ax.tick_params(labelsize=8)
+                else:
+                    ax.text(0.5, 0.5, 'Не удалось получить 5M свечи для графика',
+                            transform=ax.transAxes, ha='center', va='center', fontsize=13)
+                    ax.set_axis_off()
+
+                side = 'LONG' if direction == 'LONG' else 'SHORT'
+                if result == 'TP3' or int(h3 or 0):
+                    outcome = 'TP3 · ПЛЮС'
+                elif result == 'TP2':
+                    outcome = 'TP2 · ПЛЮС'
+                elif result == 'BE':
+                    outcome = 'BE · БЕЗУБЫТОК'
+                elif result == 'SL' or status == 'CLOSED_LOSS':
+                    outcome = 'SL · СТОП'
+                elif result == 'TIMEOUT' or status == 'TIMEOUT':
+                    outcome = 'TIMEOUT'
+                elif status == 'EXPIRED':
+                    outcome = 'NO ENTRY · БЕЗ ВХОДА'
+                elif status == 'ACTIVE':
+                    outcome = 'В РАБОТЕ'
+                elif status == 'READY':
+                    outcome = 'ОЖИДАЕТ ВХОДА'
+                else:
+                    outcome = result or status or 'НЕ ОПРЕДЕЛЕНО'
+
+                duration = '—'
+                if activated_at:
+                    end_ts = close_ts if close_ts else until
+                    mins = max(0, int((end_ts - float(activated_at)) / 60))
+                    duration = f'{mins//60}ч {mins%60:02d}м'
+
+                r_text = f'{float(r_multiple or 0):+.2f}R' if result in ('TP2','TP3','BE','SL') else '—'
+
+                ax.set_title(f'#{sid} · {coin}USDT · {side} · {strategy}', fontsize=14, fontweight='bold', pad=10)
+                fig.text(0.08, 0.955, f'Сигнал {datetime.fromtimestamp(created_ts, ZoneInfo(TIMEZONE)):%d.%m.%Y %H:%M} · {outcome}', fontsize=10.5, fontweight='bold')
+                fig.text(0.08, 0.025,
+                         f'Вход {fmt_price(entry_low)}–{fmt_price(entry_high)} · Стоп {fmt_price(sl)} · '
+                         f'TP1 {fmt_price(tp1)} · TP2 {fmt_price(tp2)} · TP3 {fmt_price(tp3)} · '
+                         f'Удержание {duration} · Результат {r_text}', fontsize=8.5)
+                plt.tight_layout(rect=[0.03, 0.06, 0.97, 0.92])
+                pdf.savefig(fig, bbox_inches='tight')
+                plt.close(fig)
+
+        pdf_created = True
+
+    except Exception:
+        log.exception('DAILY PDF REPORT FAILED')
+        try:
+            if os.path.exists(pdf_path):
+                os.remove(pdf_path)
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------
+    # SEND ONE DAILY REPORT MESSAGE
+    # ------------------------------------------------------------
+    if not pdf_created:
+        log.error('DAILY REPORT NOT SENT | PDF generation failed')
+        return
+
+    best_line = ''
+    if ranked:
+        best_name, best = ranked[0]
+        best_line = f'\n🏆 Лучшая стратегия: <b>{escape(str(best_name))}</b> · {best["r"]:+.2f}R'
+
+    caption = (
+        f'📊 <b>QUANTUM — ДНЕВНОЙ ОТЧЁТ</b>\n'
+        f'🕘 {since_dt:%d.%m.%Y %H:%M} — {n:%d.%m.%Y %H:%M}\n\n'
+        f'📨 Сигналов: <b>{total}</b>\n'
+        f'🎯 Входов: <b>{entries}</b>\n'
+        f'🟢 Плюсовых: <b>{positive_count}</b>\n'
+        f'⚖️ Безубыток: <b>{be_count}</b>\n'
+        f'🔴 Стопов: <b>{stop_count}</b>\n'
+        f'⚪ TIMEOUT: <b>{timeout_count}</b>\n'
+        f'⌛ Без входа: <b>{no_entry_count}</b>\n'
+        f'🔄 В работе: <b>{open_count}</b>\n'
+        f'📈 Win rate закрытых: <b>{win_rate:.1f}%</b>\n'
+        f'💰 Результат: <b>{total_r:+.2f}R</b>'
+        f'{best_line}\n\n'
+        f'📎 Вложение содержит полный аудит и график каждого сигнала за 24 часа.'
+    )
+
+    try:
+        with open(pdf_path, 'rb') as f:
+            bot.send_document(
                 CHANNEL_ID,
-                prefix + chunk,
+                f,
+                caption=caption,
                 parse_mode='HTML'
             )
 
@@ -1754,23 +1737,21 @@ def daily_report():
             db.commit()
 
         log.info(
-            'DAILY REPORT SENT | date=%s | signals=%d | entries=%d | '
-            'positive=%d | be=%d | stop=%d | timeout=%d | '
-            'no_entry=%d | open=%d | R=%.2f',
-            day_key,
-            total,
-            entries,
-            positive_count,
-            be_count,
-            stop_count,
-            timeout_count,
-            no_entry_count,
-            open_count,
-            total_r
+            'DAILY REPORT SENT | date=%s | signals=%d | entries=%d | positive=%d | '
+            'be=%d | stop=%d | timeout=%d | no_entry=%d | open=%d | R=%.2f | pdf=%s',
+            day_key, total, entries, positive_count, be_count, stop_count,
+            timeout_count, no_entry_count, open_count, total_r, pdf_path
         )
 
     except Exception:
-        log.exception('DAILY REPORT FAILED')
+        log.exception('DAILY REPORT SEND FAILED')
+    finally:
+        try:
+            if os.path.exists(pdf_path):
+                os.remove(pdf_path)
+        except OSError:
+            pass
+
 
 # ============================================================
 # HEALTH / STARTUP

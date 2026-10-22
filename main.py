@@ -3,6 +3,7 @@ import time
 import math
 import logging
 import sqlite3
+import json
 from html import escape
 import threading
 from dataclasses import dataclass, field
@@ -182,8 +183,11 @@ SIGNAL_COLUMNS = {
     'entry_low':'REAL', 'entry_high':'REAL', 'sl':'REAL', 'tp1':'REAL', 'tp2':'REAL', 'tp3':'REAL',
     'score':'INTEGER', 'status':'TEXT', 'created_at':'REAL', 'activated_at':'REAL',
     'expires_at':'REAL', 'tp1_hit':'INTEGER DEFAULT 0', 'tp2_hit':'INTEGER DEFAULT 0',
-    'tp3_hit':'INTEGER DEFAULT 0', 'result':'TEXT DEFAULT \'\'', 'closed_at':'REAL',
-    'r_multiple':'REAL DEFAULT 0'
+    'tp3_hit':'INTEGER DEFAULT 0', 'result':'TEXT DEFAULT ''', 'closed_at':'REAL',
+    'r_multiple':'REAL DEFAULT 0',
+    'change24':'REAL DEFAULT 0', 'range24':'REAL DEFAULT 0',
+    'atr5_pct':'REAL DEFAULT 0', 'atr15_pct':'REAL DEFAULT 0',
+    'volume_ratio':'REAL DEFAULT 0', 'risk_pct':'REAL DEFAULT 0'
 }
 
 
@@ -209,6 +213,19 @@ def init_db():
         )''')
         db.execute('''CREATE TABLE IF NOT EXISTS bot_state (
             key TEXT PRIMARY KEY, value TEXT NOT NULL
+        )''')
+        db.execute('''CREATE TABLE IF NOT EXISTS learning_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_at REAL NOT NULL,
+            window_hours INTEGER NOT NULL,
+            strategy TEXT NOT NULL,
+            samples INTEGER NOT NULL,
+            wins INTEGER NOT NULL,
+            losses INTEGER NOT NULL,
+            be INTEGER NOT NULL,
+            timeouts INTEGER NOT NULL,
+            total_r REAL NOT NULL,
+            adjustment REAL NOT NULL
         )''')
         db.commit()
 
@@ -920,13 +937,26 @@ def on_vote(call):
 
 def start_telegram_polling():
     def runner():
-        try:
-            log.info('TELEGRAM POLLING START')
-            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-        except Exception:
-            log.exception('TELEGRAM POLLING STOPPED')
+        delay = 5
+        while True:
+            try:
+                log.info('TELEGRAM POLLING START')
+                # Safe for polling deployments; do not discard pending updates here.
+                bot.delete_webhook(drop_pending_updates=False)
+                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+                log.warning('TELEGRAM POLLING RETURNED | restarting in %ss', delay)
+            except Exception as exc:
+                msg = str(exc)
+                if '409' in msg or 'Conflict' in msg or 'getUpdates' in msg:
+                    log.error('TELEGRAM 409/GETUPDATES CONFLICT | another polling instance may be active; retrying in %ss', delay)
+                else:
+                    log.exception('TELEGRAM POLLING ERROR | retrying in %ss', delay)
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
     t=threading.Thread(target=runner,name='telegram-polling',daemon=True)
     t.start()
+
 
 # ============================================================
 # CHART
@@ -1008,9 +1038,11 @@ def build_signal_text(s:Setup)->str:
 def insert_signal(s:Setup)->int:
     created=now_ts()
     with db_lock:
-        cur=db.execute('''INSERT INTO signals(inst_id,direction,strategy,level,entry_low,entry_high,sl,tp1,tp2,tp3,score,status,created_at,expires_at)
-                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                       (s.inst_id,s.direction,s.strategy,s.level,s.entry_low,s.entry_high,s.sl,s.tp1,s.tp2,s.tp3,s.score,'READY',created,created+READY_TTL_MINUTES*60))
+        risk_pct = abs(((s.entry_low+s.entry_high)/2.0) - s.sl) / max((s.entry_low+s.entry_high)/2.0, 1e-12) * 100
+        cur=db.execute('''INSERT INTO signals(inst_id,direction,strategy,level,entry_low,entry_high,sl,tp1,tp2,tp3,score,status,created_at,expires_at,change24,range24,atr5_pct,atr15_pct,volume_ratio,risk_pct)
+                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                       (s.inst_id,s.direction,s.strategy,s.level,s.entry_low,s.entry_high,s.sl,s.tp1,s.tp2,s.tp3,s.score,'READY',created,created+READY_TTL_MINUTES*60,
+                        s.change24,s.range24,s.atr5_pct,s.atr15_pct,s.volume_ratio,risk_pct))
         sid=cur.lastrowid; db.commit()
     return sid
 
@@ -1041,10 +1073,9 @@ def send_signal(s:Setup)->bool:
 # ============================================================
 
 def send_update(text:str):
-    try:
-        bot.send_message(CHANNEL_ID,text,parse_mode='HTML')
-    except Exception:
-        log.exception('TELEGRAM UPDATE FAILED')
+    # VIP channel policy: no instant TP/SL/TIMEOUT reports.
+    # Lifecycle results remain in SQLite and are included only in the 24H audit.
+    log.info('LIFECYCLE UPDATE SUPPRESSED | %s', text.replace('\n', ' | '))
 
 
 def price_in_entry(s:Setup, price:float)->bool:
@@ -1187,6 +1218,10 @@ def scan_market():
         except Exception as exc:
             log.warning('CANDIDATE FAILED | %s | %s',iid,exc)
 
+    # Self-learning is applied only after strategy builders have produced raw setups.
+    # Universe discovery and the strategy builders themselves are intentionally untouched.
+    apply_learning_to_raw(raw)
+
     # Only one setup per instrument. This avoids sending four competing signals.
     best={}
     for s in raw:
@@ -1199,6 +1234,112 @@ def scan_market():
         if not can_send(s.inst_id):
             continue
         send_signal(s)
+
+# ============================================================
+# SELF-LEARNING ENGINE — REPORT-ONLY DATA + BOUNDED ADAPTATION
+# ============================================================
+
+LEARNING_MIN_SAMPLES = int(os.getenv('LEARNING_MIN_SAMPLES', '12'))
+LEARNING_MAX_ADJUSTMENT = float(os.getenv('LEARNING_MAX_ADJUSTMENT', '4.0'))
+LEARNING_WINDOW_DAYS = int(os.getenv('LEARNING_WINDOW_DAYS', '30'))
+LEARNING_MIN_R = float(os.getenv('LEARNING_MIN_R', '0.0'))
+
+
+def _learning_rows(hours: int = 24):
+    since = now_ts() - hours * 3600
+    with db_lock:
+        return db.execute(
+            """SELECT strategy, result, r_multiple, volume_ratio, atr5_pct, atr15_pct,
+                      change24, range24, risk_pct, created_at
+               FROM signals
+               WHERE created_at >= ? AND created_at <= ?
+                 AND status NOT IN ('SEND_FAILED','READY','EXPIRED')
+               ORDER BY created_at ASC""",
+            (since, now_ts())
+        ).fetchall()
+
+
+def _bounded_adjustment(total_r: float, wins: int, losses: int, samples: int) -> float:
+    if samples < LEARNING_MIN_SAMPLES:
+        return 0.0
+    wr = wins / max(wins + losses, 1)
+    # Conservative: reward positive expectancy, penalize negative expectancy.
+    expectancy = total_r / max(samples, 1)
+    raw = expectancy * 2.0 + (wr - 0.5) * 4.0
+    return clamp(raw, -LEARNING_MAX_ADJUSTMENT, LEARNING_MAX_ADJUSTMENT)
+
+
+def run_learning_engine() -> Dict[str, float]:
+    """Analyze recent outcomes and update bounded strategy adjustments.
+
+    This layer never changes universe construction or any strategy builder.
+    It only changes ranking of already-created raw setups after enough evidence.
+    No single day can move a strategy by more than LEARNING_MAX_ADJUSTMENT points.
+    """
+    rows = _learning_rows(24 * LEARNING_WINDOW_DAYS)
+    by_strategy = {}
+    for strategy, result, r_multiple, *_ in rows:
+        if result not in ('TP2','TP3','BE','SL','TIMEOUT'):
+            continue
+        st = by_strategy.setdefault(strategy, {'samples':0,'wins':0,'losses':0,'be':0,'timeouts':0,'r':0.0})
+        st['samples'] += 1
+        st['r'] += float(r_multiple or 0.0)
+        if result in ('TP2','TP3'): st['wins'] += 1
+        elif result == 'SL': st['losses'] += 1
+        elif result == 'BE': st['be'] += 1
+        elif result == 'TIMEOUT': st['timeouts'] += 1
+
+    adjustments = {}
+    now = now_ts()
+    with db_lock:
+        for strategy, st in by_strategy.items():
+            adj = _bounded_adjustment(st['r'], st['wins'], st['losses'], st['samples'])
+            adjustments[strategy] = adj
+            db.execute(
+                "INSERT INTO learning_history(run_at,window_hours,strategy,samples,wins,losses,be,timeouts,total_r,adjustment) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (now, 24*LEARNING_WINDOW_DAYS, strategy, st['samples'], st['wins'], st['losses'], st['be'], st['timeouts'], st['r'], adj)
+            )
+        db.execute(
+            "INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)",
+            ('learning_adjustments', json.dumps(adjustments, ensure_ascii=False, sort_keys=True))
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)",
+            ('learning_last_run', str(now))
+        )
+        db.commit()
+
+    if adjustments:
+        log.info('LEARNING | window=%dd | adjustments=%s', LEARNING_WINDOW_DAYS, adjustments)
+    else:
+        log.info('LEARNING | insufficient closed history for adaptation')
+    return adjustments
+
+
+def get_learning_adjustment(strategy: str) -> float:
+    try:
+        with db_lock:
+            row = db.execute("SELECT value FROM bot_state WHERE key='learning_adjustments'").fetchone()
+        if not row:
+            return 0.0
+        data = json.loads(row[0])
+        return float(data.get(strategy, 0.0))
+    except Exception:
+        log.exception('LEARNING READ FAILED')
+        return 0.0
+
+
+def apply_learning_to_raw(raw: List[Setup]) -> List[Setup]:
+    """Rank raw setups using bounded historical strategy evidence.
+
+    Universe, candidate selection and all strategy builders remain untouched.
+    """
+    for s in raw:
+        adj = get_learning_adjustment(s.strategy)
+        if adj:
+            s.score = int(clamp(s.score + adj, 0, 99))
+    return raw
+
 
 # ============================================================
 # DAILY REPORT — once a day at 21:00, rolling last 24 hours
@@ -1436,6 +1577,9 @@ def daily_report():
             return r
 
     reconciled_rows = [reconcile_row(r) for r in rows]
+    # Learn only when the daily report itself is due, once per calendar day.
+    if not (row and row[0] == day_key):
+        run_learning_engine()
     total = len(reconciled_rows)
 
     def is_entry(r):
@@ -1446,15 +1590,15 @@ def daily_report():
 
     entries = sum(1 for r in reconciled_rows if is_entry(r))
     tp1_count = sum(1 for r in reconciled_rows if int(r[6] or 0))
-    tp2_count = sum(1 for r in reconciled_rows if r[5] == 'TP2' or int(r[7] or 0))
-    tp3_count = sum(1 for r in reconciled_rows if r[5] == 'TP3' or int(r[8] or 0))
+    # Terminal outcome is mutually exclusive: one signal -> one final bucket.
+    positive_count = sum(1 for r in reconciled_rows if r[5] in ('TP2', 'TP3'))
+    tp2_count = sum(1 for r in reconciled_rows if r[5] == 'TP2')
+    tp3_count = sum(1 for r in reconciled_rows if r[5] == 'TP3')
     be_count = sum(1 for r in reconciled_rows if r[5] == 'BE')
-    stop_count = sum(1 for r in reconciled_rows if r[5] == 'SL' or r[4] == 'CLOSED_LOSS')
-    timeout_count = sum(1 for r in reconciled_rows if r[4] == 'TIMEOUT' or r[5] == 'TIMEOUT')
-    no_entry_count = sum(1 for r in reconciled_rows if r[4] == 'EXPIRED' or r[5] == 'NO_ENTRY')
-    open_count = sum(1 for r in reconciled_rows if r[4] in ('READY', 'ACTIVE'))
-
-    positive_count = tp2_count + tp3_count
+    stop_count = sum(1 for r in reconciled_rows if r[5] == 'SL')
+    timeout_count = sum(1 for r in reconciled_rows if r[5] == 'TIMEOUT')
+    no_entry_count = sum(1 for r in reconciled_rows if r[5] == 'NO_ENTRY')
+    open_count = sum(1 for r in reconciled_rows if r[4] in ('READY', 'ACTIVE') and r[5] not in ('TP2','TP3','BE','SL','TIMEOUT','NO_ENTRY'))
     closed_count = positive_count + be_count + stop_count + timeout_count
     win_rate = positive_count / closed_count * 100 if closed_count else 0.0
     total_r = sum(
@@ -1478,13 +1622,13 @@ def daily_report():
             st['entries'] += 1
         if r[5] in ('TP2', 'TP3'):
             st['positive'] += 1
-        if r[5] == 'BE':
+        elif r[5] == 'BE':
             st['be'] += 1
-        if r[5] == 'SL' or r[4] == 'CLOSED_LOSS':
+        elif r[5] == 'SL':
             st['sl'] += 1
-        if r[4] == 'TIMEOUT' or r[5] == 'TIMEOUT':
+        elif r[5] == 'TIMEOUT':
             st['timeout'] += 1
-        if r[4] == 'EXPIRED' or r[5] == 'NO_ENTRY':
+        elif r[5] == 'NO_ENTRY':
             st['no_entry'] += 1
         if r[5] in ('TP2', 'TP3', 'BE', 'SL'):
             st['r'] += float(r[13] or 0.0)
@@ -1509,7 +1653,7 @@ def daily_report():
             fig = plt.figure(figsize=(11.7, 8.3), dpi=110)
             fig.patch.set_facecolor('white')
             fig.text(0.06, 0.93, 'QUANTUM | VIP SCANNER', fontsize=22, fontweight='bold')
-            fig.text(0.06, 0.885, 'ДНЕВНОЙ АУДИТ СИГНАЛОВ · ПОСЛЕДНИЕ 24 ЧАСА', fontsize=14, fontweight='bold')
+            fig.text(0.06, 0.885, 'ДНЕВНОЙ АУДИТ · ПОСЛЕДНИЕ 24 ЧАСА', fontsize=14, fontweight='bold')
             fig.text(0.06, 0.845, f'{since_dt:%d.%m.%Y %H:%M} — {n:%d.%m.%Y %H:%M} · {TIMEZONE}', fontsize=9.5)
 
             summary = (
@@ -1558,141 +1702,8 @@ def daily_report():
             pdf.savefig(fig, bbox_inches='tight')
             plt.close(fig)
 
-            # Отдельная страница для каждого сигнала: точка входа, стоп,
-            # TP1/TP2/TP3 и фактический исход.
-            for r in reconciled_rows:
-                (sid, inst_id, direction, strategy, status, result,
-                 h1, h2, h3, created_at, activated_at, expires_at,
-                 closed_at, r_multiple, entry_low, entry_high,
-                 sl, tp1, tp2, tp3) = r
-
-                coin = get_coin(inst_id or '')
-                entry = (float(entry_low) + float(entry_high)) / 2.0
-                created_ts = float(created_at)
-                close_ts = float(closed_at) if closed_at else None
-
-                try:
-                    candles = get_candles(inst_id, '5m', 300)
-                    idx = min(
-                        range(len(candles)),
-                        key=lambda i: abs(candles[i].ts / 1000.0 - created_ts)
-                    ) if candles else 0
-                    lo_i = max(0, idx - 60)
-                    hi_i = min(len(candles), idx + 36)
-                    chart_candles = candles[lo_i:hi_i]
-                except Exception:
-                    chart_candles = []
-
-                fig, ax = plt.subplots(figsize=(11.7, 7.2), dpi=110)
-                fig.patch.set_facecolor('white')
-                ax.set_facecolor('white')
-
-                if chart_candles:
-                    width = 0.58
-                    for i, c in enumerate(chart_candles):
-                        rising = c.close >= c.open
-                        candle_color = '#16a34a' if rising else '#dc2626'
-                        ax.vlines(i, c.low, c.high, color=candle_color, linewidth=0.9)
-                        y0 = min(c.open, c.close)
-                        hh = max(abs(c.close-c.open), c.close*0.00002)
-                        ax.add_patch(Rectangle((i-width/2, y0), width, hh,
-                                               facecolor=candle_color, edgecolor=candle_color, linewidth=.4))
-
-                    def report_hline(price, label, color, ls='--', lw=1.5):
-                        ax.axhline(float(price), color=color, linewidth=lw, linestyle=ls, zorder=4)
-                        ax.text(
-                            len(chart_candles)-1.0, float(price),
-                            f' {label} {fmt_price(float(price))}',
-                            ha='right', va='bottom', fontsize=8.5, fontweight='bold', color=color,
-                            bbox=dict(facecolor='white', alpha=.82, edgecolor='none', pad=1.2)
-                        )
-
-                    report_hline(entry, 'ВХОД', '#2563eb', '-', 2.0)
-                    report_hline(sl, 'СТОП', '#dc2626', '--', 1.8)
-                    report_hline(tp1, 'TP1', '#16a34a', ':', 1.3)
-                    report_hline(tp2, 'TP2', '#16a34a', ':', 1.5)
-                    report_hline(tp3, 'TP3', '#15803d', '--', 1.7)
-                    ax.axhspan(float(entry_low), float(entry_high), alpha=.08, color='#2563eb', zorder=1)
-
-                    signal_idx = min(
-                        range(len(chart_candles)),
-                        key=lambda i: abs(chart_candles[i].ts / 1000.0 - created_ts)
-                    )
-                    ax.scatter([signal_idx], [entry], s=48, marker='o', zorder=7, color='#111827')
-                    ax.annotate('СИГНАЛ', (signal_idx, entry), xytext=(0, 16),
-                                textcoords='offset points', ha='center', fontsize=8.5, fontweight='bold')
-
-                    if close_ts:
-                        close_idx = min(
-                            range(len(chart_candles)),
-                            key=lambda i: abs(chart_candles[i].ts / 1000.0 - close_ts)
-                        )
-                        close_price = (
-                            float(tp3) if result == 'TP3' else
-                            float(tp2) if result == 'TP2' else
-                            entry if result == 'BE' else
-                            float(sl) if result == 'SL' else
-                            entry
-                        )
-                        ax.scatter([close_idx], [close_price], s=58, marker='X', zorder=8, color='#111827')
-                        ax.annotate('ЗАКРЫТИЕ', (close_idx, close_price), xytext=(0, -20),
-                                    textcoords='offset points', ha='center', fontsize=8.5, fontweight='bold')
-
-                    ax.set_xlim(-1, len(chart_candles))
-                    ax.grid(True, alpha=.14)
-                    ax.tick_params(labelsize=8)
-                else:
-                    ax.text(0.5, 0.5, 'Не удалось получить 5M свечи для графика',
-                            transform=ax.transAxes, ha='center', va='center', fontsize=13)
-                    ax.set_axis_off()
-
-                side = 'LONG' if direction == 'LONG' else 'SHORT'
-                if result == 'TP3' or int(h3 or 0):
-                    outcome = 'TP3 · ПЛЮС'
-                elif result == 'TP2':
-                    outcome = 'TP2 · ПЛЮС'
-                elif result == 'BE':
-                    outcome = 'BE · БЕЗУБЫТОК'
-                elif result == 'SL' or status == 'CLOSED_LOSS':
-                    outcome = 'SL · СТОП'
-                elif result == 'TIMEOUT' or status == 'TIMEOUT':
-                    outcome = 'TIMEOUT'
-                elif status == 'EXPIRED':
-                    outcome = 'NO ENTRY · БЕЗ ВХОДА'
-                elif status == 'ACTIVE':
-                    outcome = 'В РАБОТЕ'
-                elif status == 'READY':
-                    outcome = 'ОЖИДАЕТ ВХОДА'
-                else:
-                    outcome = result or status or 'НЕ ОПРЕДЕЛЕНО'
-
-                duration = '—'
-                if activated_at:
-                    end_ts = close_ts if close_ts else until
-                    mins = max(0, int((end_ts - float(activated_at)) / 60))
-                    duration = f'{mins//60}ч {mins%60:02d}м'
-
-                r_text = f'{float(r_multiple or 0):+.2f}R' if result in ('TP2','TP3','BE','SL') else '—'
-
-                ax.set_title(
-                    f'#{sid} · {coin}USDT · {side} · {strategy}',
-                    fontsize=14, fontweight='bold', pad=10
-                )
-                fig.text(
-                    0.08, 0.955,
-                    f'Сигнал {datetime.fromtimestamp(created_ts, ZoneInfo(TIMEZONE)):%d.%m.%Y %H:%M} · {outcome}',
-                    fontsize=10.5, fontweight='bold'
-                )
-                fig.text(
-                    0.08, 0.025,
-                    f'Вход {fmt_price(entry_low)}–{fmt_price(entry_high)} · Стоп {fmt_price(sl)} · '
-                    f'TP1 {fmt_price(tp1)} · TP2 {fmt_price(tp2)} · TP3 {fmt_price(tp3)} · '
-                    f'Удержание {duration} · Результат {r_text}',
-                    fontsize=8.5
-                )
-                plt.tight_layout(rect=[0.03, 0.06, 0.97, 0.92])
-                pdf.savefig(fig, bbox_inches='tight')
-                plt.close(fig)
+            # Только сводная страница за 24 часа. Отдельные мгновенные/поштучные
+            # отчёты и страницы по каждой монете отключены.
 
         pdf_created = True
 
@@ -1727,7 +1738,7 @@ def daily_report():
         f'📈 Win rate закрытых: <b>{win_rate:.1f}%</b>\n'
         f'💰 Результат: <b>{total_r:+.2f}R</b>'
         f'{best_line}\n\n'
-        f'📎 PDF содержит полный аудит и отдельный график каждого сигнала за 24 часа.'
+        f'📎 PDF содержит только сводку результатов за последние 24 часа.'
     )
 
     try:
@@ -1784,6 +1795,8 @@ def main():
     log.info('============================================================')
     log.info('QUANTUM INTRADAY SWING ENGINE V2 STARTED')
     log.info('Strategies: Extreme Reversal | Breakout+Retest | Pullback | Mean Reversion')
+    log.info('Learning: bounded 30D strategy adaptation after raw setup generation')
+    log.info('Reports: one 24H report; instant lifecycle updates disabled')
     log.info('Universe: gainers | losers | volatile | new active | small alts')
     log.info('============================================================')
     startup_healthcheck()

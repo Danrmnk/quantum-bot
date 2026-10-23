@@ -141,6 +141,15 @@ class Setup:
     candles_5m: List[Candle]
     points: List[Tuple[int, float, str]] = field(default_factory=list)
     hold_hours: str = '1–8 ч'
+    # Immutable snapshot features captured at signal creation for learning.
+    entry_distance_pct: float = 0.0
+    body_ratio: float = 0.0
+    close_location: float = 0.5
+    upper_wick_ratio: float = 0.0
+    lower_wick_ratio: float = 0.0
+    impulse_2h_pct: float = 0.0
+    trend_15m: str = ''
+    trend_1h: str = ''
 
 @dataclass
 class PendingSignal:
@@ -187,7 +196,13 @@ SIGNAL_COLUMNS = {
     'r_multiple':'REAL DEFAULT 0',
     'change24':'REAL DEFAULT 0', 'range24':'REAL DEFAULT 0',
     'atr5_pct':'REAL DEFAULT 0', 'atr15_pct':'REAL DEFAULT 0',
-    'volume_ratio':'REAL DEFAULT 0', 'risk_pct':'REAL DEFAULT 0'
+    'volume_ratio':'REAL DEFAULT 0', 'risk_pct':'REAL DEFAULT 0',
+    'entry_distance_pct':'REAL DEFAULT 0', 'body_ratio':'REAL DEFAULT 0',
+    'close_location':'REAL DEFAULT 0.5', 'upper_wick_ratio':'REAL DEFAULT 0',
+    'lower_wick_ratio':'REAL DEFAULT 0', 'impulse_2h_pct':'REAL DEFAULT 0',
+    'trend_15m':"TEXT DEFAULT ''", 'trend_1h':"TEXT DEFAULT ''",
+    'failure_type':"TEXT DEFAULT ''", 'mfe_r':"REAL DEFAULT 0", 'mae_r':"REAL DEFAULT 0",
+    'initial_sl':"REAL DEFAULT 0", 'breakeven_active':"INTEGER DEFAULT 0"
 }
 
 
@@ -950,7 +965,7 @@ def start_telegram_polling():
                 if '409' in msg or 'Conflict' in msg or 'getUpdates' in msg:
                     log.error('TELEGRAM 409/GETUPDATES CONFLICT | another polling instance may be active; retrying in %ss', delay)
                 else:
-                    log.exception('TELEGRAM POLLING ERROR | retrying in %ss', delay)
+                    log.error('TELEGRAM POLLING ERROR | %s | retrying in %ss', msg, delay)
             time.sleep(delay)
             delay = min(delay * 2, 60)
 
@@ -1035,14 +1050,32 @@ def build_signal_text(s:Setup)->str:
     )
 
 
+def enrich_setup_snapshot(s: Setup) -> Setup:
+    entry = (s.entry_low + s.entry_high) / 2.0
+    c = s.candles_5m[-1] if s.candles_5m else None
+    if c:
+        up, low = wick_ratio(c)
+        s.body_ratio = body_ratio(c)
+        s.close_location = close_location(c)
+        s.upper_wick_ratio = up
+        s.lower_wick_ratio = low
+        _, s.impulse_2h_pct, _ = impulse_stats(s.candles_5m)
+    s.entry_distance_pct = abs(entry - s.level) / max(entry, 1e-12) * 100
+    s.trend_15m = ''
+    s.trend_1h = s.direction if s.strategy == 'TREND PULLBACK' else ''
+    return s
+
+
 def insert_signal(s:Setup)->int:
+    enrich_setup_snapshot(s)
     created=now_ts()
     with db_lock:
         risk_pct = abs(((s.entry_low+s.entry_high)/2.0) - s.sl) / max((s.entry_low+s.entry_high)/2.0, 1e-12) * 100
-        cur=db.execute('''INSERT INTO signals(inst_id,direction,strategy,level,entry_low,entry_high,sl,tp1,tp2,tp3,score,status,created_at,expires_at,change24,range24,atr5_pct,atr15_pct,volume_ratio,risk_pct)
-                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+        cur=db.execute('''INSERT INTO signals(inst_id,direction,strategy,level,entry_low,entry_high,sl,tp1,tp2,tp3,score,status,created_at,expires_at,change24,range24,atr5_pct,atr15_pct,volume_ratio,risk_pct,entry_distance_pct,body_ratio,close_location,upper_wick_ratio,lower_wick_ratio,impulse_2h_pct,trend_15m,trend_1h,failure_type,mfe_r,mae_r,initial_sl,breakeven_active)
+                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                        (s.inst_id,s.direction,s.strategy,s.level,s.entry_low,s.entry_high,s.sl,s.tp1,s.tp2,s.tp3,s.score,'READY',created,created+READY_TTL_MINUTES*60,
-                        s.change24,s.range24,s.atr5_pct,s.atr15_pct,s.volume_ratio,risk_pct))
+                        s.change24,s.range24,s.atr5_pct,s.atr15_pct,s.volume_ratio,risk_pct,s.entry_distance_pct,s.body_ratio,s.close_location,
+                        s.upper_wick_ratio,s.lower_wick_ratio,s.impulse_2h_pct,s.trend_15m,s.trend_1h,'',0.0,0.0,s.sl,0))
         sid=cur.lastrowid; db.commit()
     return sid
 
@@ -1069,6 +1102,77 @@ def send_signal(s:Setup)->bool:
             except OSError: pass
 
 # ============================================================
+# RUNTIME STATE RECOVERY
+# ============================================================
+
+def setup_from_db_row(row) -> Setup:
+    """Rebuild the minimum Setup object needed after a process restart."""
+    (sid, inst_id, direction, strategy, level, entry_low, entry_high, sl,
+     tp1, tp2, tp3, score, created_at, expires_at, change24, range24,
+     atr5_pct, atr15_pct, volume_ratio, entry_distance_pct, body_ratio,
+     close_location, upper_wick_ratio, lower_wick_ratio, impulse_2h_pct,
+     trend_15m, trend_1h) = row
+    return Setup(
+        inst_id=inst_id, coin=get_coin(inst_id), direction=direction,
+        strategy=strategy, pattern_name=strategy, level=float(level or 0),
+        level_kind='LEVEL', entry_low=float(entry_low), entry_high=float(entry_high),
+        sl=float(sl), tp1=float(tp1), tp2=float(tp2), tp3=float(tp3),
+        score=int(score or 0), reason='recovered after restart',
+        volume_24h=0.0, change24=float(change24 or 0), range24=float(range24 or 0),
+        atr5_pct=float(atr5_pct or 0), atr15_pct=float(atr15_pct or 0),
+        volume_ratio=float(volume_ratio or 0), candles_5m=[],
+        entry_distance_pct=float(entry_distance_pct or 0),
+        body_ratio=float(body_ratio or 0), close_location=float(close_location or .5),
+        upper_wick_ratio=float(upper_wick_ratio or 0),
+        lower_wick_ratio=float(lower_wick_ratio or 0),
+        impulse_2h_pct=float(impulse_2h_pct or 0), trend_15m=trend_15m or '',
+        trend_1h=trend_1h or ''
+    )
+
+
+def recover_runtime_state():
+    """Recover READY/ACTIVE signals after Render restart or process crash."""
+    try:
+        cutoff = now_ts() - max(READY_TTL_MINUTES, ACTIVE_MAX_HOURS * 60) * 60
+        with db_lock:
+            rows = db.execute(
+                """SELECT id,inst_id,direction,strategy,level,entry_low,entry_high,sl,
+                          tp1,tp2,tp3,score,created_at,expires_at,change24,range24,
+                          atr5_pct,atr15_pct,volume_ratio,entry_distance_pct,body_ratio,
+                          close_location,upper_wick_ratio,lower_wick_ratio,impulse_2h_pct,
+                          trend_15m,trend_1h,status,activated_at
+                   FROM signals
+                   WHERE status IN ('READY','ACTIVE') AND created_at >= ?
+                   ORDER BY created_at ASC""",
+                (cutoff,)
+            ).fetchall()
+
+        restored = 0
+        for r in rows:
+            sid = r[0]
+            iid = r[1]
+            setup = setup_from_db_row(r[:27])
+            status = r[27]
+            activated_at = r[28]
+            if status == 'READY':
+                expires = float(r[13] or (r[12] + READY_TTL_MINUTES * 60))
+                if now_ts() >= expires:
+                    with db_lock:
+                        db.execute("UPDATE signals SET status='EXPIRED',result='NO_ENTRY',closed_at=? WHERE id=? AND status='READY'",
+                                   (now_ts(), sid))
+                        db.commit()
+                    continue
+                pending[iid] = PendingSignal(setup, sid, float(r[12]), expires, 0)
+            else:
+                activated = float(activated_at or r[12])
+                active[iid] = ActiveSignal(setup, sid, activated, 0, False, False, False)
+            restored += 1
+        if restored:
+            log.info('RECOVERY | restored=%d | pending=%d | active=%d', restored, len(pending), len(active))
+    except Exception:
+        log.exception('RECOVERY FAILED')
+
+# ============================================================
 # SIGNAL LIFECYCLE
 # ============================================================
 
@@ -1082,84 +1186,170 @@ def price_in_entry(s:Setup, price:float)->bool:
     return s.entry_low <= price <= s.entry_high
 
 
-def lifecycle_for_symbol(iid:str, cs:List[Candle]):
-    if len(cs)<3:
-        return
-    last=cs[-1]
-    # 1) Pending: wait for actual entry-zone touch.
-    p=pending.get(iid)
-    if p:
-        s=p.setup
-        if now_ts()>p.expires_at:
-            with db_lock:
-                db.execute("UPDATE signals SET status='EXPIRED' WHERE id=? AND status='READY'",(p.signal_id,)); db.commit()
-            pending.pop(iid,None)
-        elif price_in_entry(s,last.close) or (last.low<=s.entry_high and last.high>=s.entry_low):
-            with db_lock:
-                db.execute("UPDATE signals SET status='ACTIVE',activated_at=? WHERE id=? AND status='READY'",(now_ts(),p.signal_id)); db.commit()
-            active[iid]=ActiveSignal(s,p.signal_id,now_ts(),p.message_id)
-            pending.pop(iid,None)
+def classify_sl(mfe_r: float) -> str:
+    # Classify the failure using only observed post-entry excursion.
+    # This is deliberately conservative: a stop after a meaningful favorable
+    # excursion is treated as a stop-management/structure issue, while an
+    # immediate stop is treated as entry/timing quality.
+    if mfe_r >= 0.80:
+        return 'BAD_STOP'
+    if mfe_r >= 0.30:
+        return 'BAD_TIMING'
+    return 'BAD_ENTRY'
 
-    a=active.get(iid)
-    if not a:
+
+def lifecycle_for_symbol(iid:str, cs:List[Candle]):
+    """Advance one live signal using confirmed 5M candles.
+
+    The original SL is preserved in initial_sl. After TP1 the protective SL is
+    moved to the entry price and breakeven_active is persisted in SQLite, so a
+    process restart cannot forget the BE state.
+    """
+    if len(cs) < 3:
         return
-    s=a.setup
-    # Use the latest confirmed candle. If TP and SL are both inside the same
-    # candle, the exact intrabar order is unknown; conservatively count SL first.
-    if not last.confirmed:
+    last = cs[-1]
+
+    p = pending.get(iid)
+    if p:
+        s = p.setup
+        if now_ts() > p.expires_at:
+            with db_lock:
+                db.execute("UPDATE signals SET status='EXPIRED', result='NO_ENTRY', closed_at=? WHERE id=? AND status='READY'",
+                           (now_ts(), p.signal_id))
+                db.commit()
+            pending.pop(iid, None)
+        elif price_in_entry(s, last.close) or (last.low <= s.entry_high and last.high >= s.entry_low):
+            activated = now_ts()
+            with db_lock:
+                db.execute("UPDATE signals SET status='ACTIVE', activated_at=? WHERE id=? AND status='READY'",
+                           (activated, p.signal_id))
+                db.commit()
+            active[iid] = ActiveSignal(s, p.signal_id, activated, p.message_id)
+            pending.pop(iid, None)
+
+    a = active.get(iid)
+    if not a or not last.confirmed:
         return
-    long=s.direction=='LONG'
-    hit1=last.high>=s.tp1 if long else last.low<=s.tp1
-    hit2=last.high>=s.tp2 if long else last.low<=s.tp2
-    hit3=last.high>=s.tp3 if long else last.low<=s.tp3
-    stop=last.low<=s.sl if long else last.high>=s.sl
-    both=stop and hit1
+
+    s = a.setup
+    long = s.direction == 'LONG'
+    entry = (s.entry_low + s.entry_high) / 2.0
 
     with db_lock:
-        row=db.execute('SELECT tp1_hit,tp2_hit,tp3_hit FROM signals WHERE id=?',(a.signal_id,)).fetchone()
+        row = db.execute(
+            'SELECT tp1_hit,tp2_hit,tp3_hit,mfe_r,mae_r,initial_sl,breakeven_active,status,result FROM signals WHERE id=?',
+            (a.signal_id,)
+        ).fetchone()
     if not row:
         return
-    h1,h2,h3=row
-
-    if both and not h1:
-        # Conservative handling for an ambiguous candle.
-        with db_lock:
-            db.execute("UPDATE signals SET status='CLOSED_LOSS',result='SL',closed_at=?,r_multiple=-1 WHERE id=?",(now_ts(),a.signal_id)); db.commit()
-        send_update(f'🔴 <b>STOP — {s.coin}USDT</b>\nСтоп затронут в свече с неоднозначным пересечением целей. Результат засчитан консервативно по SL.')
-        active.pop(iid,None)
+    h1, h2, h3, mfe_r, mae_r, initial_sl, be_active, status, result = row
+    if status in ('CLOSED_WIN','CLOSED_LOSS','CLOSED_BE','TIMEOUT','EXPIRED'):
+        active.pop(iid, None)
         return
 
+    initial_sl = float(initial_sl or s.sl)
+    protective_sl = entry if bool(be_active) else initial_sl
+    risk = abs(entry - initial_sl)
+    mfe_r = float(mfe_r or 0.0)
+    mae_r = float(mae_r or 0.0)
+
+    if risk > 0:
+        favorable = ((last.high - entry) / risk) if long else ((entry - last.low) / risk)
+        adverse = ((entry - last.low) / risk) if long else ((last.high - entry) / risk)
+        mfe_r = max(mfe_r, favorable)
+        mae_r = max(mae_r, adverse)
+
+    hit1 = last.high >= s.tp1 if long else last.low <= s.tp1
+    hit2 = last.high >= s.tp2 if long else last.low <= s.tp2
+    hit3 = last.high >= s.tp3 if long else last.low <= s.tp3
+    stop = last.low <= protective_sl if long else last.high >= protective_sl
+
+    # Before TP1, if both TP1 and the original SL occur in one candle,
+    # exact order is unknowable; use conservative SL-first accounting.
+    if not h1 and hit1 and stop:
+        failure = classify_sl(mfe_r)
+        with db_lock:
+            db.execute("""UPDATE signals SET status='CLOSED_LOSS',result='SL',closed_at=?,r_multiple=-1,
+                       failure_type=?,mfe_r=?,mae_r=? WHERE id=?""",
+                       (now_ts(), failure, mfe_r, mae_r, a.signal_id))
+            db.commit()
+        active.pop(iid, None)
+        return
+
+    if not h1 and stop:
+        failure = classify_sl(mfe_r)
+        with db_lock:
+            db.execute("""UPDATE signals SET status='CLOSED_LOSS',result='SL',closed_at=?,r_multiple=-1,
+                       failure_type=?,mfe_r=?,mae_r=? WHERE id=?""",
+                       (now_ts(), failure, mfe_r, mae_r, a.signal_id))
+            db.commit()
+        active.pop(iid, None)
+        return
+
+    # TP3 / TP2 are terminal positive outcomes. TP1 is a milestone only.
+    if hit3 and (h2 or hit2):
+        r = abs(s.tp3 - entry) / max(risk, 1e-12)
+        with db_lock:
+            db.execute("""UPDATE signals SET tp3_hit=1,status='CLOSED_WIN',result='TP3',closed_at=?,
+                       r_multiple=?,failure_type='',mfe_r=?,mae_r=? WHERE id=?""",
+                       (now_ts(), r, mfe_r, mae_r, a.signal_id))
+            db.commit()
+        active.pop(iid, None)
+        return
+
+    if hit2 and (h1 or hit1):
+        r = abs(s.tp2 - entry) / max(risk, 1e-12)
+        with db_lock:
+            db.execute("""UPDATE signals SET tp1_hit=1,tp2_hit=1,status='CLOSED_WIN',result='TP2',closed_at=?,
+                       r_multiple=?,failure_type='',mfe_r=?,mae_r=? WHERE id=?""",
+                       (now_ts(), r, mfe_r, mae_r, a.signal_id))
+            db.commit()
+        active.pop(iid, None)
+        return
+
+    # First TP: persist BE protection. This is the actual live BE move.
     if hit1 and not h1:
         with db_lock:
-            db.execute("UPDATE signals SET tp1_hit=1 WHERE id=?",(a.signal_id,)); db.commit()
-        a.tp1_sent=True
-        send_update(f'🟢 <b>TP1 — {s.coin}USDT</b>\nЦена достигла <code>{fmt_price(s.tp1)}</code>.\nЧасть позиции можно зафиксировать по своему плану.')
-    if hit2 and not h2:
+            db.execute("""UPDATE signals SET tp1_hit=1,breakeven_active=1,sl=?,mfe_r=?,mae_r=? WHERE id=?""",
+                       (entry, mfe_r, mae_r, a.signal_id))
+            db.commit()
+        be_active = 1
+        protective_sl = entry
+        h1 = 1
+
+    # After TP1, a return to entry is a true BE outcome.
+    if h1 and not h2 and not h3:
+        returned_to_entry = last.low <= entry if long else last.high >= entry
+        if returned_to_entry:
+            with db_lock:
+                db.execute("""UPDATE signals SET status='CLOSED_BE',result='BE',closed_at=?,r_multiple=0,
+                           failure_type='',mfe_r=?,mae_r=? WHERE id=?""",
+                           (now_ts(), mfe_r, mae_r, a.signal_id))
+                db.commit()
+            active.pop(iid, None)
+            return
+
+    # If TP1 happened on a previous candle, the current candle can stop at BE.
+    if h1 and stop:
         with db_lock:
-            db.execute("UPDATE signals SET tp2_hit=1 WHERE id=?",(a.signal_id,)); db.commit()
-        a.tp2_sent=True
-        send_update(f'🚀 <b>TP2 — {s.coin}USDT</b>\nЦена достигла <code>{fmt_price(s.tp2)}</code>.\nОстаток сопровождаем по плану.')
-    if hit3 and not h3:
-        entry=(s.entry_low+s.entry_high)/2
-        r=abs(s.tp3-entry)/max(abs(entry-s.sl),1e-12)
-        with db_lock:
-            db.execute("UPDATE signals SET tp3_hit=1,status='CLOSED_WIN',result='TP3',closed_at=?,r_multiple=? WHERE id=?",(now_ts(),r,a.signal_id)); db.commit()
-        send_update(f'🏁 <b>TP3 — {s.coin}USDT</b>\nЦена достигла <code>{fmt_price(s.tp3)}</code>.\nРезультат зафиксирован: TP3.')
-        active.pop(iid,None)
-        return
-    if stop:
-        with db_lock:
-            db.execute("UPDATE signals SET status='CLOSED_LOSS',result='SL',closed_at=?,r_multiple=-1 WHERE id=?",(now_ts(),a.signal_id)); db.commit()
-        send_update(f'🔴 <b>STOP — {s.coin}USDT</b>\nЦена достигла стопа <code>{fmt_price(s.sl)}</code>.\nСделка закрыта по плановому риску.')
-        active.pop(iid,None)
+            db.execute("""UPDATE signals SET status='CLOSED_BE',result='BE',closed_at=?,r_multiple=0,
+                       failure_type='',mfe_r=?,mae_r=? WHERE id=?""",
+                       (now_ts(), mfe_r, mae_r, a.signal_id))
+            db.commit()
+        active.pop(iid, None)
         return
 
-    if now_ts()-a.activated_at > ACTIVE_MAX_HOURS*3600:
-        with db_lock:
-            db.execute("UPDATE signals SET status='TIMEOUT',result='TIMEOUT',closed_at=? WHERE id=?",(now_ts(),a.signal_id)); db.commit()
-        send_update(f'⚪ <b>TIMEOUT — {s.coin}USDT</b>\nСделка не дошла до TP3/SL в установленное время. Результат закрыт как TIMEOUT.')
-        active.pop(iid,None)
+    with db_lock:
+        db.execute("UPDATE signals SET mfe_r=?,mae_r=? WHERE id=?", (mfe_r, mae_r, a.signal_id))
+        db.commit()
 
+    if now_ts() - a.activated_at > ACTIVE_MAX_HOURS * 3600:
+        with db_lock:
+            db.execute("""UPDATE signals SET status='TIMEOUT',result='TIMEOUT',closed_at=?,
+                       failure_type='TIMEOUT',mfe_r=?,mae_r=? WHERE id=?""",
+                       (now_ts(), mfe_r, mae_r, a.signal_id))
+            db.commit()
+        active.pop(iid, None)
 
 def update_signal_results():
     symbols=set(pending)|set(active)
@@ -1236,108 +1426,143 @@ def scan_market():
         send_signal(s)
 
 # ============================================================
-# SELF-LEARNING ENGINE — REPORT-ONLY DATA + BOUNDED ADAPTATION
+# SELF-LEARNING ENGINE — OUTCOME + FEATURE ADAPTATION
 # ============================================================
 
-LEARNING_MIN_SAMPLES = int(os.getenv('LEARNING_MIN_SAMPLES', '12'))
+LEARNING_MIN_SAMPLES = int(os.getenv('LEARNING_MIN_SAMPLES', '20'))
 LEARNING_MAX_ADJUSTMENT = float(os.getenv('LEARNING_MAX_ADJUSTMENT', '4.0'))
 LEARNING_WINDOW_DAYS = int(os.getenv('LEARNING_WINDOW_DAYS', '30'))
-LEARNING_MIN_R = float(os.getenv('LEARNING_MIN_R', '0.0'))
 
 
-def _learning_rows(hours: int = 24):
+def _learning_rows(hours: int = 24 * LEARNING_WINDOW_DAYS):
     since = now_ts() - hours * 3600
     with db_lock:
         return db.execute(
             """SELECT strategy, result, r_multiple, volume_ratio, atr5_pct, atr15_pct,
-                      change24, range24, risk_pct, created_at
+                      change24, range24, risk_pct, entry_distance_pct, body_ratio,
+                      close_location, upper_wick_ratio, lower_wick_ratio, impulse_2h_pct,
+                      trend_15m, trend_1h, failure_type, mfe_r, mae_r, created_at
                FROM signals
                WHERE created_at >= ? AND created_at <= ?
                  AND status NOT IN ('SEND_FAILED','READY','EXPIRED')
+                 AND result IN ('TP2','TP3','BE','SL','TIMEOUT')
                ORDER BY created_at ASC""",
             (since, now_ts())
         ).fetchall()
 
 
-def _bounded_adjustment(total_r: float, wins: int, losses: int, samples: int) -> float:
-    if samples < LEARNING_MIN_SAMPLES:
-        return 0.0
-    wr = wins / max(wins + losses, 1)
-    # Conservative: reward positive expectancy, penalize negative expectancy.
-    expectancy = total_r / max(samples, 1)
-    raw = expectancy * 2.0 + (wr - 0.5) * 4.0
-    return clamp(raw, -LEARNING_MAX_ADJUSTMENT, LEARNING_MAX_ADJUSTMENT)
+def _outcome_r(result, r_multiple):
+    if result in ('TP2', 'TP3', 'BE', 'SL'):
+        return float(r_multiple or 0.0)
+    return 0.0
+
+
+def _bucket_features(row):
+    (strategy, result, r_multiple, vr, atr5, atr15, ch, rng, risk, dist,
+     body, loc, upper, lower, impulse2h, trend15, trend1h, failure_type, mfe_r, mae_r, created_at) = row
+    return {
+        'volume': 'low' if vr < 0.6 else 'mid' if vr < 1.0 else 'high' if vr < 1.5 else 'surge',
+        'risk': 'tight' if risk < 0.35 else 'normal' if risk < 0.65 else 'wide',
+        'distance': 'near' if dist < 0.25 else 'mid' if dist < 0.60 else 'far',
+        'body': 'weak' if body < 0.42 else 'normal' if body < 0.65 else 'strong',
+        'atr5': 'low' if atr5 < 0.30 else 'mid' if atr5 < 0.60 else 'high',
+        'trend': 'aligned' if trend15 and trend15 == trend1h else 'mixed',
+    }
+
+
+def _calc_learning_adjustments(rows):
+    # Strategy-level evidence plus feature-bin evidence. No universe mutation.
+    stats = {}
+    feature_stats = {}
+    for row in rows:
+        strategy, result, r_multiple = row[0], row[1], row[2]
+        r = _outcome_r(result, r_multiple)
+        st = stats.setdefault(strategy, {'n':0,'wins':0,'sl':0,'be':0,'timeout':0,'r':0.0})
+        st['n'] += 1; st['r'] += r
+        if result in ('TP2','TP3'): st['wins'] += 1
+        elif result == 'SL': st['sl'] += 1
+        elif result == 'BE': st['be'] += 1
+        elif result == 'TIMEOUT': st['timeout'] += 1
+
+        for key, val in _bucket_features(row).items():
+            k = (strategy, key, val)
+            fs = feature_stats.setdefault(k, {'n':0,'r':0.0,'wins':0,'sl':0})
+            fs['n'] += 1; fs['r'] += r
+            if result in ('TP2','TP3'): fs['wins'] += 1
+            elif result == 'SL': fs['sl'] += 1
+
+    adjustments = {}
+    for strategy, st in stats.items():
+        if st['n'] < LEARNING_MIN_SAMPLES:
+            adjustments[strategy] = 0.0
+            continue
+        wr = st['wins'] / max(st['wins'] + st['sl'] + st['be'] + st['timeout'], 1)
+        expectancy = st['r'] / st['n']
+        # Small bounded strategy adjustment; positive expectancy wins, negative loses.
+        adjustments[strategy] = clamp(expectancy * 2.0 + (wr - 0.5) * 4.0,
+                                      -LEARNING_MAX_ADJUSTMENT, LEARNING_MAX_ADJUSTMENT)
+
+    feature_adjustments = {}
+    for (strategy, key, val), fs in feature_stats.items():
+        if fs['n'] < LEARNING_MIN_SAMPLES:
+            continue
+        expectancy = fs['r'] / fs['n']
+        wr = fs['wins'] / max(fs['wins'] + fs['sl'], 1)
+        feature_adjustments[f'{strategy}|{key}|{val}'] = clamp(
+            expectancy * 1.5 + (wr - 0.5) * 2.0, -2.0, 2.0)
+    return adjustments, feature_adjustments, stats
 
 
 def run_learning_engine() -> Dict[str, float]:
-    """Analyze recent outcomes and update bounded strategy adjustments.
-
-    This layer never changes universe construction or any strategy builder.
-    It only changes ranking of already-created raw setups after enough evidence.
-    No single day can move a strategy by more than LEARNING_MAX_ADJUSTMENT points.
-    """
-    rows = _learning_rows(24 * LEARNING_WINDOW_DAYS)
-    by_strategy = {}
-    for strategy, result, r_multiple, *_ in rows:
-        if result not in ('TP2','TP3','BE','SL','TIMEOUT'):
-            continue
-        st = by_strategy.setdefault(strategy, {'samples':0,'wins':0,'losses':0,'be':0,'timeouts':0,'r':0.0})
-        st['samples'] += 1
-        st['r'] += float(r_multiple or 0.0)
-        if result in ('TP2','TP3'): st['wins'] += 1
-        elif result == 'SL': st['losses'] += 1
-        elif result == 'BE': st['be'] += 1
-        elif result == 'TIMEOUT': st['timeouts'] += 1
-
-    adjustments = {}
+    rows = _learning_rows()
+    adjustments, feature_adjustments, stats = _calc_learning_adjustments(rows)
     now = now_ts()
     with db_lock:
-        for strategy, st in by_strategy.items():
-            adj = _bounded_adjustment(st['r'], st['wins'], st['losses'], st['samples'])
-            adjustments[strategy] = adj
+        db.execute("""CREATE TABLE IF NOT EXISTS learning_history_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, run_at REAL NOT NULL,
+            window_hours INTEGER NOT NULL, strategy TEXT NOT NULL, samples INTEGER NOT NULL,
+            wins INTEGER NOT NULL, losses INTEGER NOT NULL, be INTEGER NOT NULL,
+            timeouts INTEGER NOT NULL, total_r REAL NOT NULL, adjustment REAL NOT NULL)""")
+        for strategy, st in stats.items():
             db.execute(
-                "INSERT INTO learning_history(run_at,window_hours,strategy,samples,wins,losses,be,timeouts,total_r,adjustment) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (now, 24*LEARNING_WINDOW_DAYS, strategy, st['samples'], st['wins'], st['losses'], st['be'], st['timeouts'], st['r'], adj)
+                "INSERT INTO learning_history_v2(run_at,window_hours,strategy,samples,wins,losses,be,timeouts,total_r,adjustment) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (now, 24*LEARNING_WINDOW_DAYS, strategy, st['n'], st['wins'], st['sl'], st['be'], st['timeout'], st['r'], adjustments.get(strategy,0.0))
             )
-        db.execute(
-            "INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)",
-            ('learning_adjustments', json.dumps(adjustments, ensure_ascii=False, sort_keys=True))
-        )
-        db.execute(
-            "INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)",
-            ('learning_last_run', str(now))
-        )
+        db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)",
+                   ('learning_adjustments_v2', json.dumps(adjustments, ensure_ascii=False, sort_keys=True)))
+        db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)",
+                   ('learning_feature_adjustments_v2', json.dumps(feature_adjustments, ensure_ascii=False, sort_keys=True)))
+        db.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)",
+                   ('learning_last_run', str(now)))
         db.commit()
-
-    if adjustments:
-        log.info('LEARNING | window=%dd | adjustments=%s', LEARNING_WINDOW_DAYS, adjustments)
-    else:
-        log.info('LEARNING | insufficient closed history for adaptation')
+    log.info('LEARNING | window=%dd | strategies=%s | feature_rules=%d',
+             LEARNING_WINDOW_DAYS, adjustments, len(feature_adjustments))
     return adjustments
 
 
-def get_learning_adjustment(strategy: str) -> float:
+def get_learning_data():
     try:
         with db_lock:
-            row = db.execute("SELECT value FROM bot_state WHERE key='learning_adjustments'").fetchone()
-        if not row:
-            return 0.0
-        data = json.loads(row[0])
-        return float(data.get(strategy, 0.0))
+            a = db.execute("SELECT value FROM bot_state WHERE key='learning_adjustments_v2'").fetchone()
+            f = db.execute("SELECT value FROM bot_state WHERE key='learning_feature_adjustments_v2'").fetchone()
+        return (json.loads(a[0]) if a else {}, json.loads(f[0]) if f else {})
     except Exception:
         log.exception('LEARNING READ FAILED')
-        return 0.0
+        return {}, {}
 
 
 def apply_learning_to_raw(raw: List[Setup]) -> List[Setup]:
-    """Rank raw setups using bounded historical strategy evidence.
-
-    Universe, candidate selection and all strategy builders remain untouched.
-    """
+    adjustments, feature_adjustments = get_learning_data()
     for s in raw:
-        adj = get_learning_adjustment(s.strategy)
-        if adj:
-            s.score = int(clamp(s.score + adj, 0, 99))
+        adj = float(adjustments.get(s.strategy, 0.0))
+        # Use only immutable signal-time features.
+        row = (s.strategy, '', 0, s.volume_ratio, s.atr5_pct, s.atr15_pct,
+               s.change24, s.range24, abs(((s.entry_low+s.entry_high)/2)-s.sl) / max((s.entry_low+s.entry_high)/2,1e-12)*100,
+               s.entry_distance_pct, s.body_ratio, s.close_location, s.upper_wick_ratio,
+               s.lower_wick_ratio, s.impulse_2h_pct, s.trend_15m, s.trend_1h, '', 0.0, 0.0, 0)
+        for key, val in _bucket_features(row).items():
+            adj += float(feature_adjustments.get(f'{s.strategy}|{key}|{val}', 0.0))
+        s.score = int(clamp(round(s.score + clamp(adj, -LEARNING_MAX_ADJUSTMENT, LEARNING_MAX_ADJUSTMENT), 0), 0, 99))
     return raw
 
 
@@ -1387,7 +1612,8 @@ def daily_report():
             """SELECT id, inst_id, direction, strategy, status, result,
                       tp1_hit, tp2_hit, tp3_hit, created_at, activated_at,
                       expires_at, closed_at, r_multiple,
-                      entry_low, entry_high, sl, tp1, tp2, tp3
+                      entry_low, entry_high, sl, tp1, tp2, tp3,
+                      failure_type, mfe_r, mae_r, initial_sl, breakeven_active
                FROM signals
                WHERE created_at >= ? AND created_at <= ?
                  AND status != 'SEND_FAILED'
@@ -1404,7 +1630,7 @@ def daily_report():
         (sid, inst_id, direction, strategy, status, result,
          h1, h2, h3, created_at, activated_at, expires_at,
          closed_at, r_multiple, entry_low, entry_high, sl,
-         tp1, tp2, tp3) = r
+         tp1, tp2, tp3, failure_type, mfe_r, mae_r, initial_sl, breakeven_active) = r
 
         terminal_statuses = {
             'CLOSED_WIN', 'CLOSED_LOSS', 'CLOSED_BE', 'TIMEOUT', 'EXPIRED'
@@ -1454,7 +1680,8 @@ def daily_report():
                             'EXPIRED', 'NO_ENTRY',
                             int(h1 or 0), int(h2 or 0), int(h3 or 0),
                             created_at, activated_at, expires_at, closed_at,
-                            r_multiple, entry_low, entry_high, sl, tp1, tp2, tp3
+                            r_multiple, entry_low, entry_high, sl, tp1, tp2, tp3,
+                            failure_type, mfe_r, mae_r, initial_sl, breakeven_active
                         )
                     return r
 
@@ -1470,12 +1697,22 @@ def daily_report():
             terminal_result = result or ''
             terminal_closed_at = closed_at
             terminal_r = float(r_multiple or 0.0)
+            original_risk = abs(entry - float(initial_sl or sl))
+            max_favorable_r = float(mfe_r or 0.0)
+            max_adverse_r = float(mae_r or 0.0)
+            failure = failure_type or ''
 
             for c in trade_candles:
+                if original_risk > 0:
+                    favorable = ((c.high - entry) / original_risk) if long else ((entry - c.low) / original_risk)
+                    adverse = ((entry - c.low) / original_risk) if long else ((c.high - entry) / original_risk)
+                    max_favorable_r = max(max_favorable_r, favorable)
+                    max_adverse_r = max(max_adverse_r, adverse)
                 hit_tp1 = c.high >= float(tp1) if long else c.low <= float(tp1)
                 hit_tp2 = c.high >= float(tp2) if long else c.low <= float(tp2)
                 hit_tp3 = c.high >= float(tp3) if long else c.low <= float(tp3)
-                hit_sl = c.low <= float(sl) if long else c.high >= float(sl)
+                protective_sl = entry if int(breakeven_active or 0) else float(initial_sl or sl)
+                hit_sl = c.low <= protective_sl if long else c.high >= protective_sl
 
                 # До TP1 порядок внутри одной свечи неизвестен.
                 # Для статистики используем консервативное правило: SL первым.
@@ -1484,6 +1721,7 @@ def daily_report():
                     terminal_result = 'SL'
                     terminal_closed_at = c.ts / 1000.0
                     terminal_r = -1.0
+                    failure = 'BAD_STOP' if max_favorable_r >= 0.80 else 'BAD_TIMING' if max_favorable_r >= 0.30 else 'BAD_ENTRY'
                     break
 
                 if not hit1 and hit_sl:
@@ -1491,10 +1729,13 @@ def daily_report():
                     terminal_result = 'SL'
                     terminal_closed_at = c.ts / 1000.0
                     terminal_r = -1.0
+                    failure = 'BAD_STOP' if max_favorable_r >= 0.80 else 'BAD_TIMING' if max_favorable_r >= 0.30 else 'BAD_ENTRY'
                     break
 
                 if hit_tp1:
                     hit1 = True
+                    breakeven_active = 1
+                    protective_sl = entry
 
                 if hit1 and hit_tp2:
                     hit2 = True
@@ -1504,20 +1745,22 @@ def daily_report():
 
                 # После TP3 сделка полностью положительная.
                 if hit3:
-                    risk = abs(entry - float(sl))
+                    risk = original_risk
                     terminal_status = 'CLOSED_WIN'
                     terminal_result = 'TP3'
                     terminal_closed_at = c.ts / 1000.0
                     terminal_r = abs(float(tp3) - entry) / max(risk, 1e-12)
+                    failure = ''
                     break
 
                 # TP2 — тоже положительное закрытие по плану.
                 if hit2:
-                    risk = abs(entry - float(sl))
+                    risk = original_risk
                     terminal_status = 'CLOSED_WIN'
                     terminal_result = 'TP2'
                     terminal_closed_at = c.ts / 1000.0
                     terminal_r = abs(float(tp2) - entry) / max(risk, 1e-12)
+                    failure = ''
                     break
 
                 # После TP1 стоп считается перенесённым в BE.
@@ -1528,6 +1771,7 @@ def daily_report():
                         terminal_result = 'BE'
                         terminal_closed_at = c.ts / 1000.0
                         terminal_r = 0.0
+                        failure = ''
                         break
 
             # Если фактического закрытия нет — не придумываем результат.
@@ -1541,6 +1785,7 @@ def daily_report():
                     terminal_status = 'TIMEOUT'
                     terminal_result = 'TIMEOUT'
                     terminal_closed_at = until
+                    failure = 'TIMEOUT'
 
             updated = (
                 sid, inst_id, direction, strategy,
@@ -1548,7 +1793,8 @@ def daily_report():
                 int(hit1), int(hit2), int(hit3),
                 created_at, activation_ts, expires_at,
                 terminal_closed_at, terminal_r,
-                entry_low, entry_high, sl, tp1, tp2, tp3
+                entry_low, entry_high, (entry if int(breakeven_active or 0) else float(initial_sl or sl)), tp1, tp2, tp3,
+                failure, max_favorable_r, max_adverse_r, initial_sl, int(breakeven_active or 0)
             )
 
             # Сохраняем только результат существующего сигнала.
@@ -1557,13 +1803,15 @@ def daily_report():
                 db.execute(
                     """UPDATE signals
                        SET status=?, result=?, activated_at=COALESCE(activated_at,?),
-                           tp1_hit=?, tp2_hit=?, tp3_hit=?,
-                           closed_at=?, r_multiple=?
+                           tp1_hit=?, tp2_hit=?, tp3_hit=?, sl=?, breakeven_active=?,
+                           closed_at=?, r_multiple=?, failure_type=?, mfe_r=?, mae_r=?
                        WHERE id=?""",
                     (
                         terminal_status, terminal_result, activation_ts,
                         int(hit1), int(hit2), int(hit3),
-                        terminal_closed_at, float(terminal_r or 0.0), sid
+                        (entry if int(breakeven_active or 0) else float(initial_sl or sl)), int(breakeven_active or 0),
+                        terminal_closed_at, float(terminal_r or 0.0), failure,
+                        float(max_favorable_r or 0.0), float(max_adverse_r or 0.0), sid
                     )
                 )
                 db.commit()
@@ -1800,6 +2048,7 @@ def main():
     log.info('Universe: gainers | losers | volatile | new active | small alts')
     log.info('============================================================')
     startup_healthcheck()
+    recover_runtime_state()
     start_telegram_polling()
 
     while True:

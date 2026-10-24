@@ -950,27 +950,74 @@ def on_vote(call):
             pass
 
 
-def start_telegram_polling():
-    def runner():
-        delay = 5
-        while True:
-            try:
-                log.info('TELEGRAM POLLING START')
-                # Safe for polling deployments; do not discard pending updates here.
-                bot.delete_webhook(drop_pending_updates=False)
-                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-                log.warning('TELEGRAM POLLING RETURNED | restarting in %ss', delay)
-            except Exception as exc:
-                msg = str(exc)
-                if '409' in msg or 'Conflict' in msg or 'getUpdates' in msg:
-                    log.error('TELEGRAM 409/GETUPDATES CONFLICT | another polling instance may be active; retrying in %ss', delay)
-                else:
-                    log.error('TELEGRAM POLLING ERROR | %s | retrying in %ss', msg, delay)
-            time.sleep(delay)
-            delay = min(delay * 2, 60)
+# Telegram polling is isolated from the trading loop.
+# A Telegram 409 must NEVER be allowed to affect scanning, result reconciliation,
+# or the 24H report. Only one polling thread is created by this process.
+_telegram_polling_thread = None
+_telegram_polling_lock = threading.Lock()
 
-    t=threading.Thread(target=runner,name='telegram-polling',daemon=True)
-    t.start()
+
+def start_telegram_polling():
+    global _telegram_polling_thread
+
+    with _telegram_polling_lock:
+        if _telegram_polling_thread is not None and _telegram_polling_thread.is_alive():
+            log.warning('TELEGRAM POLLING ALREADY RUNNING | skip duplicate start')
+            return
+
+        def runner():
+            conflict_delay = 60
+            while True:
+                try:
+                    log.info('TELEGRAM POLLING START')
+                    # Do not call delete_webhook on every retry. It is unnecessary
+                    # for polling and can interfere with another deployment.
+                    bot.infinity_polling(
+                        skip_pending=True,
+                        timeout=20,
+                        long_polling_timeout=20
+                    )
+                    log.warning(
+                        'TELEGRAM POLLING RETURNED | retrying in %ss',
+                        conflict_delay
+                    )
+                    time.sleep(conflict_delay)
+                    conflict_delay = 60
+
+                except Exception as exc:
+                    msg = str(exc)
+                    is_conflict = (
+                        '409' in msg
+                        or 'Conflict' in msg
+                        or 'getUpdates' in msg
+                    )
+
+                    if is_conflict:
+                        # Another instance owns getUpdates. Keep the trading engine
+                        # alive and retry slowly instead of creating rapid polling
+                        # churn. This thread is the only Telegram retry loop.
+                        log.error(
+                            'TELEGRAM 409/GETUPDATES CONFLICT | '
+                            'polling isolated; scanner remains active | '
+                            'retrying in %ss',
+                            conflict_delay
+                        )
+                        time.sleep(conflict_delay)
+                        conflict_delay = min(conflict_delay * 2, 300)
+                    else:
+                        log.exception(
+                            'TELEGRAM POLLING ERROR | retrying in %ss',
+                            conflict_delay
+                        )
+                        time.sleep(conflict_delay)
+                        conflict_delay = min(conflict_delay * 2, 300)
+
+        _telegram_polling_thread = threading.Thread(
+            target=runner,
+            name='telegram-polling',
+            daemon=True
+        )
+        _telegram_polling_thread.start()
 
 
 # ============================================================

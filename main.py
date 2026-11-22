@@ -4,7 +4,6 @@ import math
 import logging
 import sqlite3
 import json
-import gc
 from html import escape
 import threading
 import fcntl
@@ -31,8 +30,9 @@ from matplotlib.patches import Rectangle
 #
 # Active strategies:
 #   1) Breakout + Retest      structure break -> retest -> continuation
-#   2) Trend Pullback          1H trend -> confirmed 15M rejection -> 5M trigger
+#   2) Trend Pullback          1H trend -> 15M pullback -> 5M trigger
 #   3) Mean Reversion          stretched 15M price -> 5M reversal
+# Extreme Reversal is retained for history/research, but is not active in STRATEGIES.
 #
 # Important:
 #   This is a signal engine, not a profitability guarantee.
@@ -44,11 +44,6 @@ CHANNEL_ID = os.getenv('CHANNEL_ID', '').strip()
 OKX_BASE_URL = os.getenv('OKX_BASE_URL', 'https://www.okx.com').rstrip('/')
 TIMEZONE = os.getenv('BOT_TIMEZONE', 'Europe/Kyiv')
 DB_PATH = os.getenv('DB_PATH', 'quantum_swing.db')
-
-# Render persistent disks commonly use a mounted directory such as /var/data.
-# Create the directory if configured, but leave plain relative DB filenames alone.
-_db_parent = os.path.dirname(os.path.abspath(DB_PATH))
-os.makedirs(_db_parent, exist_ok=True)
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError('TELEGRAM_TOKEN is missing.')
@@ -67,11 +62,15 @@ NEW_ACTIVE_COUNT = int(os.getenv('NEW_ACTIVE_COUNT', '15'))
 DEEP_SCAN_LIMIT = int(os.getenv('DEEP_SCAN_LIMIT', '70'))
 MIN_ACTIVE_24H_RANGE_PCT = float(os.getenv('MIN_ACTIVE_24H_RANGE_PCT', '5.0'))
 
-# ---------------- momentum filters ----------------
+# ---------------- momentum/reversal ----------------
+MIN_24H_MOVE_FOR_REVERSAL = float(os.getenv('MIN_24H_MOVE_FOR_REVERSAL', '15'))
 STRONG_24H_MOVE = float(os.getenv('STRONG_24H_MOVE', '30'))
+MIN_2H_IMPULSE = float(os.getenv('MIN_2H_IMPULSE', '5'))
+MIN_1H_IMPULSE = float(os.getenv('MIN_1H_IMPULSE', '3'))
 MIN_ATR_5M_PCT = float(os.getenv('MIN_ATR_5M_PCT', '0.18'))
 MIN_ATR_15M_PCT = float(os.getenv('MIN_ATR_15M_PCT', '0.45'))
 MIN_VOLUME_RATIO = float(os.getenv('MIN_VOLUME_RATIO', '1.20'))
+MIN_REVERSAL_VOLUME_RATIO = float(os.getenv('MIN_REVERSAL_VOLUME_RATIO', '1.15'))
 
 # ---------------- strategy/risk ----------------
 MIN_BREAKOUT_VOLUME = float(os.getenv('MIN_BREAKOUT_VOLUME', '1.35'))
@@ -179,29 +178,15 @@ class ActiveSignal:
 pending: Dict[str, PendingSignal] = {}
 active: Dict[str, ActiveSignal] = {}
 candle_cache: Dict[Tuple[str, str, int], Tuple[float, List[Candle]]] = {}
-CANDLE_CACHE_MAX_KEYS = int(os.getenv('CANDLE_CACHE_MAX_KEYS', '900'))
-CANDLE_CACHE_MAX_AGE_SECONDS = max(60, CANDLE_CACHE_SECONDS * 4)
-
-def prune_candle_cache():
-    """Bound process memory when market universes rotate over time."""
-    now = now_ts()
-    stale = [key for key, (stamp, _candles) in candle_cache.items()
-             if now - stamp > CANDLE_CACHE_MAX_AGE_SECONDS]
-    for key in stale:
-        candle_cache.pop(key, None)
-    overflow = len(candle_cache) - max(30, CANDLE_CACHE_MAX_KEYS)
-    if overflow > 0:
-        oldest = sorted(candle_cache.items(), key=lambda item: item[1][0])[:overflow]
-        for key, _value in oldest:
-            candle_cache.pop(key, None)
 
 # ============================================================
 # DATABASE + MIGRATION
 # ============================================================
 
 def db_connect():
-    con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10.0)
-    con.execute('PRAGMA busy_timeout=10000')
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.execute('PRAGMA journal_mode=WAL')
+    con.execute('PRAGMA busy_timeout=5000')
     return con
 
 
@@ -243,9 +228,6 @@ SIGNAL_COLUMNS = {
 
 def init_db():
     with db_lock:
-        # Set WAL only after the single-process lock has been acquired in main().
-        db.execute('PRAGMA journal_mode=WAL')
-        db.execute('PRAGMA synchronous=NORMAL')
         db.execute('''CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             inst_id TEXT, direction TEXT, strategy TEXT, level REAL,
@@ -283,8 +265,7 @@ def init_db():
         db.commit()
 
 
-# Database schema initialization is deliberately deferred until main(),
-# after the process lock is acquired. This avoids concurrent startup migrations.
+init_db()
 
 # ============================================================
 # BASIC HELPERS
@@ -367,6 +348,13 @@ def body_ratio(c: Candle) -> float:
 def close_location(c: Candle) -> float:
     r = c.high - c.low
     return (c.close - c.low) / r if r > 0 else 0.5
+
+
+def wick_ratio(c: Candle) -> Tuple[float, float]:
+    r = max(c.high - c.low, 1e-12)
+    upper = c.high - max(c.open, c.close)
+    lower = min(c.open, c.close) - c.low
+    return upper / r, lower / r
 
 
 def true_range_pct(c: Candle) -> float:
@@ -607,6 +595,22 @@ def trend_state(cs: List[Candle]) -> Optional[str]:
     return None
 
 
+def impulse_stats(c5: List[Candle]):
+    def move(n):
+        if len(c5) <= n:
+            return 0.0
+        return pct_move(c5[-1].close, c5[-1-n].close)
+    return move(12), move(24), move(36)
+
+
+def local_extreme(c5: List[Candle], direction: str, lookback: int = 48):
+    x = c5[-lookback-1:-1] if len(c5) > lookback + 1 else c5[:-1]
+    if not x:
+        return None
+    if direction == 'LONG':
+        return min(x, key=lambda c: c.low)
+    return max(x, key=lambda c: c.high)
+
 # ============================================================
 # QUALITY / RISK / TARGET ENGINE
 # ============================================================
@@ -735,7 +739,98 @@ def final_score(base: int, bonuses: List[int], penalties: List[int]) -> int:
     return max(0, min(99, base + sum(bonuses) - sum(penalties)))
 
 # ============================================================
-# STRATEGY 1 — BREAKOUT + RETEST
+# STRATEGY 1 — EXTREME REVERSAL
+# ============================================================
+
+def build_reversal(iid, ticker, data) -> Optional[Setup]:
+    c5, c15, c1h = data['5m'], data['15m'], data['1h']
+    if min(len(c5), len(c15), len(c1h)) < 70:
+        return None
+    ch = ticker['change24h_pct']
+    if abs(ch) < MIN_24H_MOVE_FOR_REVERSAL:
+        return None
+    if atr_pct(c5) < MIN_ATR_5M_PCT or atr_pct(c15) < MIN_ATR_15M_PCT:
+        return None
+
+    m1h, m2h, _ = impulse_stats(c5)
+    direction = 'SHORT' if ch > 0 else 'LONG'
+    if direction == 'SHORT' and m2h < MIN_2H_IMPULSE:
+        return None
+    if direction == 'LONG' and m2h > -MIN_2H_IMPULSE:
+        return None
+
+    extreme = local_extreme(c5, 'SHORT' if direction == 'SHORT' else 'LONG', 60)
+    if extreme is None:
+        return None
+    cur = c5[-1]
+    prev = c5[-2]
+    vr = vol_ratio(c5)
+    if vr < MIN_REVERSAL_VOLUME_RATIO:
+        return None
+
+    if direction == 'SHORT':
+        retrace = pct_move(extreme.high, cur.close)
+        upper, lower = wick_ratio(cur)
+        # Strong rejection from the high + bearish confirmation.
+        if retrace < 0.55:
+            return None
+        if not (cur.close < cur.open and cur.close < prev.low * 1.001):
+            return None
+        if body_ratio(cur) < 0.42 or close_location(cur) > 0.48:
+            return None
+        if upper < 0.10 and cur.high < max(c.high for c in c5[-6:-1]):
+            return None
+        sl = max(extreme.high, max(c.high for c in c5[-4:])) + atr(c5) * 0.28
+        level = extreme.high
+        point_label = 'EXTREME HIGH'
+        pattern = 'ТОП МОВЕР → ПЕРВЫЙ РАЗВОРОТ SHORT'
+        reason = f'сильный рост 24H {ch:+.1f}% → 2H {m2h:+.1f}% → экстремум → медвежье подтверждение'
+        bonuses = [7 if ch >= STRONG_24H_MOVE else 3, 6 if m2h >= 8 else 3, 5 if vr >= 1.5 else 0]
+    else:
+        retrace = pct_move(cur.close, extreme.low)
+        upper, lower = wick_ratio(cur)
+        if retrace < 0.55:
+            return None
+        if not (cur.close > cur.open and cur.close > prev.high * 0.999):
+            return None
+        if body_ratio(cur) < 0.42 or close_location(cur) < 0.52:
+            return None
+        if lower < 0.10 and cur.low > min(c.low for c in c5[-6:-1]):
+            return None
+        sl = min(extreme.low, min(c.low for c in c5[-4:])) - atr(c5) * 0.28
+        level = extreme.low
+        point_label = 'EXTREME LOW'
+        pattern = 'ТОП ЛУЗЕР → ПЕРВЫЙ РАЗВОРОТ LONG'
+        reason = f'сильное падение 24H {ch:+.1f}% → 2H {m2h:+.1f}% → экстремум → бычье подтверждение'
+        bonuses = [7 if ch <= -STRONG_24H_MOVE else 3, 6 if m2h <= -8 else 3, 5 if vr >= 1.5 else 0]
+
+    entry = cur.close
+    if abs(entry - level) / max(entry, 1e-12) * 100 > MAX_ENTRY_CHASE_PCT * 1.8:
+        return None
+    if not stop_is_structurally_valid(direction, entry, sl):
+        return None
+    tps = target_levels(direction, entry, sl, c15)
+    if not tps:
+        return None
+    score = final_score(base_score(ticker, c5, c15, vr), bonuses, [])
+    # Higher-timeframe agreement adds quality but does not create the setup.
+    tstate = trend_state(c15)
+    if (direction == 'LONG' and tstate == 'LONG') or (direction == 'SHORT' and tstate == 'SHORT'):
+        score = min(99, score + 3)
+    if score < MIN_SCORE:
+        return None
+    lo, hi = entry_zone(entry, atr(c5), direction)
+    chart = c5[-96:]
+    ext_index = max(0, len(chart) - 2 - 60)
+    return Setup(iid, get_coin(iid), direction, 'EXTREME REVERSAL', pattern,
+                 level, point_label, lo, hi, sl, *tps, score, reason,
+                 ticker['vol24h_usd'], ch, ticker['range24h_pct'], atr_pct(c5),
+                 atr_pct(c15), vr, chart,
+                 [(ext_index, level, point_label), (len(chart)-1, entry, 'CONFIRM')],
+                 '1–8 ч')
+
+# ============================================================
+# STRATEGY 2 — BREAKOUT + RETEST
 # ============================================================
 
 def build_breakout(iid, ticker, data) -> Optional[Setup]:
@@ -819,97 +914,63 @@ def build_breakout(iid, ticker, data) -> Optional[Setup]:
 
 
 # ============================================================
-# STRATEGY 2 — TREND PULLBACK
+# STRATEGY 3 — TREND PULLBACK
 # ============================================================
 
 def build_pullback(iid, ticker, data) -> Optional[Setup]:
-    """Trend continuation only after a completed 15M rejection and 5M trigger."""
-    c5, c15, c1h = data['5m'], data['15m'], data['1h']
-    if min(len(c5), len(c15), len(c1h)) < 70:
+    c5,c15,c1h=data['5m'],data['15m'],data['1h']
+    if min(len(c5),len(c15),len(c1h))<70:
         return None
-
-    trend = trend_state(c1h)
+    trend=trend_state(c1h)
     if not trend:
         return None
-
-    e20_15_series = ema([c.close for c in c15], 20)
-    e20_1h_series = ema([c.close for c in c1h], 20)
-    e50_1h_series = ema([c.close for c in c1h], 50)
-    if len(e20_15_series) < 10 or len(e20_1h_series) < 8 or len(e50_1h_series) < 8:
+    e20_15=ema([c.close for c in c15],20)
+    if len(e20_15)<10:
+        return None
+    cur,prev=c5[-1],c5[-2]
+    vr=vol_ratio(c5)
+    recent=c15[-10:-2]
+    if len(recent)<5:
         return None
 
-    cur5, prev5 = c5[-1], c5[-2]
-    cur15, prev15 = c15[-1], c15[-2]
-    cur1h = c1h[-1]
-    vr = vol_ratio(c5)
-    recent = c15[-10:-1]
-    if len(recent) < 6:
-        return None
-
-    # 1H trend must still be active, not merely an old EMA cross.
-    if trend == 'LONG':
-        if not (cur1h.close > e20_1h_series[-1] and e20_1h_series[-1] > e50_1h_series[-1]
-                and e20_1h_series[-1] > e20_1h_series[-5]):
+    if trend=='LONG':
+        pull_low=min(c.low for c in recent)
+        # Price must have pulled back toward 15M EMA, then reclaim it on 5M.
+        if not any(c.low <= e20_15[-3]*1.003 for c in recent):
             return None
-        pull_extreme = min(c.low for c in recent)
-        # The pullback must actually reach the 15M EMA area.
-        touched = any(c.low <= e20_15_series[i] * 1.002 for i, c in enumerate(c15[-10:-1], start=len(c15)-10))
-        if not touched:
+        if not (cur.close > e20_15[-1] and cur.close > prev.high and cur.close > cur.open):
             return None
-        # A completed 15M candle must reclaim EMA20 with bullish body and close near its high.
-        if not (cur15.close > e20_15_series[-1] and cur15.close > cur15.open
-                and close_location(cur15) >= 0.65 and cur15.close > prev15.close):
-            return None
-        # 5M trigger must break the previous local high with a decisive close.
-        local_high = max(c.high for c in c5[-4:-1])
-        if not (cur5.close > local_high and cur5.close > cur5.open
-                and body_ratio(cur5) >= 0.50 and close_location(cur5) >= 0.68):
-            return None
-        level = pull_extreme
-        sl = structural_stop('LONG', pull_extreme, atr(c15), STOP_BUFFER_ATR_15M)
-        reason = f'1H восходящий тренд сохранён → 15M откат к EMA20 и закрытый возврат выше неё → сильный 5M пробой локального high; объём x{vr:.2f}'
+        level=pull_low
+        sl=structural_stop('LONG', pull_low, atr(c15), STOP_BUFFER_ATR_15M)
+        reason=f'1H восходящий тренд → 15M откат к EMA20 → 5M возврат выше уровня; объём x{vr:.2f}'
     else:
-        if not (cur1h.close < e20_1h_series[-1] and e20_1h_series[-1] < e50_1h_series[-1]
-                and e20_1h_series[-1] < e20_1h_series[-5]):
+        pull_high=max(c.high for c in recent)
+        if not any(c.high >= e20_15[-3]*0.997 for c in recent):
             return None
-        pull_extreme = max(c.high for c in recent)
-        touched = any(c.high >= e20_15_series[i] * 0.998 for i, c in enumerate(c15[-10:-1], start=len(c15)-10))
-        if not touched:
+        if not (cur.close < e20_15[-1] and cur.close < prev.low and cur.close < cur.open):
             return None
-        if not (cur15.close < e20_15_series[-1] and cur15.close < cur15.open
-                and close_location(cur15) <= 0.35 and cur15.close < prev15.close):
-            return None
-        local_low = min(c.low for c in c5[-4:-1])
-        if not (cur5.close < local_low and cur5.close < cur5.open
-                and body_ratio(cur5) >= 0.50 and close_location(cur5) <= 0.32):
-            return None
-        level = pull_extreme
-        sl = structural_stop('SHORT', pull_extreme, atr(c15), STOP_BUFFER_ATR_15M)
-        reason = f'1H нисходящий тренд сохранён → 15M откат к EMA20 и закрытый возврат ниже неё → сильный 5M пробой локального low; объём x{vr:.2f}'
+        level=pull_high
+        sl=structural_stop('SHORT', pull_high, atr(c15), STOP_BUFFER_ATR_15M)
+        reason=f'1H нисходящий тренд → 15M откат к EMA20 → 5M возврат ниже уровня; объём x{vr:.2f}'
 
-    # A weak-volume candle is not accepted as continuation confirmation.
-    if vr < MIN_VOLUME_RATIO:
-        return None
-    entry = cur5.close
+    entry=cur.close
     if not stop_is_structurally_valid(trend, entry, sl):
         return None
-    if abs(entry - level) / max(entry, 1e-12) * 100 > MAX_ENTRY_CHASE_PCT:
+    if abs(entry-level)/max(entry,1e-12)*100>MAX_ENTRY_CHASE_PCT*1.5:
         return None
-    tps = target_levels(trend, entry, sl, c15)
+    tps=target_levels(trend,entry,sl,c15)
     if not tps:
         return None
-    score = final_score(base_score(ticker, c5, c15, vr), [8, 5, 5 if vr >= 1.5 else 0], [])
-    if score < MIN_SCORE:
+    score=final_score(base_score(ticker,c5,c15,vr),[8,5 if vr>=1.2 else 0,5],[])
+    if score<MIN_SCORE:
         return None
-    lo, hi = entry_zone(entry, atr(c5), trend)
-    return Setup(iid, get_coin(iid), trend, 'TREND PULLBACK', 'ПОДТВЕРЖДЁННЫЙ ТРЕНДОВЫЙ ОТКАТ',
-                 level, 'PULLBACK LOW' if trend == 'LONG' else 'PULLBACK HIGH', lo, hi, sl, *tps,
-                 score, reason, ticker['vol24h_usd'], ticker['change24h_pct'], ticker['range24h_pct'],
-                 atr_pct(c5), atr_pct(c15), vr, c5[-96:],
-                 [(len(c5[-96:])-1, entry, '5M CONFIRM')], '1–8 ч')
+    lo,hi=entry_zone(entry,atr(c5),trend)
+    return Setup(iid,get_coin(iid),trend,'TREND PULLBACK','ТРЕНДОВЫЙ ОТКАТ',level,'PULLBACK LOW' if trend=='LONG' else 'PULLBACK HIGH',lo,hi,sl,*tps,score,reason,
+                 ticker['vol24h_usd'],ticker['change24h_pct'],ticker['range24h_pct'],atr_pct(c5),atr_pct(c15),vr,c5[-96:],
+                 [(len(c5[-96:])-1,entry,'TRIGGER')],'1–8 ч')
 
 # ============================================================
-# STRATEGY 3 — MEAN REVERSION
+# STRATEGY 4 — MEAN REVERSION
 # ============================================================
 
 def build_mean_reversion(iid,ticker,data)->Optional[Setup]:
@@ -967,7 +1028,7 @@ STRATEGIES = (
     build_breakout,
     build_pullback,
     build_mean_reversion,
-)
+)  # EXTREME REVERSAL retained in source/history, disabled from active scanning
 
 # ============================================================
 # TELEGRAM VOTES
@@ -1021,7 +1082,7 @@ def start_telegram_polling():
                 log.info('TELEGRAM POLLING START')
                 # Safe for polling deployments; do not discard pending updates here.
                 bot.delete_webhook(drop_pending_updates=False)
-                bot.polling(non_stop=False, skip_pending=False, timeout=20, long_polling_timeout=20)
+                bot.infinity_polling(skip_pending=False, timeout=20, long_polling_timeout=20)
                 log.warning('TELEGRAM POLLING RETURNED | restarting in %ss', delay)
             except Exception as exc:
                 msg = str(exc)
@@ -1092,46 +1153,19 @@ def draw_setup_chart(ax, setup: Setup, show_title: bool = True):
         ax.annotate(label, (idx, price), xytext=(0, offset), textcoords='offset points',
                     ha='center', fontsize=7.5, fontweight='bold', color='#111827')
 
-    # TradingView-style Long/Short Position tool: proportional reward and risk zones.
-    # The box uses the actual Entry midpoint, SL and TP3 prices; TP1/TP2 remain
-    # separately marked by their exact horizontal levels above.
-    box_x = max(0.0, len(cs) - 24.0)
-    box_w = min(23.0, len(cs) - box_x + 0.75)
-    ax.text(box_x + 0.5, entry, 'ENTRY ZONE', ha='left', va='bottom',
-            fontsize=7.5, fontweight='bold', color='#1d4ed8',
-            bbox=dict(facecolor='white', alpha=.78, edgecolor='none', pad=1.0), zorder=5)
-    if setup.direction == 'LONG':
-        profit_low, profit_high = entry, setup.tp3
-        risk_low, risk_high = setup.sl, entry
-        position_label = 'LONG POSITION'
-    else:
-        profit_low, profit_high = setup.tp3, entry
-        risk_low, risk_high = entry, setup.sl
-        position_label = 'SHORT POSITION'
-
-    ax.add_patch(Rectangle(
-        (box_x, profit_low), box_w, max(profit_high-profit_low, 1e-12),
-        facecolor='#16a34a', edgecolor='#15803d', linewidth=1.0,
-        alpha=0.13, zorder=0
-    ))
-    ax.add_patch(Rectangle(
-        (box_x, risk_low), box_w, max(risk_high-risk_low, 1e-12),
-        facecolor='#dc2626', edgecolor='#b91c1c', linewidth=1.0,
-        alpha=0.16, zorder=0
-    ))
-    ax.text(box_x + box_w/2, (profit_low+profit_high)/2,
-            f'{position_label} · PROFIT',
-            ha='center', va='center', fontsize=8.5, fontweight='bold',
-            color='#166534', alpha=.95, zorder=4,
-            bbox=dict(facecolor='white', alpha=.55, edgecolor='none', pad=2))
-    ax.text(box_x + box_w/2, (risk_low+risk_high)/2,
-            'RISK',
-            ha='center', va='center', fontsize=8, fontweight='bold',
-            color='#991b1b', alpha=.95, zorder=4,
-            bbox=dict(facecolor='white', alpha=.55, edgecolor='none', pad=2))
-    # Keep the entry zone visually above both position rectangles.
-    ax.axhspan(setup.entry_low, setup.entry_high, alpha=.20,
-               color='#2563eb', zorder=1)
+    # Explicit directional position marker: this is a LONG/SHORT trade setup, not just price levels.
+    marker = '^' if setup.direction == 'LONG' else 'v'
+    marker_color = '#15803d' if setup.direction == 'LONG' else '#b91c1c'
+    signal_x = len(cs)-1
+    ax.scatter([signal_x], [entry], marker=marker, s=180, color=marker_color,
+               edgecolors='white', linewidths=1.2, zorder=9)
+    label = 'LONG POSITION' if setup.direction == 'LONG' else 'SHORT POSITION'
+    vertical = 28 if setup.direction == 'LONG' else -32
+    ax.annotate(label, (signal_x, entry), xytext=(-48, vertical), textcoords='offset points',
+                arrowprops=dict(arrowstyle='->', color=marker_color, lw=1.6),
+                fontsize=9, fontweight='bold', color=marker_color,
+                bbox=dict(boxstyle='round,pad=.25', fc='white', ec=marker_color, alpha=.95),
+                ha='right', zorder=10)
 
     if show_title:
         ax.set_title(f'{setup.coin}USDT · {setup.strategy} · {setup.direction} POSITION · 5M',
@@ -1147,27 +1181,16 @@ def make_chart(setup:Setup)->str:
     if len(cs) < 35:
         raise RuntimeError('Not enough candles for chart')
     path = f'/tmp/quantum_{setup.coin}_{int(time.time()*1000)}.png'
-    fig = None
-    try:
-        fig, ax = plt.subplots(figsize=(13, 7.5), dpi=120)
-        fig.patch.set_facecolor('white')
-        ax.set_facecolor('white')
-        draw_setup_chart(ax, setup)
-        ax.text(.01, .965, f'15M structure · 1H context · {setup.pattern_name}',
-                transform=ax.transAxes, va='top', fontsize=9.5, fontweight='bold', color='#111827')
-        fig.tight_layout()
-        fig.savefig(path, facecolor='white', bbox_inches='tight')
-        return path
-    except Exception:
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except OSError:
-            pass
-        raise
-    finally:
-        if fig is not None:
-            plt.close(fig)
+    fig, ax = plt.subplots(figsize=(15, 8.5), dpi=150)
+    fig.patch.set_facecolor('white')
+    ax.set_facecolor('white')
+    draw_setup_chart(ax, setup)
+    ax.text(.01, .965, f'15M structure · 1H context · {setup.pattern_name}',
+            transform=ax.transAxes, va='top', fontsize=9.5, fontweight='bold', color='#111827')
+    plt.tight_layout()
+    fig.savefig(path, facecolor='white', bbox_inches='tight')
+    plt.close(fig)
+    return path
 
 # ============================================================
 # SIGNAL MESSAGE
@@ -1548,54 +1571,37 @@ def scan_market():
     raw = []
     data_cache = {}
     seen_candidates = set()
-    diag = {
-        'pool_visits': 0, 'cooldown_or_live': 0, 'bad_candles': 0,
-        'atr_gate': 0, 'builder_none': 0, 'builder_error': 0,
-        'built_by_strategy': {name: 0 for name, _ in strategy_builders},
-        'none_by_strategy': {name: 0 for name, _ in strategy_builders},
-    }
 
     for strategy_name, builder in strategy_builders:
         pool = strategy_universes.get(strategy_name, [])
         for iid, ticker, _ in pool:
-            diag['pool_visits'] += 1
             seen_candidates.add(iid)
             if not can_send(iid):
-                diag['cooldown_or_live'] += 1
                 continue
             try:
                 if iid not in data_cache:
                     data_cache[iid] = load_symbol(iid)
                 data = data_cache[iid]
-                c5, c15, c1h = data['5m'], data['15m'], data['1h']
-                if min(len(c5), len(c15), len(c1h)) < 70:
-                    diag['bad_candles'] += 1
+                c5, c15 = data['5m'], data['15m']
+                if len(c5) < 70 or len(c15) < 70:
                     continue
                 if atr_pct(c5) < MIN_ATR_5M_PCT or atr_pct(c15) < MIN_ATR_15M_PCT:
-                    diag['atr_gate'] += 1
                     continue
                 try:
                     setup = builder(iid, ticker, data)
                     if setup:
                         setup.oi_usd = float(ticker.get('oi_usd') or 0.0)
                         setup.btc_context = btc_context
-                        # Preserve the existing soft BTC context adjustment for all strategies.
                         if btc_context == setup.direction:
                             setup.score = min(99, setup.score + 1)
                         elif btc_context in ('LONG', 'SHORT') and btc_context != setup.direction:
                             setup.score = max(0, setup.score - 2)
                         setup.reason += f'; BTC 1H context: {btc_context}'
                         raw.append(setup)
-                        diag['built_by_strategy'][strategy_name] += 1
-                    else:
-                        diag['builder_none'] += 1
-                        diag['none_by_strategy'][strategy_name] += 1
-                except Exception:
-                    diag['builder_error'] += 1
-                    log.exception('STRATEGY FAILED | %s | %s', iid, builder.__name__)
-            except Exception:
-                log.exception('CANDIDATE FAILED | %s', iid)
-                diag['builder_error'] += 1
+                except Exception as exc:
+                    log.debug('STRATEGY FAILED | %s | %s | %s', iid, builder.__name__, exc)
+            except Exception as exc:
+                log.warning('CANDIDATE FAILED | %s | %s', iid, exc)
 
     # Learning only ranks already-built setups; it never creates signals.
     apply_learning_to_raw(raw)
@@ -1610,18 +1616,10 @@ def scan_market():
         'SCAN | market=%d unique_candidates=%d raw=%d final=%d',
         len(tickers), len(seen_candidates), len(raw), len(final)
     )
-    log.info(
-        'SCAN DIAGNOSTICS | pool_visits=%d cooldown_or_live=%d bad_candles=%d '
-        'atr_gate=%d builder_none=%d builder_error=%d built=%s none_by_strategy=%s',
-        diag['pool_visits'], diag['cooldown_or_live'], diag['bad_candles'],
-        diag['atr_gate'], diag['builder_none'], diag['builder_error'],
-        diag['built_by_strategy'], diag['none_by_strategy']
-    )
 
     for setup in final:
         if can_send(setup.inst_id):
             send_signal(setup)
-    prune_candle_cache()
 
 
 # ============================================================
@@ -1801,7 +1799,6 @@ def daily_report():
     # Audit what price did AFTER an SL. Diagnostic only: it never rewrites the
     # original stop outcome or automatically widens future stops.
     post_stop_stats = {'checked': 0, 'tp1': 0, 'tp2': 0, 'tp3': 0}
-    post_stop_candle_cache = {}
     for r in reconciled_rows:
         if r[5] != 'SL' or not r[12]:
             continue
@@ -1815,10 +1812,8 @@ def daily_report():
                     "SELECT post_stop_checked_at FROM signals WHERE id=?", (sid,)
                 ).fetchone()
             if not (audit_row and audit_row[0]):
-                if inst_id not in post_stop_candle_cache:
-                    post_stop_candle_cache[inst_id] = get_candles(inst_id, '5m', 300)
                 after = [
-                    c for c in post_stop_candle_cache[inst_id]
+                    c for c in get_candles(inst_id, '5m', 300)
                     if c.confirmed and c.ts / 1000.0 > float(r[12])
                 ]
                 if after:
@@ -1880,10 +1875,6 @@ def daily_report():
         float(r[13] or 0.0)
         for r in reconciled_rows
         if r[5] in ('TP3', 'PARTIAL_BE', 'BE', 'SL', 'TIMEOUT')
-    ) + sum(
-        float(r[21] or 0.0)
-        for r in reconciled_rows
-        if r[4] == 'ACTIVE' and r[5] not in ('TP3', 'PARTIAL_BE', 'BE', 'SL', 'TIMEOUT')
     )
 
     # ------------------------------------------------------------
@@ -1931,7 +1922,7 @@ def daily_report():
         from matplotlib.backends.backend_pdf import PdfPages
 
         with PdfPages(pdf_path) as pdf:
-            fig = plt.figure(figsize=(11.7, 8.3), dpi=90)
+            fig = plt.figure(figsize=(11.7, 8.3), dpi=110)
             fig.patch.set_facecolor('white')
             fig.text(0.06, 0.93, 'QUANTUM | VIP SCANNER', fontsize=22, fontweight='bold')
             fig.text(0.06, 0.885, 'ДНЕВНОЙ АУДИТ · ПОСЛЕДНИЕ 24 ЧАСА', fontsize=14, fontweight='bold')
@@ -2000,7 +1991,7 @@ def daily_report():
                     except (TypeError, ValueError):
                         setup_data = {}
                 candles = setup_data.get('candles_5m', [])
-                fig = plt.figure(figsize=(11.7, 8.3), dpi=90)
+                fig = plt.figure(figsize=(11.7, 8.3), dpi=110)
                 fig.patch.set_facecolor('white')
                 coin = str(setup_data.get('coin') or inst_id.replace('-USDT-SWAP',''))
                 fig.text(0.06, 0.94, f'{coin}USDT · {direction}', fontsize=20, fontweight='bold')
@@ -2065,7 +2056,7 @@ def daily_report():
         f'🕘 {since_dt:%d.%m.%Y %H:%M} — {n:%d.%m.%Y %H:%M}\n\n'
         f'📨 Сигналов: <b>{total}</b>\n'
         f'🎯 Входов: <b>{entries}</b>\n'
-        f'🟢 Финальных TP3: <b>{tp3_count}</b>\n'
+        f'🟢 Финальных TP3: <b>{positive_count}</b>\n'
         f'🛡 Защищённых после частичной фиксации: <b>{protected_count}</b>\n'
         f'⚖️ Чистый BE: <b>{be_count}</b>\n'
         f'🔴 Стопов: <b>{stop_count}</b>\n'
@@ -2106,9 +2097,6 @@ def daily_report():
                 os.remove(pdf_path)
         except OSError:
             pass
-        # Report pages contain many Matplotlib artists; release them before the next scan.
-        plt.close('all')
-        gc.collect()
 
 
 # ============================================================
@@ -2133,16 +2121,14 @@ def startup_healthcheck():
 
 def main():
     log.info('============================================================')
-    log.info('QUANTUM INTRADAY SWING ENGINE V2.3 AUDITED BUILD STARTED')
-    log.info('Strategies: Breakout+Retest | Confirmed Trend Pullback | Mean Reversion')
+    log.info('QUANTUM INTRADAY SWING ENGINE V2.3 STARTED')
+    log.info('Strategies: Breakout+Retest | Trend Pullback | Mean Reversion (Extreme Reversal disabled)')
     log.info('Risk model: structural stops; TP2 >= %.2f%% and >= 1:%.2f RR', MIN_TARGET_MOVE_PCT, MIN_TARGET_RR)
     log.info('Learning: bounded 30D strategy adaptation after raw setup generation')
     log.info('Context: batched OI snapshot + soft BTC 1H regime adjustment')
     log.info('Partial exits: TP1 %.0f%% | TP2 %.0f%% | TP3 %.0f%% (gross R before fees)',
              TP1_CLOSE_PCT, TP2_CLOSE_PCT, TP3_CLOSE_PCT)
-    log.info('Charts: TradingView-style Long/Short risk-reward box with Entry Zone, SL and TP1/TP2/TP3')
-    log.info('Reports: retryable daily 24H audit; TP2 is milestone, TP3 final; active partial R included')
-    log.info('Trend Pullback: 1H trend + closed 15M reclaim/rejection + decisive 5M break + volume confirmation')
+    log.info('Reports: retryable daily 24H audit; TP2 is milestone, TP3 final')
     log.info('Universe: gainers | losers | volatile | new active | high turnover; full deduplicated pool')
     log.info('============================================================')
     acquire_instance_lock()
